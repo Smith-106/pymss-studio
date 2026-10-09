@@ -1,6 +1,6 @@
 import type { Component } from 'vue'
 
-export type AudioToolKey = 'convert' | 'merge' | 'sdr' | 'midi' | 'inspect' | 'slicer' | 'asr'
+export type AudioToolKey = 'convert' | 'merge' | 'sdr' | 'midi' | 'inspect' | 'slicer' | 'asr' | 'plugin-ops'
 export type AudioToolCategory = 'convert' | 'analyze' | 'recognize' | 'edit'
 
 export type AudioToolPhase =
@@ -74,7 +74,8 @@ export type AsrResult = AudioToolResultBase & {
   operation: 'asr'; text: string; sentences: AsrSentence[]; segmentCount: number
   modelPreset?: string; requestedLanguage?: string; detectedLanguage?: string
 }
-export type AudioToolResult = ConvertResult | MergeResult | SdrResult | MidiResult | InspectResult | SlicerResult | AsrResult
+export type PluginOpsResult = AudioToolResultBase & { operation: 'plugin-ops' }
+export type AudioToolResult = ConvertResult | MergeResult | SdrResult | MidiResult | InspectResult | SlicerResult | AsrResult | PluginOpsResult
 
 export type AudioToolProgress = { completed: number; total: number; current: string; phase: AudioToolPhase }
 export type AudioToolLogEntry = AudioToolProgress & {

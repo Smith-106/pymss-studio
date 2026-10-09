@@ -364,7 +364,17 @@
     "phaseDetailWritingSegments": "Cut points are ready; exporting audio segments from the source file.",
     "phaseDetailLoadingAsrModel": "Loading ASR, VAD, and punctuation models. The initial download may take some time.",
     "phaseDetailRecognizingSpeech": "The models are ready; detecting speech and generating the transcript.",
-    "phaseDetailWritingTranscript": "Recognition is complete; writing text, timeline, and subtitle files."
+    "phaseDetailWritingTranscript": "Recognition is complete; writing text, timeline, and subtitle files.",
+    "pluginOps": {
+      "unavailable": "The current Python runtime has no pymss operations support. Update the runtime core and retry.",
+      "selectOperation": "Select operation",
+      "noOperations": "No plugin operations registered.",
+      "audioInput": "{name} (audio file)",
+      "filePath": "Audio file path",
+      "run": "Run"
+    },
+    "pluginOpsTitle": "Plugin operations",
+    "pluginOpsDescription": "Run operations contributed by pymss plugins (loudness, analysis, custom processing)."
   },
   "separate": {
     "subtitle": "Configure input audio, the separation model, and output options to start a task.",

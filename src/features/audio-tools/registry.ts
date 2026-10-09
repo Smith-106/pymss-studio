@@ -1,4 +1,4 @@
-import { AnalyticsOutline, CutOutline, GitMergeOutline, InformationCircleOutline, MicOutline, MusicalNoteOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
+import { AnalyticsOutline, CutOutline, GitMergeOutline, InformationCircleOutline, MicOutline, MusicalNoteOutline, PulseOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
 import type { AudioToolDefinition } from './types'
 import ConvertTool from './tools/convert'
 import SdrTool from './tools/sdr'
@@ -7,6 +7,7 @@ import InspectTool from './tools/inspect'
 import SlicerTool from './tools/slicer'
 import AsrTool from './tools/asr'
 import MergeTool from './tools/merge'
+import PluginOpsTool from '../plugin-ops/PluginOpsTool.vue'
 
 export const audioTools: AudioToolDefinition[] = [
   { id: 'convert', category: 'convert', titleKey: 'tools.convertTitle', descriptionKey: 'tools.convertDescription', icon: SwapHorizontalOutline, component: ConvertTool },
@@ -16,4 +17,5 @@ export const audioTools: AudioToolDefinition[] = [
   { id: 'midi', category: 'recognize', titleKey: 'tools.midiTitle', descriptionKey: 'tools.midiDescription', icon: MusicalNoteOutline, component: MidiTool },
   { id: 'slicer', category: 'edit', titleKey: 'tools.slicerTitle', descriptionKey: 'tools.slicerDescription', icon: CutOutline, component: SlicerTool },
   { id: 'merge', category: 'edit', titleKey: 'tools.mergeTitle', descriptionKey: 'tools.mergeDescription', icon: GitMergeOutline, component: MergeTool },
+  { id: 'plugin-ops', category: 'analyze', titleKey: 'tools.pluginOpsTitle', descriptionKey: 'tools.pluginOpsDescription', icon: PulseOutline, component: PluginOpsTool },
 ]

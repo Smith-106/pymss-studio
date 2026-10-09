@@ -364,7 +364,17 @@
     "phaseDetailWritingSegments": "切点分析完成，正在从源文件导出音频片段。",
     "phaseDetailLoadingAsrModel": "正在加载识别、VAD 与标点模型；首次下载可能需要较长时间。",
     "phaseDetailRecognizingSpeech": "模型已就绪，正在检测有效语音并生成识别结果。",
-    "phaseDetailWritingTranscript": "识别完成，正在写入文本、时间轴与字幕文件。"
+    "phaseDetailWritingTranscript": "识别完成，正在写入文本、时间轴与字幕文件。",
+    "pluginOps": {
+      "unavailable": "当前 Python 运行时暂不支持 pymss 操作。请更新运行时核心后重试。",
+      "selectOperation": "选择操作",
+      "noOperations": "没有已注册的插件操作。",
+      "audioInput": "{name}（音频文件）",
+      "filePath": "音频文件路径",
+      "run": "运行"
+    },
+    "pluginOpsTitle": "插件操作",
+    "pluginOpsDescription": "运行 pymss 插件提供的操作（响度、分析、自定义处理）。"
   },
   "separate": {
     "subtitle": "配置输入音频、分离模型与输出参数后，即可发起分离任务。",
