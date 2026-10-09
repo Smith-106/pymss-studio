@@ -941,6 +941,9 @@ fn is_background_terminal_event(command: &str, event_type: &str) -> bool {
             matches!(event_type, "error" | "task_done" | "task_cancelled")
         }
         "audio_tools" => matches!(event_type, "error" | "audio_tool_result" | "task_cancelled"),
+        "run_operation" => {
+            matches!(event_type, "error" | "operation_result" | "task_cancelled")
+        }
         "export_editor_mix" => {
             matches!(event_type, "error" | "editor_mix_exported" | "task_cancelled")
         }
@@ -1790,6 +1793,17 @@ mod tests {
         assert!(is_background_terminal_event("audio_tools", "audio_tool_result"));
         assert!(is_background_terminal_event("audio_tools", "error"));
         assert!(!is_background_terminal_event("audio_tools", "audio_tool_progress"));
+    }
+
+    #[test]
+    fn operation_result_is_a_background_terminal_event() {
+        assert!(is_background_terminal_event("run_operation", "operation_result"));
+        assert!(is_background_terminal_event("run_operation", "error"));
+        assert!(is_background_terminal_event("run_operation", "task_cancelled"));
+        assert!(!is_background_terminal_event(
+            "run_operation",
+            "operation_progress"
+        ));
     }
 
     #[test]

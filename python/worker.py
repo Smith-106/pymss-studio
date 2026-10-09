@@ -131,6 +131,15 @@ def run_command(command: str, payload: dict) -> int:
     if command == "infer":
         from worker_infer import cmd_infer
         return cmd_infer(payload)
+    if command == "list_operations":
+        from worker_operations import cmd_list_operations
+        return cmd_list_operations(payload)
+    if command == "describe_operation":
+        from worker_operations import cmd_describe_operation
+        return cmd_describe_operation(payload)
+    if command == "run_operation":
+        from worker_operations import cmd_run_operation
+        return cmd_run_operation(payload)
     if command == "infer_workflow":
         from worker_workflows import cmd_infer_workflow
         return cmd_infer_workflow(payload)
