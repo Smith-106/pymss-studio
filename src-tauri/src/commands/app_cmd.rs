@@ -1843,6 +1843,16 @@ pub async fn get_audio_metadata(app: AppHandle, payload: Value) -> AppResult<Val
 }
 
 #[tauri::command]
+pub async fn list_operations(app: AppHandle) -> AppResult<Value> {
+    run_worker_with_payload(&app, "list_operations", None)
+}
+
+#[tauri::command]
+pub async fn describe_operation(app: AppHandle, payload: Value) -> AppResult<Value> {
+    run_worker_with_payload(&app, "describe_operation", Some(payload))
+}
+
+#[tauri::command]
 pub async fn generate_waveform_peaks(app: AppHandle, payload: Value) -> AppResult<Value> {
     let mut payload = payload;
     if let Some(object) = payload.as_object_mut() {
@@ -2136,6 +2146,23 @@ pub async fn start_audio_tool(
         .ok_or_else(|| AppError::Worker("missing audio tool request id".into()))?
         .to_string();
     spawn_worker_background(app, state, "audio_tools", task_id.clone(), payload)?;
+    Ok(serde_json::json!({ "taskId": task_id, "started": true }))
+}
+
+#[tauri::command]
+pub async fn start_operation_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: Value,
+) -> AppResult<Value> {
+    let task_id = payload
+        .get("requestId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Worker("missing operation request id".into()))?
+        .to_string();
+    spawn_worker_background(app, state, "run_operation", task_id.clone(), payload)?;
     Ok(serde_json::json!({ "taskId": task_id, "started": true }))
 }
 
