@@ -79,7 +79,7 @@ Pymss Studio 将 [pymss](https://github.com/pymss-project/pymss) 音乐源分离
 | Linux | 源码构建 | 当前发布工作流未生成 Linux 安装包；开发与构建依赖见下文。 |
 | Intel Mac | 暂无专用发布包 | 现有 MLX 包面向 Apple Silicon；自行构建时仍需核验推理依赖的兼容性。 |
 
-发布包包含所需的基础 Python 运行时，普通用户无需单独安装系统 Python。可以在 **设置 → 运行环境** 中查看、安装或切换当前平台支持的环境。
+发布包包含 Python，普通用户无需单独安装系统 Python。macOS DMG 已包含固定的 Python、PyTorch、MLX 和出厂核心，首次启动无需重新下载整套 Python 环境。可在 **设置 → 运行环境** 中查看当前环境并更新内核；应用内安装、切换、重装或删除整套环境仅适用于 Windows。
 
 ### 选择文件类型
 
@@ -149,7 +149,7 @@ xattr -cr '/Applications/Pymss Studio.app'
 | 音频切片 | 按静音区间分析并导出片段，配置最短片段、静音阈值和边界保留时长。 |
 | 合并音频 | 按文件名、修改时间或正则规则排列目录中的音频，输出统一规格的 WAV。 |
 
-ASR 的 FunASR 运行组件按需安装，模型首次使用时下载并缓存。歌声转 MIDI 可通过工具页提供的 [GAME 发布页](https://github.com/openvpi/GAME/releases/tag/v1.0.0) 下载模型压缩包。**解压后保留完整目录：`model.pt` 同级必须有 `config.yaml`，启用语言条件的模型还需要 `lang_map.json`。** 不要单独移动权重文件。输出语言、格式和参数以所选工具与模型为准。
+ASR 的 FunASR 运行组件按需安装，模型首次使用时下载并缓存；macOS 当前未开放 ASR 工具。歌声转 MIDI 可通过工具页提供的 [GAME 发布页](https://github.com/openvpi/GAME/releases/tag/v1.0.0) 下载模型压缩包。**解压后保留完整目录：`model.pt` 同级必须有 `config.yaml`，启用语言条件的模型还需要 `lang_map.json`。** 不要单独移动权重文件。输出语言、格式和参数以所选工具与模型为准。
 
 ## 数据、运行环境与更新
 
@@ -164,15 +164,19 @@ ASR 的 FunASR 运行组件按需安装，模型首次使用时下载并缓存�
 | Windows 便携版，程序同级有 `pymss-studio.portable` 标记 | 程序同级的 `data/`。 |
 | 普通安装版 / 其他发布包 | 用户目录下的 `.pymss-studio/`，例如 Windows 的 `%USERPROFILE%\.pymss-studio`。 |
 
-数据根目录默认包含 `settings/`、`models/`、`outputs/`、`editor-projects/`、`logs/` 和 `temp/`。推理环境另由运行时管理器保存：Windows / Linux 通常位于安装资源的 `python-runtime/runtime-envs/`，macOS 用户安装环境位于数据根目录的 `runtime-envs/`。
+数据根目录默认包含 `settings/`、`models/`、`outputs/`、`editor-projects/`、`logs/` 和 `temp/`。macOS 和 Linux 的可写运行状态保存在该根目录下的 `runtime-envs/`：`active-runtime.json` 记录当前核心，`.overlays/` 保存核心更新及其依赖，`optional-packages/` 保存独立组件。Windows 继续使用所选运行时根目录下的 `runtime-envs/`，通常位于安装资源旁的 `python-runtime/runtime-envs/`。macOS 的基础 Python 环境保留在应用包内。
 
 **编辑器工程会引用音频素材的文件路径。** 备份工程时也应保留对应音频；移动或删除原始输出后，可在编辑器中重连缺失素材。调整模型目录时优先使用应用提供的目录迁移流程。
 
 ### 更新与环境管理
 
-在 **设置 → 关于** 查看版本与更新状态。支持应用内更新的官方 Windows 构建可在此检查和安装更新；其他平台或不支持自动更新的构建，通过发行页手动更新。
+在 **设置 → 关于** 查看版本与更新状态。发布通道支持应用内更新的 Windows 和 macOS 构建可在此检查并安装更新；不支持自动更新的构建通过发行页手动更新。macOS 应用更新会整体替换 `.app` 并保留用户数据，写入权限不足时请求管理员授权。更新前应将应用移入 `/Applications`；从只读 DMG 或 App Translocation 位置运行时会阻止更新。固定基础环境契约发生变化时，需要手动安装新版。
 
-应用更新与 Python 推理环境管理是不同操作。切换或维护 CPU / GPU 环境，请使用 **设置 → 运行环境**。当前依赖组合由 [`python/runtime-manifest.json`](./python/runtime-manifest.json) 定义，不建议在内置环境中自行混装其他版本的 Torch 或后端组件。
+在 **设置 → 运行环境** 中，可独立更新 `pymss`、`pymss-core` 及其兼容依赖，无需更新桌面软件。确认前会展示版本和依赖计划，软件包先安装到新的核心覆盖层，验证成功后才切换；存在兼容的上一版时可回退。需要替换固定加速组件的更新会被拒绝，当前环境保持可用。依赖组合由 [`python/runtime-manifest.json`](./python/runtime-manifest.json) 定义。
+
+FunASR 等可选组件使用独立目录，与核心覆盖层分别管理。安装时校验与当前 PyTorch 版本及加速后端的兼容性。Windows 和 Linux 卸载 FunASR 时，会删除独立组件目录，并卸载直接安装在当前环境中的副本，保留已下载的模型。macOS 的组件管理不卸载内置基础环境中的包，ASR 工具仍未开放。pip 和 Numba 缓存保存在数据根目录的 `temp/` 下。
+
+在 macOS 上删除 `Pymss Studio.app` 会移除应用及内置环境，用户数据根目录中的设置、模型、输出和核心覆盖层继续保留，因此重新安装后会复用原有数据。自定义模型或输出目录，以及应用同级的 `.pymss-studio-previous-*.app` 更新备份，需要单独管理。
 
 ## 常见问题
 
@@ -202,7 +206,7 @@ cd pymss-studio
 pnpm install --frozen-lockfile
 ```
 
-首次进行完整桌面调试，还需准备基础 Python，并在启动引导或“设置 → 运行环境”安装、激活推理环境。首次安装需要联网，下载量取决于后端。以下命令准备引导解释器；推理所需的 Python 依赖由应用按运行时清单安装，模型权重在模型库另行下载。
+Windows 首次进行完整桌面调试时，先准备基础 Python，再通过启动引导或“设置 → 运行环境”安装、激活推理环境。首次安装需要联网，下载量取决于后端。以下命令仅准备引导解释器；macOS 和 Linux 需另行准备兼容的推理环境，或复用已准备的内置运行时，当前不支持在应用内安装整套环境。模型权重在模型库另行下载。
 
 Windows PowerShell：
 

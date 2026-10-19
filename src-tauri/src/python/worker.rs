@@ -576,11 +576,13 @@ fn prepend_path(existing: Option<String>, dirs: Vec<PathBuf>) -> Option<String> 
     Some(parts.join(path_separator()))
 }
 
-fn isolate_python_environment(cmd: &mut Command) {
+fn isolate_python_environment(cmd: &mut Command, cache_root: &Path) {
     for key in HOST_PYTHON_ENV_VARS {
         cmd.env_remove(key);
     }
-    cmd.env("PYTHONNOUSERSITE", "1");
+    cmd.env("PYTHONNOUSERSITE", "1")
+        .env("NUMBA_CACHE_DIR", cache_root.join("numba-cache"))
+        .env("PIP_CACHE_DIR", cache_root.join("pip-cache"));
 }
 
 fn default_output_dir(app: &AppHandle) -> AppResult<PathBuf> {
@@ -631,7 +633,7 @@ fn build_worker_command(
     let python_for_log = python.clone();
     let worker_for_log = worker.clone();
     let mut cmd = Command::new(&python);
-    isolate_python_environment(&mut cmd);
+    isolate_python_environment(&mut cmd, &storage::temp_dir(app)?);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.arg(worker)
@@ -1679,7 +1681,10 @@ mod tests {
             command.env(key, "host-runtime");
         }
 
-        super::isolate_python_environment(&mut command);
+        command.env("NUMBA_CACHE_DIR", "host-runtime");
+        command.env("PIP_CACHE_DIR", "host-runtime");
+        let cache_root = Path::new("user-data/temp");
+        super::isolate_python_environment(&mut command, cache_root);
 
         for key in super::HOST_PYTHON_ENV_VARS {
             let (_, value) = command
@@ -1693,6 +1698,12 @@ mod tests {
             .find(|(name, _)| *name == std::ffi::OsStr::new("PYTHONNOUSERSITE"))
             .expect("PYTHONNOUSERSITE was not configured");
         assert_eq!(no_user_site, Some(std::ffi::OsStr::new("1")));
+        for (key, directory) in [("NUMBA_CACHE_DIR", "numba-cache"), ("PIP_CACHE_DIR", "pip-cache")] {
+            let (_, value) = command.get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .unwrap();
+            assert_eq!(value, Some(cache_root.join(directory).as_os_str()));
+        }
     }
 
     #[test]

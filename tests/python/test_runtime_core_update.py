@@ -98,7 +98,7 @@ class RuntimeCoreVersionTests(unittest.TestCase):
         ]})
         self.assertIn("pymss[proxy]==2.2.0", resolved)
         self.assertIn("new-audio-dependency==1.0", resolved)
-        for name in ("torch", "torchvision", "torchaudio", "nvidia-cublas-cu12", "rocm-sdk-core"):
+        for name in ("torch", "torchvision", "torchaudio", "triton", "mlx", "mlx-metal", "nvidia-cublas-cu12", "rocm-sdk-core"):
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "base accelerator"):
                 worker_bootstrap._resolved_overlay_requirements(requirements, {"version": "1", "install": [{"metadata": {"name": name, "version": "9.0"}}]})
         with self.assertRaisesRegex(RuntimeError, "unsupported installation report"):

@@ -1,4 +1,4 @@
-"""Verify offline core overlay activation and rollback in a signed macOS app."""
+"""Verify core overlays survive signed bundle replacement and rollback offline."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,33 @@ def bundle_snapshot(app: Path) -> dict:
     return result
 
 
+def verify_signature(app: Path) -> None:
+    subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
+                   capture_output=True, text=True, check=True, timeout=120)
+
+
+def replace_test_bundle(app: Path, source: Path, directory: Path) -> None:
+    """Replace only the installed copy inside this verification directory."""
+    directory = directory.resolve(strict=True)
+    app = app.resolve(strict=True)
+    source = source.resolve(strict=True)
+    if app.parent != directory / "installed" or source == app:
+        raise RuntimeError("Bundle replacement is restricted to the isolated installed copy")
+    staged = directory / "replacement" / app.name
+    previous = directory / "previous" / app.name
+    staged.parent.mkdir()
+    previous.parent.mkdir()
+    shutil.copytree(source, staged, symlinks=True)
+    verify_signature(staged)
+    app.rename(previous)
+    try:
+        staged.rename(app)
+    except OSError:
+        previous.rename(app)
+        raise
+    verify_signature(app)
+
+
 def protocol_payload(output: str, event: str) -> dict:
     events = []
     for line in output.splitlines():
@@ -105,14 +133,21 @@ def protocol_payload(output: str, event: str) -> dict:
             events.append(value)
     errors = [item for item in events if item.get("type") == "error"]
     if errors:
-        raise RuntimeError(str(errors[-1].get("payload", {}).get("message", "Worker failed")))
+        message = str(errors[-1].get("payload", {}).get("message", "Worker failed"))
+        diagnostics = "\n".join(
+            str(item.get("payload", {}).get("message", ""))
+            for item in events if item.get("type") == "runtime_core_update_log"
+        )[-8000:]
+        if diagnostics:
+            message += "\n" + diagnostics
+        raise RuntimeError(message)
     matches = [item["payload"] for item in events if item.get("type") == event]
     if not matches:
         raise RuntimeError(f"The worker did not emit {event}")
     return matches[-1]
 
 
-def verify_runtime(app: Path, directory: Path) -> None:
+def verify_runtime(app: Path, directory: Path, replacement_app: Path | None = None) -> None:
     runtime, python, worker_path = bundle_paths(app)
     sys.path.insert(0, str(worker_path.parent))
     import worker_bootstrap as worker
@@ -133,10 +168,20 @@ def verify_runtime(app: Path, directory: Path) -> None:
         with contextlib.redirect_stdout(output):
             status = worker.cmd_update_runtime_core(payload)
         if status:
-            # Prefer the structured failure over an unbounded pip log.
+            # Preserve the structured failure and a bounded pip diagnostic tail
+            # before the isolated verification directory is removed.
             protocol_payload(output.getvalue(), event)
             raise RuntimeError(f"The runtime operation failed with exit code {status}")
         return protocol_payload(output.getvalue(), event)
+
+    def fresh_operation(payload: dict, event: str) -> dict:
+        completed = subprocess.run(
+            [str(python), "-B", str(worker_path), "update_runtime_core", "--payload", json.dumps(payload)],
+            env=os.environ.copy(), cwd=directory, capture_output=True, text=True, timeout=120,
+        )
+        result = protocol_payload(completed.stdout, event)
+        completed.check_returncode()
+        return result
 
     def fresh_worker(overlay: str | None) -> None:
         environment = os.environ.copy()
@@ -176,9 +221,18 @@ def verify_runtime(app: Path, directory: Path) -> None:
     if not overlay or not Path(overlay).resolve().is_relative_to(directory.resolve()):
         raise RuntimeError("The core overlay was not installed in the isolated user directory")
     fresh_worker(overlay)
+    if replacement_app is not None:
+        pointer = directory / "runtime-envs/active-runtime.json"
+        before_replacement = pointer.read_bytes()
+        replace_test_bundle(app, replacement_app, directory)
+        if pointer.read_bytes() != before_replacement:
+            raise RuntimeError("Bundle replacement changed the user runtime state")
+        fresh_worker(overlay)
+        print("Signed bundle replacement preserved the active core overlay in fresh workers")
     restore = {**payload, "mode": "rollback"}
-    plan = operation({**restore, "prepareOnly": True}, "runtime_core_update_plan")
-    operation({**restore, "planId": plan["id"]}, "runtime_core_update_finished")
+    rollback_operation = fresh_operation if replacement_app is not None else operation
+    plan = rollback_operation({**restore, "prepareOnly": True}, "runtime_core_update_plan")
+    rollback_operation({**restore, "planId": plan["id"]}, "runtime_core_update_finished")
     restored = worker._read_runtime_state()
     if not restored or restored.get("overlayPath") or restored.get("packageVersions") != active.get("packageVersions"):
         raise RuntimeError("The previous bundled core was not restored")
@@ -189,17 +243,17 @@ def verify_runtime(app: Path, directory: Path) -> None:
 def verify_app(app: Path) -> None:
     if sys.platform != "darwin":
         raise RuntimeError("A macOS host is required to verify the signed application")
-    runtime, python, _worker = bundle_paths(app)
-
-    def signature() -> None:
-        subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
-                       capture_output=True, text=True, check=True, timeout=120)
-
-    signature()
+    bundle_paths(app)
+    verify_signature(app)
     before = bundle_snapshot(app)
     try:
         with tempfile.TemporaryDirectory(prefix="pymss-core-check-") as temporary:
             directory = Path(temporary).resolve()
+            installed = directory / "installed" / app.name
+            shutil.copytree(app, installed, symlinks=True)
+            verify_signature(installed)
+            installed_before = bundle_snapshot(installed)
+            runtime, python, _worker = bundle_paths(installed)
             environment = os.environ.copy()
             for name in list(environment):
                 if name.startswith("PYMSS_") or name in {"PYTHONPATH", "PYTHONUSERBASE", "VIRTUAL_ENV"}:
@@ -219,12 +273,16 @@ def verify_app(app: Path) -> None:
                 "PATH": str(runtime.parent / "bin") + os.pathsep + environment.get("PATH", ""),
             })
             completed = subprocess.run(
-                [str(python), "-B", str(Path(__file__).resolve()), str(app), "--verify-runtime", str(directory)],
+                [str(python), "-B", str(Path(__file__).resolve()), str(installed),
+                 "--verify-runtime", str(directory), "--replacement-app", str(app)],
                 env=environment, cwd=directory, capture_output=True, text=True, check=True, timeout=600,
             )
             print(completed.stdout.strip())
+            verify_signature(installed)
+            if bundle_snapshot(installed) != installed_before:
+                raise RuntimeError("Core verification modified the replacement application bundle")
     finally:
-        signature()
+        verify_signature(app)
         if bundle_snapshot(app) != before:
             raise RuntimeError("Core verification modified the signed application bundle")
     print("Application signature and bundle contents preserved")
@@ -234,11 +292,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", type=Path)
     parser.add_argument("--verify-runtime", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--replacement-app", type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     try:
         application = arguments.app.resolve(strict=True)
         if arguments.verify_runtime:
-            verify_runtime(application, arguments.verify_runtime)
+            verify_runtime(application, arguments.verify_runtime, arguments.replacement_app)
         else:
             verify_app(application)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:

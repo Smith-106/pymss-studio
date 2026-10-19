@@ -81,6 +81,57 @@ class MacosCoreCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "complete bundled runtime"):
                 CHECK.bundle_paths(Path(directory))
 
+    def test_bundle_replacement_preserves_user_state_and_original_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "installed/Pymss Studio.app"
+            source = root / "release/Pymss Studio.app"
+            for bundle, version in ((app, "old"), (source, "new")):
+                bundle.mkdir(parents=True)
+                (bundle / "version").write_text(version, encoding="utf-8")
+            pointer = root / "runtime-envs/active-runtime.json"
+            pointer.parent.mkdir()
+            state = {"overlayPath": str(root / "runtime-envs/.overlays/core")}
+            pointer.write_text(json.dumps(state), encoding="utf-8")
+            with mock.patch.object(CHECK, "verify_signature"):
+                CHECK.replace_test_bundle(app, source, root)
+            self.assertEqual((app / "version").read_text(encoding="utf-8"), "new")
+            self.assertEqual((root / "previous/Pymss Studio.app/version").read_text(encoding="utf-8"), "old")
+            self.assertEqual((source / "version").read_text(encoding="utf-8"), "new")
+            self.assertEqual(json.loads(pointer.read_text(encoding="utf-8")), state)
+
+    def test_bundle_replacement_restores_old_copy_when_activation_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "installed/Pymss Studio.app"
+            source = root / "release/Pymss Studio.app"
+            for bundle, version in ((app, "old"), (source, "new")):
+                bundle.mkdir(parents=True)
+                (bundle / "version").write_text(version, encoding="utf-8")
+            rename = Path.rename
+
+            def fail_activation(path, target):
+                if path.parent.name == "replacement":
+                    raise PermissionError("replacement unavailable")
+                return rename(path, target)
+
+            with mock.patch.object(CHECK, "verify_signature"), \
+                 mock.patch.object(Path, "rename", autospec=True, side_effect=fail_activation):
+                with self.assertRaisesRegex(PermissionError, "replacement unavailable"):
+                    CHECK.replace_test_bundle(app, source, root)
+            self.assertEqual((app / "version").read_text(encoding="utf-8"), "old")
+            self.assertEqual((source / "version").read_text(encoding="utf-8"), "new")
+
+    def test_bundle_replacement_rejects_a_bundle_outside_the_isolated_installation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "release/Pymss Studio.app"
+            app.mkdir(parents=True)
+            (app / "version").write_text("preserved", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "isolated installed copy"):
+                CHECK.replace_test_bundle(app, app, root)
+            self.assertEqual((app / "version").read_text(encoding="utf-8"), "preserved")
+
     def test_worker_failure_cannot_be_mistaken_for_a_successful_event(self):
         output = '\n'.join([
             'package diagnostic',
@@ -89,6 +140,21 @@ class MacosCoreCheckTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(RuntimeError, "runtime verification failed"):
             CHECK.protocol_payload(output, "runtime_core_update_finished")
+
+    def test_worker_failure_includes_bounded_pip_diagnostics(self):
+        message = "pip failed during resolve with exit code 1"
+        diagnostic = "ERROR: No matching distribution found for setuptools"
+        output = '\n'.join([
+            json.dumps({"type": "runtime_core_update_log", "payload": {"message": "x" * 9000}}),
+            json.dumps({"type": "runtime_core_update_log", "payload": {"message": diagnostic}}),
+            json.dumps({"type": "error", "payload": {"message": message}}),
+        ])
+        with self.assertRaises(RuntimeError) as failure:
+            CHECK.protocol_payload(output, "runtime_core_update_plan")
+        detail = str(failure.exception)
+        self.assertTrue(detail.startswith(message + "\n"))
+        self.assertTrue(detail.endswith(diagnostic))
+        self.assertLessEqual(len(detail), len(message) + 8001)
 
 
 if __name__ == "__main__":

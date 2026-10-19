@@ -41,7 +41,20 @@ class RuntimePruningTests(unittest.TestCase):
         (core_meta_dir / "METADATA").write_text("Name: pymss-core\nVersion: 0.1.6\n", encoding="utf-8")
         (core_meta_dir / "RECORD").write_text("pymss_core/__init__.py,,\n", encoding="utf-8")
         (core_meta_dir / "WHEEL").write_text("Wheel-Version: 1.0\n", encoding="utf-8")
+        for name in ("setuptools", "wheel"):
+            package = site_packages / name
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            info = site_packages / f"{name}-78.1.0.dist-info"
+            info.mkdir()
+            (info / "METADATA").write_text(f"Name: {name}\nVersion: 78.1.0\n", encoding="utf-8")
         return runtime, site_packages
+
+    def _check_packaging_dependencies(self, site_packages: Path) -> None:
+        self.assertTrue((site_packages / "setuptools/__init__.py").is_file())
+        self.assertTrue((site_packages / "setuptools-78.1.0.dist-info/METADATA").is_file())
+        self.assertFalse((site_packages / "wheel").exists())
+        self.assertFalse((site_packages / "wheel-78.1.0.dist-info").exists())
 
     def test_windows_prune_keeps_runtime_versions_and_records(self) -> None:
         runtime, site_packages = self._write_sample_runtime(windows=True)
@@ -62,6 +75,7 @@ class RuntimePruningTests(unittest.TestCase):
             "-KeepVenv",
         ]
         subprocess.run(command, check=True, cwd=runtime, env={**os.environ, "OS": "Windows_NT"})
+        self._check_packaging_dependencies(site_packages)
 
         meta_dir = site_packages / "samplepkg-1.0.0.dist-info"
         self.assertTrue((meta_dir / "METADATA").exists())
@@ -91,6 +105,7 @@ class RuntimePruningTests(unittest.TestCase):
             cwd=runtime,
             env=os.environ.copy(),
         )
+        self._check_packaging_dependencies(site_packages)
 
         meta_dir = site_packages / "samplepkg-1.0.0.dist-info"
         self.assertTrue((meta_dir / "METADATA").exists())

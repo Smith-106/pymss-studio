@@ -10,6 +10,7 @@ export type OptionalPackageStatus = {
   present?: boolean
   version: string | null
   source: 'managed' | 'environment' | null
+  canUninstall?: boolean
   issue?: 'version_mismatch' | null
   runtimeIdentity: string
 }
@@ -177,7 +178,7 @@ function createOptionalRuntimePackage(packageName: string): OptionalRuntimePacka
     if (busy.value) throw new Error(`${packageName} package management is already running`)
     refreshSequence += 1
     checking.value = false
-    status.value = null
+    if (packageAction === 'install') status.value = null
     logs.value = []
     action.value = packageAction
     taskId.value = `optional_package_${packageName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`

@@ -70,6 +70,7 @@ let restored = false
 let initialActivation = true
 
 const funAsrInstalled = computed(() => Boolean(funAsrStatus.value?.installed))
+const funAsrCanUninstall = computed(() => Boolean((funAsrStatus.value?.present ?? funAsrStatus.value?.installed) && funAsrStatus.value?.canUninstall !== false))
 const funAsrNeedsRepair = computed(() => Boolean(funAsrStatus.value?.present && !funAsrStatus.value?.installed))
 const selectedPreset = computed(() => findAsrPreset(presetId.value) || ASR_PRESETS[0])
 const timestampOutputAvailable = computed(() => modelMode.value === 'local' || selectedPreset.value.supportsTimestamps)
@@ -202,6 +203,7 @@ async function cancelFunAsrManagement() {
 }
 
 function confirmFunAsrUninstall() {
+  if (!funAsrCanUninstall.value) return
   dialog.warning({
     title: t('tools.asrRuntimeUninstallTitle'),
     content: t('tools.asrRuntimeUninstallConfirm'),
@@ -423,7 +425,10 @@ watch(() => settings.outputDir, (value) => {
         >
           {{ t('tools.asrRuntimeInstallLog') }} · {{ dependencyLogs.length }}
         </n-button>
-        <n-button text size="tiny" type="error" :loading="dependencyBusy" :disabled="state.anyBusy || dependencyBusy" @click="confirmFunAsrUninstall">
+        <n-tag v-if="!funAsrCanUninstall" size="small" :bordered="false">
+          {{ t('tools.asrRuntimeProvidedByEnvironment') }}
+        </n-tag>
+        <n-button v-if="funAsrCanUninstall" text size="tiny" type="error" :loading="dependencyBusy" :disabled="state.anyBusy || dependencyBusy" @click="confirmFunAsrUninstall">
           {{ dependencyBusy ? t('tools.asrRuntimeUninstalling') : t('tools.asrRuntimeUninstall') }}
         </n-button>
         <n-button

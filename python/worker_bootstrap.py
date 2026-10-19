@@ -1253,6 +1253,11 @@ def _overlay_requirements(
     return requirements
 
 
+def _is_base_accelerator_package(name: str) -> bool:
+    name = canonicalize_name(name)
+    return name in {"torch", "torchaudio", "torchvision", "triton", "mlx"} or name.startswith(("nvidia-", "rocm-", "mlx-"))
+
+
 def _resolved_overlay_requirements(requirements: list[str], report: dict[str, Any]) -> list[str]:
     if report.get("version") != "1" or not isinstance(report.get("install"), list):
         raise RuntimeError("The package resolver returned an unsupported installation report")
@@ -1260,7 +1265,7 @@ def _resolved_overlay_requirements(requirements: list[str], report: dict[str, An
     for item in report["install"]:
         metadata = item["metadata"]
         name = canonicalize_name(metadata["name"])
-        if name in {"torch", "torchaudio", "torchvision", "triton"} or name.startswith(("nvidia-", "rocm-")):
+        if _is_base_accelerator_package(name):
             raise RuntimeError(f"The core update requires changing the base accelerator package {name}; the current runtime was preserved")
         version = str(Version(metadata["version"]))
         resolved[name] = _pin_manifest_requirement(resolved.get(name, name), version)

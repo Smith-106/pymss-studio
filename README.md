@@ -79,7 +79,7 @@ Choose a version on [GitHub Releases](https://github.com/pymss-project/pymss-stu
 | Linux | Build from source | The current release workflow does not produce Linux installers; see development prerequisites below. |
 | Intel Mac | No dedicated release package | The existing MLX package targets Apple Silicon; source builds still require checking inference dependency compatibility. |
 
-Release packages include a bootstrap Python runtime, so end users do not need to install system Python separately. Open **Settings → Runtime** to inspect, install, or switch environments supported by your platform.
+Release packages include Python, so end users do not need to install system Python separately. The macOS DMG includes the fixed Python, PyTorch, MLX, and bundled core packages; first launch does not download another Python environment. Open **Settings → Runtime** to inspect the active runtime and update its core. Installing, switching, reinstalling, or deleting an entire environment in the application is available only on Windows.
 
 ### File types
 
@@ -149,7 +149,7 @@ Open **Tools** to use these utilities independently of the separation workflow.
 | Audio slicing | Analyze silence and export clips, with minimum-length, threshold, and boundary-silence settings. |
 | Audio merging | Order a directory's files by name, modification time, or a regular expression, then export a WAV with consistent audio settings. |
 
-The optional FunASR component installs on demand; ASR models download and cache on first use. Download a model archive from the [GAME release](https://github.com/openvpi/GAME/releases/tag/v1.0.0) linked in the MIDI tool. **Keep the complete extracted directory: `model.pt` requires `config.yaml` beside it, and language-conditioned models also require `lang_map.json`.** Do not move the weights alone. Language, output, and parameter options depend on the selected tool and model.
+The optional FunASR component installs on demand; ASR models download and cache on first use. The ASR tool is currently unavailable on macOS. Download a model archive from the [GAME release](https://github.com/openvpi/GAME/releases/tag/v1.0.0) linked in the MIDI tool. **Keep the complete extracted directory: `model.pt` requires `config.yaml` beside it, and language-conditioned models also require `lang_map.json`.** Do not move the weights alone. Language, output, and parameter options depend on the selected tool and model.
 
 ## Data, runtimes, and updates
 
@@ -164,15 +164,19 @@ Settings, models, outputs, projects, logs, and temporary files share a data root
 | Windows portable package with a `pymss-studio.portable` marker beside the executable | `data/` beside the executable. |
 | Regular installed / other release packages | `.pymss-studio/` in the user directory, such as `%USERPROFILE%\.pymss-studio` on Windows. |
 
-The root defaults to `settings/`, `models/`, `outputs/`, `editor-projects/`, `logs/`, and `temp/`. Inference environments are managed separately: Windows / Linux generally use the installation resources' `python-runtime/runtime-envs/`; user-installed macOS environments use `runtime-envs/` under the data root.
+The root defaults to `settings/`, `models/`, `outputs/`, `editor-projects/`, `logs/`, and `temp/`. On macOS and Linux, writable runtime state is stored in `runtime-envs/` under this root: `active-runtime.json` selects the current core, `.overlays/` contains core updates and their dependencies, and `optional-packages/` contains separately installed components. On Windows, these paths remain under the selected runtime root's `runtime-envs/`, generally in `python-runtime/runtime-envs/` beside the installation resources. The macOS base Python environment stays inside the application bundle.
 
 **Editor projects reference audio files by path.** Back up the associated audio as well as the project. Relink missing assets in the editor after moving or deleting original outputs. Use the application's migration workflow when changing the model directory.
 
 ### Updates and environment management
 
-Open **Settings → About** for version and update information. Official Windows builds that support in-app updates can check and install updates there. Use the release page for other platforms or builds without automatic update support.
+Open **Settings → About** for version and update information. Windows and macOS builds whose release channel supports in-app updates can check and install updates there. Use the release page for builds without automatic update support. On macOS, an application update replaces the entire `.app`, preserving user data; administrator authorization is requested if write permissions are insufficient. Move the app to `/Applications` before updating: updates are blocked from a read-only DMG or App Translocation location. A change to the fixed base runtime contract requires a manual installation.
 
-Application updates and Python inference environment management are separate operations. Use **Settings → Runtime** to switch or maintain CPU / GPU environments. Dependency combinations are defined in [`python/runtime-manifest.json`](./python/runtime-manifest.json); avoid mixing unrelated Torch or backend versions into the bundled environments.
+Use **Settings → Runtime** to update `pymss`, `pymss-core`, and their compatible dependencies independently of the desktop application. Review the prepared version and dependency plan before confirming. Packages are installed into a new core overlay and activated only after validation; a compatible previous core can be restored when available. Updates that require replacing fixed accelerator components are rejected, preserving the active runtime. Dependency combinations are defined in [`python/runtime-manifest.json`](./python/runtime-manifest.json).
+
+Optional components such as FunASR use their own directories, separate from core overlays. Installation checks compatibility with the current PyTorch version and accelerator backend. On Windows and Linux, uninstalling FunASR removes its separate component directory and any copy installed directly in the active environment; downloaded models are kept. On macOS, component operations preserve packages in the bundled base runtime; the ASR tool remains unavailable. Pip and Numba caches are stored under the data root's `temp/` directory.
+
+On macOS, deleting `Pymss Studio.app` removes the application and bundled runtime while retaining the user data root, including settings, models, outputs, and core overlays. Removing and reinstalling the app therefore reuses retained data. Custom model/output directories and `.pymss-studio-previous-*.app` update backups beside the application must be managed separately.
 
 ## Troubleshooting
 
@@ -202,7 +206,7 @@ cd pymss-studio
 pnpm install --frozen-lockfile
 ```
 
-For a first full desktop development session, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. These commands prepare the bootstrap interpreter; the application installs Python inference dependencies according to its runtime manifest. Download model weights separately in the model library.
+For a first full desktop development session on Windows, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. The commands below prepare only the bootstrap interpreter. On macOS and Linux, prepare a compatible inference runtime separately or reuse a prepared bundled runtime; in-app installation of an entire environment is unavailable. Download model weights separately in the model library.
 
 Windows PowerShell:
 
