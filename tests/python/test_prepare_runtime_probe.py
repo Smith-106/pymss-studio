@@ -13,6 +13,28 @@ from unittest.mock import patch
 
 
 class PrepareRuntimeProbeTests(unittest.TestCase):
+    def test_windows_backend_extras_omit_missing_and_blank_requirements(self):
+        powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is required for Windows runtime preparation tests")
+        script = (Path(__file__).resolve().parents[2] / "scripts/prepare-python-runtime.ps1").read_text(encoding="utf-8")
+        helper = re.search(r"^function Get-ManifestBackendExtras \{\r?\n.*?^\}", script, re.M | re.S)
+        self.assertIsNotNone(helper)
+        invocation = helper.group(0) + '''
+$ErrorActionPreference = "Stop"
+$runtimeManifest = '{"backends":{"rocm":{},"cpu":{"extras":[]},"cuda":{"extras":[null,"","  ","onnxruntime>=1"]}}}' | ConvertFrom-Json
+$result = @{}
+foreach ($backend in @("rocm", "cpu", "cuda", "unknown")) {
+    $result[$backend] = @(Get-ManifestBackendExtras $backend)
+}
+$result | ConvertTo-Json -Compress
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.ps1"
+            path.write_text(invocation, encoding="utf-8-sig")
+            result = subprocess.run([powershell, "-NoProfile", "-File", str(path)], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {"rocm": [], "cpu": [], "cuda": ["onnxruntime>=1"], "unknown": []})
+
     def test_probe_template_executes_after_production_replacement(self):
         script = (Path(__file__).resolve().parents[2] / "scripts/prepare-python-runtime.ps1").read_text(
             encoding="utf-8",

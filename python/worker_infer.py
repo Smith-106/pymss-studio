@@ -181,6 +181,8 @@ def _studio_separator_type() -> type[Any]:
             return updated
 
         def __init__(self, *args: Any, output_naming: Any = None, output_model: str = "", **kwargs: Any) -> None:
+            from worker_rocm import configure_rocm_runtime
+            configure_rocm_runtime(kwargs.get("device", "auto"), kwargs.get("device_ids"), kwargs.get("logger"))
             super().__init__(*args, **kwargs)
             self._studio_naming = _normalize_output_naming(output_naming)
             self._studio_output_model = output_model
@@ -204,6 +206,14 @@ def _studio_separator_type() -> type[Any]:
                 str(stem).strip().lower(): index
                 for index, stem in enumerate(ordered_stems)
             }
+
+        def separate(self, *args: Any, **kwargs: Any) -> Any:
+            from worker_rocm import run_rocm_inference
+            separate = super().separate
+            return run_rocm_inference(
+                lambda: separate(*args, **kwargs), getattr(self, "device", "auto"),
+                getattr(self, "device_ids", None), getattr(self, "logger", None),
+            )
 
         def _calculate_expected_output_count(self) -> int:
             try:

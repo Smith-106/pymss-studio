@@ -54,7 +54,9 @@ function Get-ManifestBackendExtras {
     )
     $backendProperty = $runtimeManifest.backends.PSObject.Properties[$Backend]
     if (!$backendProperty) { return @() }
-    return @($backendProperty.Value.extras | ForEach-Object { [string]$_ })
+    return @($backendProperty.Value.extras |
+        Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) } |
+        ForEach-Object { [string]$_ })
 }
 
 function Resolve-ManifestBackend {
