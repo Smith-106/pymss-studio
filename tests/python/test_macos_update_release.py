@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+BASH_EXECUTABLE = shutil.which("bash")
 
 
 def load_script(name):
@@ -30,13 +31,14 @@ MANIFEST = json.loads((ROOT / "python/runtime-manifest.json").read_text(encoding
 
 
 class MacosUpdateReleaseTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("bash"), "Bash is required for the installer snapshot check")
+    @unittest.skipUnless(BASH_EXECUTABLE, "Bash is required for the installer snapshot check")
     def test_authorized_snapshot_rejects_changed_bytes_and_ignores_later_source_changes(self):
         installer = (ROOT / "scripts/install-macos-update.sh").read_text(encoding="utf-8")
         snapshot = installer.split("# Hash and unpack a root-owned snapshot,", 1)[1]
         snapshot = snapshot[snapshot.index("/bin/cp"):snapshot.index('/bin/mkdir "$control/private/extracted"')]
-        # Git Bash installs shasum in core_perl rather than /usr/bin.
-        snapshot = snapshot.replace("/usr/bin/shasum", "shasum")
+        # Non-login Git Bash does not always include core_perl in PATH.
+        if os.name == "nt":
+            snapshot = snapshot.replace("/usr/bin/shasum -a 256", "/usr/bin/sha256sum")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "private").mkdir()
@@ -47,12 +49,12 @@ class MacosUpdateReleaseTests(unittest.TestCase):
 
             def run_snapshot():
                 return subprocess.run(
-                    ["bash", "-c", command, "snapshot-test", root.as_posix(), archive.as_posix(), digest],
+                    [BASH_EXECUTABLE, "-c", command, "snapshot-test", root.as_posix(), archive.as_posix(), digest],
                     capture_output=True, text=True, check=False,
                 )
 
             result = run_snapshot()
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 0, f"bash: {BASH_EXECUTABLE}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
             archive.write_bytes(b"changed after snapshot")
             self.assertEqual((root / "private/update.app.tar.gz").read_bytes(), b"authenticated archive")
             result = run_snapshot()

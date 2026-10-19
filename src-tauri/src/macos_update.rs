@@ -322,8 +322,8 @@ mod platform {
             return Err(failure("The updated application executable is missing"));
         }
         if !Command::new("/usr/bin/lipo")
-            .args(["-verify_arch", "arm64"])
             .arg(bundle.join("Contents/MacOS").join(executable))
+            .args(["-verify_arch", "arm64"])
             .status()?
             .success()
         {
@@ -732,10 +732,19 @@ mod platform {
         use super::*;
 
         fn signed_bundle(parent: &Path, name: &str, version: &str) -> PathBuf {
+            signed_bundle_with_arch(parent, name, version, "arm64")
+        }
+
+        fn signed_bundle_with_arch(
+            parent: &Path,
+            name: &str,
+            version: &str,
+            architecture: &str,
+        ) -> PathBuf {
             let bundle = parent.join(name);
             fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
             let mut compiler = Command::new("/usr/bin/clang")
-                .args(["-arch", "arm64", "-x", "c", "-", "-o"])
+                .args(["-arch", architecture, "-x", "c", "-", "-o"])
                 .arg(bundle.join("Contents/MacOS/pymss-studio"))
                 .stdin(Stdio::piped())
                 .spawn()
@@ -770,6 +779,14 @@ mod platform {
                 .unwrap()
                 .success());
             bundle
+        }
+
+        #[test]
+        fn rejects_signed_bundles_without_arm64() {
+            let root = tempfile::tempdir().unwrap();
+            let bundle = signed_bundle_with_arch(root.path(), "Intel.app", "1.0.0", "x86_64");
+            let error = validate_bundle(&bundle, Some("1.0.0")).unwrap_err();
+            assert!(error.to_string().contains("Apple Silicon executable"));
         }
 
         #[test]

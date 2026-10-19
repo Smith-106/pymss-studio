@@ -218,7 +218,7 @@ class OptionalRuntimePackageTests(unittest.TestCase):
         (legacy / "funasr").mkdir(parents=True)
         runtime = optional_packages._runtime_context()
         self.assertEqual(runtime.backend, "cuda")
-        self.assertEqual(runtime.packages_dir, legacy)
+        self.assertEqual(runtime.packages_dir.resolve(), legacy.resolve())
 
     def test_macos_default_component_root_is_outside_the_application(self) -> None:
         with mock.patch.dict(os.environ, {"PYMSS_STUDIO_DATA_ROOT": str(self.root / "data")}), \

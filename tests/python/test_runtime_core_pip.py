@@ -30,12 +30,21 @@ class OfflineCoreUpdateTests(unittest.TestCase):
     def test_bundle_replacement_preserves_core_components_and_rollback(self):
         self.run_offline_update(bundled=True, replace_bundle=True)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX directory symlinks")
+    def test_bundled_runtime_update_and_rollback_through_a_directory_alias(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        physical = root / "physical"
+        physical.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        self.run_offline_update(bundled=True, temporary_parent=alias)
+
     @unittest.skipUnless(shutil.which("bash"), "Bash is required for runtime pruning")
     def test_pruned_bundled_runtime_preserves_torch_dependencies_for_offline_updates(self):
         self.run_offline_update(bundled=True, pruned=True)
 
-    def run_offline_update(self, *, bundled, pruned=False, replace_bundle=False):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+    def run_offline_update(self, *, bundled, pruned=False, replace_bundle=False, temporary_parent=None):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=temporary_parent)))
         envs = root / "runtime-envs"
         envs.mkdir()
         bundled_envs = root / "Installed.app/Contents/Resources/python-runtime/runtime-envs"
@@ -226,7 +235,10 @@ class OfflineCoreUpdateTests(unittest.TestCase):
                 env=worker._probe_environment(Path(installed["overlayPath"]), python_path=python),
                 capture_output=True, text=True, timeout=30, check=True,
             )
-            self.assertTrue(Path(loaded.stdout.strip()).is_relative_to(Path(installed["overlayPath"])))
+            self.assertTrue(
+                Path(loaded.stdout.strip()).resolve().is_relative_to(Path(installed["overlayPath"]).resolve()),
+                f"The worker loaded the core outside the active overlay: {loaded.stdout.strip()}",
+            )
             if replace_bundle:
                 with mock.patch.dict(os.environ, {
                     "PIP_NO_INDEX": "1", "PIP_FIND_LINKS": wheels.as_uri(), "PIP_CONFIG_FILE": os.devnull,
@@ -274,7 +286,10 @@ class OfflineCoreUpdateTests(unittest.TestCase):
                 env=worker._probe_environment(python_path=python),
                 capture_output=True, text=True, timeout=30, check=True,
             )
-            self.assertTrue(Path(loaded.stdout.strip()).is_relative_to(base))
+            self.assertTrue(
+                Path(loaded.stdout.strip()).resolve().is_relative_to(base.resolve()),
+                f"Rollback loaded the core outside the base runtime: {loaded.stdout.strip()} (expected {base.resolve()})",
+            )
             if replace_bundle:
                 check_fresh_component(base)
                 for path in user_files:
