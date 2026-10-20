@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { darkTheme } from 'naive-ui'
@@ -21,6 +23,8 @@ import { useWorkbenchStore } from '@/stores/workbench'
 import type { WorkflowRuntimeBindings } from '@/workflows/workbench'
 import { activeRuntimeEnvironment, runtimeBackendLabel, runtimeCoreSyncAvailable, runtimeCoreUpdateAvailable as hasRuntimeCoreUpdate } from '@/utils/runtime'
 import { connectWorkerEvents } from '@/utils/events'
+
+const studioLog = createLogger('ui.App')
 
 const settings = useSettingsStore()
 const app = useAppStore()
@@ -152,7 +156,7 @@ function startBackgroundWarmups() {
 
 async function reconnectWorkerEvents() {
   await connectWorkerEvents(app).catch((error) => {
-    console.warn('Failed to reconnect worker events', error)
+    studioLog.warn('Failed to reconnect worker events', error)
   })
 }
 
@@ -233,7 +237,7 @@ async function listenForMainWorkflowEvent<T>(event: string, handler: EventCallba
 
 function handleWorkflowEditorClosed(kind: 'advanced' | 'simple', label?: string) {
   void workflow.handleEditorClosed(kind, label).catch((error) => {
-    console.warn('Failed to refresh workflows after editor closed', error)
+    studioLog.warn('Failed to refresh workflows after editor closed', error)
   })
 }
 
@@ -246,7 +250,7 @@ onMounted(async () => {
       workflow.applyEditorSnapshot(event.payload)
     })
     if (isMainTaskOwner() && !isStandaloneRoute.value) {
-      try { await workflow.refreshEditorWindows() } catch (error) { console.warn('Failed to refresh workflow editors', error) }
+      try { await workflow.refreshEditorWindows() } catch (error) { studioLog.warn('Failed to refresh workflow editors', error) }
     }
     await listenForMainWorkflowEvent<{ label?: string }>('pymss://workflow-node-editor-closed', event => {
       handleWorkflowEditorClosed('advanced', event.payload?.label)

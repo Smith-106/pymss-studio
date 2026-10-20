@@ -17,14 +17,15 @@ const stateFor = (available: boolean | null | undefined, missing: DiagnosticStat
   available === true ? 'ok' : available === false ? missing : 'unknown'
 
 export function isDiagnosticIssueEvent(event: { type?: string; payload?: unknown }): boolean {
-  if (/error|failed|warning|cancelled/i.test(String(event.type))) return true
+  if (/error|failed|warning/i.test(String(event.type))) return true
   if (!event.payload || typeof event.payload !== 'object') return false
   const payload = event.payload as Record<string, unknown>
   if (event.type === 'workflow_execution') {
-    return /(?:^|_)(?:failed|cancelled)$/i.test(String(payload.event || ''))
+    return /(?:^|_)failed$/i.test(String(payload.event || ''))
   }
-  return (event.type === 'task_log' || event.type === 'download_log')
-    && ['warn', 'warning', 'error', 'fatal', 'critical'].includes(String(payload.level || '').toLowerCase())
+  const record = payload.logRecord && typeof payload.logRecord === 'object' ? payload.logRecord as Record<string, unknown> : payload
+  return ['task_log', 'worker_log', 'download_log', 'optional_package_log', 'runtime_install_log', 'runtime_core_update_log'].includes(String(event.type))
+    && ['warn', 'warning', 'error', 'fatal', 'critical'].includes(String(record.level || '').toLowerCase())
 }
 
 export function buildDiagnosticChecks(input: {

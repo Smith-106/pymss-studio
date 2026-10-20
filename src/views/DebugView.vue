@@ -29,6 +29,7 @@ import { detectRuntimePlatform } from '@/utils/runtime'
 import { isTauriRuntime } from '@/utils/appStore'
 import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import { formatBytes } from '@/utils/format'
+import { normalizeLogRecord, formatLogRecord, logContextPreview, logMessagePreview, locationLabel, logClock, sourceLabel, type LogRecord } from '@/utils/logRecord'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -46,7 +47,7 @@ const { downloadTasks } = storeToRefs(modelStore)
 
 type DebugTab = 'overview' | 'runtime' | 'activity' | 'models' | 'events' | 'logs' | 'paths'
 type CatalogEditMode = 'simple' | 'advanced'
-type DebugLogLevelFilter = 'all' | 'error' | 'warn' | 'info' | 'debug'
+type DebugLogLevelFilter = 'all' | 'error' | 'warn' | 'info' | 'debug' | 'unclassified'
 type DebugLogCategoryFilter = 'all' | 'issues' | 'traceback' | 'pymss' | 'worker' | 'app' | 'runtime' | 'store' | 'other'
 type DebugCatalogInfo = {
   baseCatalogPath: string
@@ -140,6 +141,7 @@ type DebugLogReport = {
   sizeBytes: number
 }
 type ParsedDebugLogLine = {
+  record: LogRecord
   id: string
   timestamp: string
   severity: DebugLogLevelFilter
@@ -151,6 +153,7 @@ type ParsedDebugLogLine = {
   command: string
   stage: string
   message: string
+  messageContext: string
   details: string
   location: string
   traceback: string
@@ -650,6 +653,7 @@ const debugLogLevelOptions = computed(() => [
   { label: 'WARN', value: 'warn' },
   { label: 'INFO', value: 'info' },
   { label: 'DEBUG', value: 'debug' },
+  { label: t('debug.logUnclassified'), value: 'unclassified' },
 ] as Array<{ label: string; value: DebugLogLevelFilter }>)
 const debugLogSourceOptions = computed(() => {
   const sources = Array.from(new Set(parsedDebugLogLines.value.map((line) => line.sourceKind).filter(Boolean))).sort()
@@ -670,7 +674,7 @@ const debugLogCategoryOptions = computed(() => [
   { label: t('debug.logCategoryOther'), value: 'other' },
 ] as Array<{ label: string; value: DebugLogCategoryFilter }>)
 const debugLogTaskOptions = computed(() => {
-  const tasks = Array.from(new Set(parsedDebugLogLines.value.map((line) => line.taskId).filter(Boolean))).sort()
+  const tasks = Array.from(new Set(parsedDebugLogLines.value.flatMap((line) => [line.taskId, ...(Array.isArray(line.record.context.taskIds) ? line.record.context.taskIds.filter((id): id is string => typeof id === 'string') : [])]).filter(Boolean))).sort()
   if (debugLogTask.value !== 'all' && !tasks.includes(debugLogTask.value)) tasks.unshift(debugLogTask.value)
   return [
     { label: t('debug.logFilterAllTasks'), value: 'all' },
@@ -682,7 +686,7 @@ const filteredDebugLogLines = computed(() => {
   return parsedDebugLogLines.value.filter((line) => {
     if (debugLogLevel.value !== 'all' && line.severity !== debugLogLevel.value) return false
     if (debugLogSource.value !== 'all' && line.sourceKind !== debugLogSource.value) return false
-    if (debugLogTask.value !== 'all' && line.taskId !== debugLogTask.value) return false
+    if (debugLogTask.value !== 'all' && line.taskId !== debugLogTask.value && !(Array.isArray(line.record.context.taskIds) && line.record.context.taskIds.includes(debugLogTask.value))) return false
     if (debugLogCategory.value === 'issues' && !line.hasIssue) return false
     if (debugLogCategory.value === 'traceback' && !line.traceback) return false
     if (!['all', 'issues', 'traceback'].includes(debugLogCategory.value) && line.category !== debugLogCategory.value) return false
@@ -899,7 +903,7 @@ function showExecutionLogs(taskId: string) {
 const executionLogText = computed(() => [
   ...(executionLogTask.value?.logs || []),
   ...Object.entries(executionLogTask.value?.nodeLogs || {}).flatMap(([id, lines]) => [`[node:${id}]`, ...lines]),
-].join('\n'))
+].map(entry => formatLogRecord(normalizeLogRecord(entry))).join('\n'))
 
 const taskStatusKeys: Record<string, string> = {
   queued: 'tasks.statusQueued', preparing: 'tasks.statusPreparing', validating_input: 'tasks.statusValidatingInput',
@@ -1031,6 +1035,8 @@ async function scrollDebugLogToLatest() {
 
 async function loadDebugLog() {
   if (!developerMode.value || debugLogLoading.value) return
+  const scroller = debugLogScroller.value
+  const followLatest = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48
   debugLogLoading.value = true
   debugLogError.value = ''
   try {
@@ -1040,7 +1046,7 @@ async function loadDebugLog() {
     ])
     debugLogInfo.value = info
     debugLogContent.value = content
-    await scrollDebugLogToLatest()
+    if (followLatest) await scrollDebugLogToLatest()
   } catch (error) {
     debugLogError.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -1064,7 +1070,7 @@ async function clearDebugLog() {
 }
 
 async function copyDebugLog() {
-  const content = filteredDebugLogLines.value.map(line => line.raw).join('\n')
+  const content = filteredDebugLogLines.value.map(line => formatLogRecord(line.record)).join('\n')
   if (!content) return
   try {
     await navigator.clipboard.writeText(content)
@@ -1158,138 +1164,20 @@ async function restoreRuntimeDebugFile(file: DebugRuntimeFileInfo) {
 }
 
 function parseDebugLogLine(raw: string, index: number): ParsedDebugLogLine {
-  const appMatch = raw.match(/^(\S+)\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+(\S+)(?:\s+(.*))?$/)
-  const workerMatch = raw.match(/^(\S+)\s+PY\s+(\S+)(?:\s+(.*))?$/)
-  if (!appMatch && !workerMatch) {
-    const severity = inferLogSeverity('', raw)
-    return {
-      id: `${index}-${raw}`,
-      timestamp: '',
-      severity,
-      level: '',
-      source: '',
-      sourceKind: 'plain',
-      category: 'other',
-      taskId: '',
-      command: '',
-      stage: '',
-      message: raw,
-      details: '',
-      location: extractLogLocation(raw),
-      traceback: extractTraceback(raw),
-      hasIssue: severity === 'error' || severity === 'warn',
-      fields: {},
-      raw,
-    }
-  }
-
-  const timestamp = appMatch?.[1] || workerMatch?.[1] || ''
-  const level = appMatch?.[2] || 'PY'
-  const source = appMatch?.[3] || workerMatch?.[2] || ''
-  const attributes = appMatch?.[4] || workerMatch?.[3] || ''
-
-  const fields: Record<string, string> = {}
-  const fieldPattern = /([A-Za-z][\w]*)=(?:"((?:\\.|[^"])*)"|(\S+))/g
-  for (const field of attributes.matchAll(fieldPattern)) {
-    fields[field[1]] = parseDebugLogFieldValue(field[2] ?? field[3] ?? '')
-  }
-  const details = attributes.replace(fieldPattern, '').replace(/\s+/g, ' ').trim()
-  const fieldDetails = Object.entries(fields)
-    .filter(([key]) => key !== 'message' && key !== 'detail')
-    .map(([key, value]) => `${key}=${value}`)
-    .join(' ')
-  const embedded = parseEmbeddedLogMessage(fields.message || details)
-  const rawMessage = embedded.message || fields.message || details
-  const detail = fields.detail || ''
-  const location = extractLogLocation(`${rawMessage}\n${detail}\n${fieldDetails}`)
-  const message = stripLeadingLogLocation(rawMessage, location)
-  const traceback = extractTraceback(detail || message || raw)
-  const severity = inferLogSeverity(embedded.level || level, `${source}\n${message}\n${detail}`)
-  const sourceKind = inferLogSourceKind(source, rawMessage)
-  const category = inferLogCategory(source, sourceKind, rawMessage, fields)
-
+  const record = normalizeLogRecord(raw, index)
+  const severity: DebugLogLevelFilter = record.level === 'fatal' ? 'error'
+    : record.level === 'trace' ? 'debug' : record.level || 'unclassified'
+  const fields = Object.fromEntries(Object.entries({ ...record.context, taskId: record.taskId, nodeId: record.nodeId, jobId: record.jobId, requestId: record.requestId }).filter(([, value]) => value != null).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]))
+  const details = Object.entries(fields).map(([key, value]) => `${key}=${value}`).join('\n')
   return {
-    id: `${index}-${raw}`,
-    timestamp: formatDebugLogTimestamp(timestamp),
-    severity,
-    level: embedded.level || level,
-    source,
-    sourceKind,
-    category,
-    taskId: fields.taskId || '',
-    command: fields.command || '',
-    stage: fields.stage || '',
-    message,
-    details: [details && details !== message ? details : '', fieldDetails].filter(Boolean).join(' '),
-    location,
-    traceback,
-    hasIssue: severity === 'error' || severity === 'warn' || Boolean(traceback),
-    fields,
-    raw,
+    record, id: record.id, timestamp: logClock(record.timestamp), severity,
+    level: record.level?.toUpperCase() || t('debug.logUnclassified'),
+    source: (record.logger === 'logger' && record.location?.file ? record.location.file.replaceAll('\\', '/').split('/').pop() : record.logger) || record.event, sourceKind: record.source,
+    category: inferLogCategory(record.event, record.source, '', fields),
+    taskId: record.taskId || record.jobId || '', command: fields.command || '', stage: fields.stage || '',
+    message: record.message, messageContext: logContextPreview(record), details, location: locationLabel(record),
+    traceback: record.detail || '', hasIssue: severity === 'error' || severity === 'warn', fields, raw,
   }
-}
-
-function parseDebugLogFieldValue(value: string) {
-  if (!value) return ''
-  if (!/[\\"]/.test(value)) return value
-  try {
-    return JSON.parse(`"${value}"`)
-  } catch {
-    return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
-  }
-}
-
-function inferLogSeverity(level: string, text: string): DebugLogLevelFilter {
-  const normalized = normalizeLogLevel(level).toLowerCase()
-  if (normalized === 'fatal' || normalized === 'error') return 'error'
-  if (normalized === 'warn' || normalized === 'warning') return 'warn'
-  if (normalized === 'debug' || normalized === 'trace') return 'debug'
-  const lowered = text.toLowerCase()
-  if (lowered.includes('traceback') || lowered.includes('exception') || lowered.includes('failed')) return 'error'
-  if (lowered.includes(' warn ') || lowered.includes('cannot separate') || lowered.includes('unable to')) return 'warn'
-  return 'info'
-}
-
-function parseEmbeddedLogMessage(message: string) {
-  const text = String(message || '').trim()
-  const pymssMatch = text.match(/^(?:\d{2}:\d{2}:\d{2}\s+\|\s+)?(TRC|TRACE|DBG|DEBUG|INF|INFO|WRN|WARN|WARNING|ERR|ERROR|FTL|FATAL)\s+\|\s+(.+)$/)
-  if (pymssMatch) {
-    return {
-      level: normalizeLogLevel(pymssMatch[1]),
-      message: pymssMatch[2].trim(),
-    }
-  }
-  const pipeMatch = text.match(/^(.+?\.py:\d+)\s+\|\s+(.*)$/)
-  if (pipeMatch) {
-    return {
-      level: '',
-      message: `${pipeMatch[1]} | ${pipeMatch[2]}`.trim(),
-    }
-  }
-  return { level: '', message: text }
-}
-
-function normalizeLogLevel(level: string) {
-  const value = String(level || '').trim().toUpperCase()
-  const aliases: Record<string, string> = {
-    TRC: 'TRACE',
-    DBG: 'DEBUG',
-    INF: 'INFO',
-    WRN: 'WARN',
-    WARNING: 'WARN',
-    ERR: 'ERROR',
-    FTL: 'FATAL',
-  }
-  return aliases[value] || value
-}
-
-function inferLogSourceKind(source: string, message: string) {
-  const text = `${source} ${message}`.toLowerCase()
-  if (text.includes('pymss') || text.includes('separator.py')) return 'pymss'
-  if (text.includes('worker.')) return 'worker'
-  if (text.includes('app.')) return 'app'
-  if (text.includes('log.')) return 'log'
-  return source ? 'other' : 'plain'
 }
 
 function inferLogCategory(source: string, sourceKind: string, message: string, fields: Record<string, string>): DebugLogCategoryFilter {
@@ -1298,78 +1186,16 @@ function inferLogCategory(source: string, sourceKind: string, message: string, f
   if (text.includes('runtime') || text.includes('env_info') || text.includes('pythonpath')) return 'runtime'
   if (text.includes('app.store') || text.includes('store.')) return 'store'
   if (sourceKind === 'worker' || text.includes('worker.')) return 'worker'
-  if (sourceKind === 'app' || text.includes('app.')) return 'app'
+  if (sourceKind === 'studio' || sourceKind === 'app' || text.includes('app.')) return 'app'
   return 'other'
 }
 
 function logSourceLabel(source: string) {
-  const labels: Record<string, string> = {
-    app: 'App',
-    log: 'Log',
-    other: t('debug.logSourceOther'),
-    plain: t('debug.logSourcePlain'),
-    pymss: 'pymss',
-    worker: 'Worker',
-  }
-  return labels[source] || source
-}
-
-function extractLogLocation(text: string) {
-  const value = String(text || '')
-  const pipeLocation = value.match(/\|\s*([^|\n]+?\.py):(\d+)\s*\|/)
-  if (pipeLocation) return `${pipeLocation[1]}:${pipeLocation[2]}`
-  const tracebackFrame = value.match(/File\s+"([^"]+)",\s+line\s+(\d+),\s+in\s+([^\n]+)/)
-  if (tracebackFrame) return `${tracebackFrame[1]}:${tracebackFrame[2]} in ${tracebackFrame[3].trim()}`
-  const shortFrame = value.match(/([A-Za-z]:)?[^\s|]+\.py:(\d+)/)
-  return shortFrame ? shortFrame[0] : ''
-}
-
-function stripLeadingLogLocation(message: string, location: string) {
-  let text = String(message || '').trim()
-  if (!location) return text
-  const escaped = location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  text = text.replace(new RegExp(`^${escaped}\\s*\\|\\s*`), '')
-  text = text.replace(/^.*?\.py:\d+\s*\|\s*/, '')
-  return text.trim()
-}
-
-function extractTraceback(text: string) {
-  const value = String(text || '').trim()
-  if (!value) return ''
-  const marker = value.indexOf('Traceback (most recent call last):')
-  if (marker >= 0) return formatTracebackText(value.slice(marker))
-  if (/File\s+"[^"]+",\s+line\s+\d+,\s+in\s+/.test(value)) return formatTracebackText(value)
-  return ''
-}
-
-function formatTracebackText(value: string) {
-  return value
-    .replace(/\\n/g, '\n')
-    .replace(/\s+(File\s+")/g, '\n  $1')
-    .replace(/\s+([A-Za-z_][\w.]+(?:Error|Exception|Warning):)/g, '\n$1')
-    .trim()
-}
-
-function debugLogLineText(line: ParsedDebugLogLine) {
-  return [line.message, line.details].filter(Boolean).join(' ')
-}
-
-function debugLogLineSource(line: ParsedDebugLogLine) {
-  const source = logSourceLabel(line.sourceKind)
-  if (!line.category || line.category === 'all' || line.category === line.sourceKind) return source
-  return `${source}/${logCategoryLabel(line.category)}`
-}
-
-function debugLogLineLocation(line: ParsedDebugLogLine) {
-  const location = line.location.trim()
-  if (!location) return '-'
-  const normalized = location.replace(/\\/g, '/')
-  const fileMatch = normalized.match(/([^/]+\.py:\d+(?:\s+in\s+.+)?)$/)
-  return fileMatch?.[1] || location
+  return source === 'third_party' ? t('debug.logSourceExternal') : sourceLabel(source as LogRecord['source'])
 }
 
 function canExpandDebugLogLine(line: ParsedDebugLogLine) {
-  return Boolean(line.traceback || line.severity === 'error' || (line.severity === 'warn' && (line.location || line.details)))
+  return Boolean(line.raw || line.traceback || line.location || line.details)
 }
 
 function logCategoryLabel(category: DebugLogCategoryFilter) {
@@ -1391,15 +1217,6 @@ function clearDebugLogFilters() {
   debugLogCategory.value = 'all'
   debugLogSource.value = 'all'
   debugLogTask.value = 'all'
-}
-
-function formatDebugLogTimestamp(value: string) {
-  const epoch = value.match(/^(\d+)\.(\d{3})Z?$/)
-  const date = epoch
-    ? new Date(Number(epoch[1]) * 1000 + Number(epoch[2]))
-    : new Date(value)
-  if (!Number.isFinite(date.getTime())) return value
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`
 }
 
 function syncRuntimeOverrideFromCurrent(force = false) {
@@ -2281,34 +2098,47 @@ watch(developerMode, (enabled) => {
           <div class="debug-log-table__head" aria-hidden="true">
             <span>{{ t('debug.logColumnTime') }}</span>
             <span>{{ t('debug.logColumnLevel') }}</span>
-            <span>{{ t('debug.logColumnCategory') }}</span>
-            <span>{{ t('debug.logColumnLocation') }}</span>
+            <span>{{ t('debug.logColumnSource') }}</span>
+            <span>{{ t('debug.logColumnModule') }}</span>
+            <span>{{ t('debug.logColumnScope') }}</span>
             <span>{{ t('debug.logColumnMessage') }}</span>
           </div>
           <article
             v-for="line in filteredDebugLogLines"
             :key="line.id"
             class="debug-log-row"
-            :class="[`debug-log-row--${line.severity}`, { 'debug-log-row--expandable': canExpandDebugLogLine(line) }]"
-            :title="line.raw"
+            :class="[`debug-log-row--${line.severity}`, `log-source--${line.sourceKind}`, { 'debug-log-row--expandable': canExpandDebugLogLine(line) }]"
+            :title="logMessagePreview(line.record)"
+            tabindex="0"
+            :aria-expanded="Boolean(expandedDebugLogLines[line.id])"
+            @keydown.enter.prevent="toggleDebugLogLine(line)"
+            @keydown.space.prevent="toggleDebugLogLine(line)"
             @click="toggleDebugLogLine(line)"
           >
             <code class="debug-log-row__time">{{ line.timestamp || '-' }}</code>
             <span class="debug-log-row__level">{{ line.level || line.severity }}</span>
-            <code class="debug-log-row__source" :title="line.source || '-'">{{ debugLogLineSource(line) }}</code>
-            <code class="debug-log-row__location" :title="line.location || '-'">{{ debugLogLineLocation(line) }}</code>
-            <span class="debug-log-row__message">{{ line.message || line.raw }}</span>
-            <div v-if="expandedDebugLogLines[line.id]" class="debug-log-row__detail">
+            <code class="debug-log-row__source" :title="line.source || '-'">{{ logSourceLabel(line.sourceKind) }}</code>
+            <code class="debug-log-row__module" :title="line.source">{{ line.source || '—' }}</code>
+            <code class="debug-log-row__location" :title="[line.taskId, line.record.nodeId].filter(Boolean).join(' / ')">{{ line.record.nodeId || shortTaskId(line.taskId) || '—' }}</code>
+            <span class="debug-log-row__message"><span class="debug-log-row__message-text">{{ line.message || line.record.event || line.raw }}</span><span v-if="line.messageContext" class="debug-log-row__message-context"> · {{ line.messageContext }}</span></span>
+            <div v-if="expandedDebugLogLines[line.id]" class="debug-log-row__detail" @click.stop @keydown.stop>
+              <div v-if="line.message" class="debug-log-row__full-message">
+                <span>{{ t('debug.logColumnMessage') }}</span>
+                <pre>{{ line.message }}</pre>
+              </div>
               <div v-if="line.location" class="debug-log-row__location-detail">
                 <span>{{ t('debug.logLocation') }}</span>
                 <code>{{ line.location }}</code>
               </div>
               <pre v-if="line.traceback">{{ line.traceback }}</pre>
-              <pre v-if="line.details && !line.traceback">{{ line.details }}</pre>
-              <details class="debug-log-row__raw">
-                <summary>{{ t('debug.logRawLine') }}</summary>
+              <pre v-if="line.details">{{ line.details }}</pre>
+              <div class="debug-log-row__raw">
+                <div class="debug-log-row__raw-head">
+                  <span>{{ t('debug.logRawLine') }}</span>
+                  <n-button size="tiny" quaternary @click.stop="copyText(line.raw, 'debug.logCopied')">{{ t('common.copy') }}</n-button>
+                </div>
                 <pre>{{ line.raw }}</pre>
-              </details>
+              </div>
             </div>
           </article>
         </div>
@@ -3188,9 +3018,12 @@ watch(developerMode, (enabled) => {
   border-radius: 10px;
   background: color-mix(in srgb, #0c111d 92%, var(--surface-1));
   color: #d9e2f1;
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
-  font-size: 12px;
-  line-height: 1.5;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 13px;
+  font-weight: 400;
+  font-synthesis: none;
+  font-variant-ligatures: none;
+  line-height: 1.6;
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.46) transparent;
 }
@@ -3223,10 +3056,10 @@ watch(developerMode, (enabled) => {
 .debug-log-table__head,
 .debug-log-row {
   display: grid;
-  grid-template-columns: 72px 58px 126px 150px minmax(360px, 1fr);
+  grid-template-columns: 94px 68px 78px 138px 112px minmax(260px, 1fr);
   align-items: baseline;
   gap: 7px;
-  min-width: 820px;
+  min-width: 860px;
 }
 
 .debug-log-table__head {
@@ -3257,6 +3090,7 @@ watch(developerMode, (enabled) => {
 
 .debug-log-row__time,
 .debug-log-row__source,
+.debug-log-row__module,
 .debug-log-row__location,
 .debug-log-row__message {
   min-width: 0;
@@ -3277,18 +3111,47 @@ watch(developerMode, (enabled) => {
   color: #cbd5e1;
   font-size: 11px;
   font-weight: 700;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
   text-align: center;
 }
 
 .debug-log-row__source {
-  color: #a5b4fc;
-  font-size: 11px;
+  justify-self: start;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--log-source-color) 32%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--log-source-color) 10%, transparent);
+  color: var(--log-source-color);
+  font-size: 10px;
 }
+.debug-log-row__module { color: #a7b5cb; font-size: 11px; }
+.log-source--studio { --log-source-color: #93baff; }
+.log-source--worker { --log-source-color: #67d7d0; }
+.log-source--pymss { --log-source-color: #c7a6ff; }
+.log-source--third_party { --log-source-color: #ffc58b; }
+.log-source--unknown { --log-source-color: #a7b5cb; }
+.debug-log-row--warn { background: #facc1508; box-shadow: inset 3px 0 #d5a83f; }
+.debug-log-row--error { background: #fca5a50b; box-shadow: inset 3px 0 #e88191; }
+.debug-log-row:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
 
 .debug-log-row__message {
-  color: #e2e8f0;
-  white-space: pre-wrap;
-  word-break: break-word;
+  color: #cbd5e1;
+  font-weight: 400;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.debug-log-row__message-context {
+  color: #94a3b8;
+}
+
+.debug-log-row__full-message > span {
+  color: #91a2b8;
+  font-size: 11px;
 }
 
 .debug-log-row__detail {
@@ -3297,19 +3160,20 @@ watch(developerMode, (enabled) => {
   gap: 6px;
   margin-top: 6px;
   padding: 10px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.86);
+  background: #151c29;
 }
 
 .debug-log-row__detail pre {
   margin: 0;
   overflow: auto;
   max-height: 360px;
-  color: #dbeafe;
-  font-family: inherit;
+  color: #a3afc2;
+  font-family: var(--font-mono);
   font-size: 11px;
-  line-height: 1.55;
+  font-weight: 400;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -3319,23 +3183,29 @@ watch(developerMode, (enabled) => {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: #93c5fd;
+  color: #91a2b8;
   font-size: 11px;
 }
 
 .debug-log-row__location-detail code {
   min-width: 0;
   overflow: hidden;
-  color: #bfdbfe;
+  color: #acb8c9;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.debug-log-row__raw summary {
-  width: max-content;
-  color: #93c5fd;
-  cursor: pointer;
+.debug-log-row__raw-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #91a2b8;
   font-size: 11px;
+}
+
+.debug-log-row__raw pre {
+  color: #8d9aaf;
 }
 
 .debug-log-row--info .debug-log-row__level { color: #86efac; }

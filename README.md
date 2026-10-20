@@ -190,6 +190,24 @@ On macOS, deleting `Pymss Studio.app` removes the application and bundled runtim
 | Missing project assets | Check whether audio files moved or were deleted, relink them in the editor, and save the project again. |
 | Update fails or a new version behaves unexpectedly | Record version, package type, and errors; read the release notes. Back up projects and settings before manually installing a complete package. |
 
+With developer mode enabled, open **Diagnostics → Logs** to filter by source, level, or task. Studio, Worker, pymss, and external tools have separate source badges. Warnings and errors are highlighted, with expandable tracebacks, code locations, and context. Task, workflow node, download, and installation logs use the same presentation.
+
+Launching the application from a command prompt or terminal also produces readable console logs. Supported terminals use colors for levels and sources; redirected output and `NO_COLOR` omit color codes. Application log files contain one JSON record per line, while historical text in cumulative logs remains readable without conversion.
+
+**Diagnostics → Generate diagnostic report** writes `latest-diagnostic-report.md` with build/session details, recent page and tool visits, operation requests and outcomes, separation parameters, workflow batch/node correlations, task history and graph summaries, editor project/export summaries, model downloads, cached runtime probes, and update events. Requests are captured before validation or worker startup, preserving the selected feature and parameters when an environment is missing or process creation fails.
+
+The report distinguishes observations from this process and saved snapshots, including their observation/save times. Generation does not rerun environment probes or scan media files. It retains at most 24 recent operations and 12 historical tasks, prioritizing active and failed tasks; fields, collections, store reads, and report sections have explicit limits and omission/unavailability notes. Request and configuration summaries use allow-lists and omit transcript text, audio contents, arbitrary graph text, and proxy addresses. Errors and log tails can still contain custom names and paths; review them before sharing.
+
+Automatic error reports coalesce errors within a five-second interval and write the latest error and traceback afterward. Pending errors are flushed before normal application exit. Clearing logs cancels older pending reports.
+
+If no window appears at startup, exit any existing Pymss Studio process, open CMD in the installation directory, and enable verbose logging before the interface loads:
+
+```cmd
+start "" /b /wait "Pymss Studio.exe" --debug
+```
+
+To save console output, run `start "" /b /wait "Pymss Studio.exe" --debug > "%TEMP%\pymss-startup.log" 2>&1`. The flag enables verbose Studio and Worker logs for this process without changing the saved developer mode setting. A subsequent launch without the flag uses the original logging level. Exit an existing process before relaunching with the flag. On macOS and Linux, pass `--debug` directly to the application executable.
+
 For unresolved issues, include application version and package type, OS version, GPU model, separation model, reproduction steps, and relevant log excerpts in [GitHub Issues](https://github.com/pymss-project/pymss-studio/issues). Remove personal paths, proxy credentials, and other sensitive information from logs before sharing.
 
 ## Development and verification

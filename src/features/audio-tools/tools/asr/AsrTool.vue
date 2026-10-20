@@ -1,4 +1,8 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import { normalizeLogRecord } from '@/utils/logRecord'
+
 import { computed, nextTick, onActivated, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
@@ -29,6 +33,8 @@ import {
   type AsrLanguageCode,
   type AsrPresetId,
 } from './profiles'
+
+const studioLog = createLogger('ui.features.audio-tools.tools.asr.AsrTool')
 
 const FUNASR_URL = 'https://github.com/modelscope/FunASR'
 
@@ -156,15 +162,6 @@ async function refreshFunAsrStatus() {
   await funAsrRuntime.refresh()
 }
 
-function formatDependencyLogTime(timestamp: number) {
-  return new Date(timestamp).toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
-}
-
 async function manageFunAsr(action: 'install' | 'uninstall') {
   try {
     await funAsrRuntime.manage(action, {
@@ -287,7 +284,7 @@ onMounted(async () => {
   try {
     await funAsrRuntime.start()
   } catch (error) {
-    console.warn('[audio-tools] optional package log listener unavailable', error)
+    studioLog.warn('[audio-tools] optional package log listener unavailable', error)
   }
   const saved = await loadAudioToolsState()
   modelPath.value = saved?.asrModelPath || ''
@@ -314,7 +311,9 @@ onActivated(() => {
   void refreshFunAsrStatus()
 })
 
-watch(() => dependencyLogs.value.length, async () => {
+watch(() => dependencyLogs.value.at(-1), async () => {
+  const target = dependencyLogList.value
+  if (target && target.scrollHeight - target.scrollTop - target.clientHeight > 48) return
   await nextTick()
   if (dependencyLogList.value) dependencyLogList.value.scrollTop = dependencyLogList.value.scrollHeight
 })
@@ -454,14 +453,7 @@ watch(() => settings.outputDir, (value) => {
         <small>{{ t('tools.logEntries', { count: dependencyLogs.length }) }}</small>
       </header>
       <div ref="dependencyLogList" class="audio-tool-install-log__list" role="log" aria-live="polite">
-        <article
-          v-for="entry in dependencyLogs"
-          :key="entry.id"
-          :class="`audio-tool-install-log__entry--${entry.level}`"
-        >
-          <time>{{ formatDependencyLogTime(entry.timestamp) }}</time>
-          <span>{{ entry.message }}</span>
-        </article>
+        <TaskLogConsole :lines="dependencyLogs.map(entry => entry.record || normalizeLogRecord({ message: entry.message, level: entry.level === 'error' ? 'error' : entry.level === 'output' ? null : 'info', source: 'worker', timestamp: new Date(entry.timestamp).toISOString() }))" embedded />
       </div>
     </section>
 

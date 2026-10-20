@@ -1,5 +1,8 @@
+import { createLogger } from '@/utils/logger'
 import { loadAppStore, saveAppStore } from '@/utils/appStore'
 import type { AudioToolKey } from './types'
+
+const studioLog = createLogger('ui.features.audio-tools.state')
 
 export type StoredAudioToolsState = {
   activeTool?: AudioToolKey
@@ -33,6 +36,6 @@ export function updateAudioToolsState(patch: Partial<StoredAudioToolsState>) {
     const current = await loadAudioToolsState() || {}
     await saveAppStore('audio-tools', { ...current, ...patch })
   })
-  queue = run.catch(error => console.warn('[audio-tools] state save failed', error))
+  queue = run.catch(error => studioLog.warn('[audio-tools] state save failed', error))
   return run
 }

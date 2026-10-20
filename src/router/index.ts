@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { createWorkflowEditorRouteGuard } from '@/workflows/editorWindow'
 import { isMainTaskOwner } from '@/utils/taskOwner'
 import { isTauriRuntime } from '@/utils/appStore'
+import { recordFeatureVisit } from '@/utils/logger'
 import { useToastStore } from '@/stores/toast'
 import { useWorkflowStore } from '@/stores/workflow'
 import i18n from '@/i18n'
@@ -37,5 +38,9 @@ router.beforeEach(createWorkflowEditorRouteGuard({
   },
   onError: error => useToastStore().error(error instanceof Error ? error.message : i18n.global.t('workflows.editorWindowOpenFailed')),
 }))
+
+router.afterEach((to, from, failure) => {
+  if (!failure && typeof to.name === 'string' && to.name !== from.name) recordFeatureVisit(to.name)
+})
 
 export default router

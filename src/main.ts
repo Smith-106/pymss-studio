@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { createApp, nextTick } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
@@ -15,9 +16,16 @@ import { useUpdateStore } from '@/stores/update'
 import { activeRuntimeEnvironment, runtimeCoreSyncAvailable, runtimeToActivate } from '@/utils/runtime'
 import './styles/global.scss'
 
+const studioLog = createLogger('ui.main')
+
 async function bootstrap() {
   const pinia = createPinia()
   const app = createApp(App)
+  app.config.errorHandler = (error, _instance, info) => {
+    studioLog.error('Vue application error', error, info)
+  }
+  window.addEventListener('unhandledrejection', event => studioLog.error('Unhandled promise rejection', event.reason))
+  window.addEventListener('error', event => studioLog.error(event.message || 'Unhandled application error', event.error))
   app.use(pinia)
   app.use(router)
   app.use(i18n)
@@ -36,28 +44,28 @@ async function bootstrap() {
   const appState = useAppStore(pinia)
   const updates = useUpdateStore(pinia)
   await settings.initialize().catch((error) => {
-    console.warn('Failed to initialize settings', error)
+    studioLog.warn('Failed to initialize settings', error)
   })
   if (isTauriRuntime() && isMainTaskOwner()) {
     try {
       const unlisten = await listenForEditorExportPreferences(settings.saveEditorExportPreference)
       app.onUnmount(unlisten)
     } catch (error) {
-      console.warn('Failed to connect editor export preferences', error)
+      studioLog.warn('Failed to connect editor export preferences', error)
     }
   }
   await updates.initialize().catch((error) => {
-    console.warn('Failed to initialize update store', error)
+    studioLog.warn('Failed to initialize update store', error)
   })
   const tasks = await import('@/stores/task').then((mod) => mod.useTaskStore(pinia))
   if (isMainTaskOwner()) await tasks.initialize().catch((error) => {
-    console.warn('Failed to initialize tasks', error)
+    studioLog.warn('Failed to initialize tasks', error)
   })
   const models = await import('@/stores/model').then((mod) => mod.useModelStore(pinia))
   const workflows = await import('@/stores/workflow').then((mod) => mod.useWorkflowStore(pinia))
   await Promise.allSettled([models.initialize(), workflows.initialize()])
   await initializeWorkbenchBridge().catch(error => {
-    console.warn('Failed to connect workflow editor windows', error)
+    studioLog.warn('Failed to connect workflow editor windows', error)
   })
   // Register after the webview and dependent stores are ready. Tauri's event
   // bridge can still be initializing while the entry module is evaluated;
@@ -65,7 +73,7 @@ async function bootstrap() {
   // initialized stores.
   const workerEventsReady = connectWorkerEvents(appState)
   await workerEventsReady.catch((error) => {
-    console.warn('Failed to register worker events', error)
+    studioLog.warn('Failed to register worker events', error)
   })
   initTheme(settings.themeMode, settings.themeAccent)
   try {
@@ -75,7 +83,7 @@ async function bootstrap() {
     appState.buildInfoVariant = buildInfo.variant || ''
     appState.buildInfoUpdateSupported = buildInfo.updateSupported === true
   } catch (error: unknown) {
-    console.warn('Failed to load build info version', error)
+    studioLog.warn('Failed to load build info version', error)
   }
   if (appState.buildInfoVersion && updates.hasPendingDeferredVersion(appState.buildInfoVersion)) {
     updates.status = 'ready'
@@ -98,7 +106,7 @@ async function bootstrap() {
         }, { refreshCoreVersions: false, onlyIfNoActive: true })
         runtime = appState.runtimeInfo || runtime
       } catch (error) {
-        console.warn('Failed to activate detected runtime', error)
+        studioLog.warn('Failed to activate detected runtime', error)
         // The activation command may have succeeded before a follow-up probe failed.
         // Prefer the store's latest runtime snapshot over the stale callback value.
         runtime = appState.runtimeInfo || runtime
@@ -107,23 +115,23 @@ async function bootstrap() {
     const activeRuntime = activeRuntimeEnvironment(runtime)
     if (runtime.ready && (!appState.runtimeCoreUpdateSupported || !runtimeCoreSyncAvailable(activeRuntime, runtime.manifestVersion))) {
       void models.loadModels().catch((error) => {
-        console.warn('Failed to preload model metadata', error)
+        studioLog.warn('Failed to preload model metadata', error)
       })
     }
     if (appState.runtimeCoreUpdateSupported && runtime.installedEnvironments?.some((env) => env.coreUpdateSupported !== false)) {
       void appState.loadRuntimeCoreVersions().catch((error) => {
-        console.warn('Failed to check runtime core versions', error)
+        studioLog.warn('Failed to check runtime core versions', error)
       })
     }
     return undefined
   }).catch((error) => {
-    console.warn('Failed to load runtime info', error)
+    studioLog.warn('Failed to load runtime info', error)
   })
   void updates.checkForUpdates().catch((error) => {
-    console.warn('Failed to check for updates', error)
+    studioLog.warn('Failed to check for updates', error)
   })
 }
 
 bootstrap().catch((error) => {
-  console.error('Failed to bootstrap application', error)
+  studioLog.error('Failed to bootstrap application', error)
 })

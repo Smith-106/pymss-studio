@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -157,10 +158,12 @@ const runtimeDetecting = computed(() => app.runtimeInfoLoading || runtimeManualC
 const runtimeDeleting = ref<string | null>(null)
 const runtimeActivating = ref<string | null>(null)
 const runtimeLogDialogVisible = ref(false)
-const runtimeLogPre = ref<HTMLPreElement | null>(null)
+const runtimeLogPre = ref<HTMLElement | null>(null)
 
-watch(() => app.runtimeInstallLogs.length, () => {
+watch(() => app.runtimeInstallLogs.at(-1), () => {
   if (runtimeLogDialogVisible.value && runtimeLogPre.value) {
+    const target = runtimeLogPre.value
+    if (target.scrollHeight - target.scrollTop - target.clientHeight > 48) return
     nextTick(() => {
       if (runtimeLogPre.value) {
         runtimeLogPre.value.scrollTop = runtimeLogPre.value.scrollHeight
@@ -2298,7 +2301,7 @@ onMounted(async () => {
         <n-alert v-else-if="app.runtimeInstallStatus === 'success'" type="success" :show-icon="true" style="margin-bottom: 8px">
           {{ t('settings.runtimeInstallLogSuccess') }}
         </n-alert>
-        <pre v-if="app.runtimeInstallLogs.length" ref="runtimeLogPre" class="runtime-log-dialog__pre">{{ app.runtimeInstallLogs.join('\n') }}</pre>
+        <div v-if="app.runtimeInstallLogs.length" ref="runtimeLogPre" class="runtime-log-dialog__pre"><TaskLogConsole :lines="app.runtimeInstallLogs" embedded /></div>
         <div v-if="app.runtimeInfo?.logPath" class="runtime-log-dialog__path">
           <code>{{ app.runtimeInfo.logPath }}</code>
           <n-button size="tiny" tertiary @click="revealPath(app.runtimeInfo.logPath)">

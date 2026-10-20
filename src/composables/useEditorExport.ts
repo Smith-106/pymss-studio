@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { MessageApiInjection } from 'naive-ui/es/message/src/MessageProvider'
@@ -6,6 +7,8 @@ import type { EditorExportFormat, EditorExportSampleRate } from '@/types/editor'
 import type { useEditorStore } from '@/stores/editor'
 import { EditorExportCancelledError } from '@/stores/editor'
 import type { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.composables.useEditorExport')
 
 type EditorStore = ReturnType<typeof useEditorStore>
 type SettingsStore = ReturnType<typeof useSettingsStore>
@@ -140,7 +143,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
       try {
         await settings.saveEditorExportPreference({ format, bitDepth: format === 'wav' ? wavBitDepth : flacBitDepth })
       } catch (error) {
-        console.warn('Failed to save editor export preference', error)
+        studioLog.warn('Failed to save editor export preference', error)
         message.warning(t('editor.exportPreferencesSaveFailed'))
       }
       if (result.peakProtectionApplied && Number(result.peakAdjustmentDb) < 0) {

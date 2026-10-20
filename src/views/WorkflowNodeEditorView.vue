@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -27,6 +29,8 @@ import {
   isWorkflowSeparationNodeType,
 } from '@/workflows/formats'
 import { storeGraphDefaults } from '@/workflows/graphDefaults'
+
+const studioLog = createLogger('ui.views.WorkflowNodeEditorView')
 
 const { t, locale } = useI18n()
 const route = useRoute()
@@ -428,7 +432,7 @@ async function refreshMaximized() {
   try {
     isMaximized.value = await invoke<boolean>('is_current_window_maximized')
   } catch (error) {
-    console.warn('[workflow-node-editor] is_current_window_maximized failed', error)
+    studioLog.warn('[workflow-node-editor] is_current_window_maximized failed', error)
     try {
       isMaximized.value = await currentWindow.isMaximized()
     } catch {
@@ -444,8 +448,8 @@ function startWindowDrag(event?: MouseEvent) {
   }
   if (!currentWindow) return
   invoke('start_drag_current_window').catch((error) => {
-    console.warn('[workflow-node-editor] start_drag_current_window failed', error)
-    currentWindow.startDragging().catch(innerError => console.warn('[workflow-node-editor] currentWindow.startDragging failed', innerError))
+    studioLog.warn('[workflow-node-editor] start_drag_current_window failed', error)
+    currentWindow.startDragging().catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.startDragging failed', innerError))
   })
 }
 
@@ -454,8 +458,8 @@ async function minimizeWindow() {
   try {
     await invoke('minimize_current_window')
   } catch (error) {
-    console.warn('[workflow-node-editor] minimize_current_window failed', error)
-    currentWindow.minimize().catch(innerError => console.warn('[workflow-node-editor] currentWindow.minimize failed', innerError))
+    studioLog.warn('[workflow-node-editor] minimize_current_window failed', error)
+    currentWindow.minimize().catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.minimize failed', innerError))
   }
 }
 
@@ -464,8 +468,8 @@ async function toggleMaximizeWindow() {
   try {
     isMaximized.value = await invoke<boolean>('toggle_maximize_current_window')
   } catch (error) {
-    console.warn('[workflow-node-editor] toggle_maximize_current_window failed', error)
-    currentWindow.toggleMaximize().then(refreshMaximized).catch(innerError => console.warn('[workflow-node-editor] currentWindow.toggleMaximize failed', innerError))
+    studioLog.warn('[workflow-node-editor] toggle_maximize_current_window failed', error)
+    currentWindow.toggleMaximize().then(refreshMaximized).catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.toggleMaximize failed', innerError))
   }
 }
 

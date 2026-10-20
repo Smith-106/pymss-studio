@@ -213,11 +213,12 @@ test('a backend read failure leaves the stored data untouched and still register
   await store.initialize()
   assert.equal(store.status, 'idle')
   assert.equal(store.deferredVersion, '')
-  assert.deepEqual(storage.commands, ['load_app_store', 'plugin:event|listen'])
+  assert.deepEqual(storage.commands, ['load_app_store', 'write_frontend_log', 'plugin:event|listen'])
   assert.deepEqual(storage.writes, [])
   assert.deepEqual(local.writes, [])
   assert.equal(local.values.get('pymss-studio:update-state'), JSON.stringify(persisted016))
-  assert.deepEqual(warning.mock.calls[0].arguments, ['Failed to load update state', failure])
+  assert.match(warning.mock.calls[0].arguments[0], /Studio.*Failed to load update state/)
+  assert.match(warning.mock.calls[0].arguments[1], /Store read failed/)
 })
 
 test('a backend without update-state keeps the existing local key and three-field payload', async () => {

@@ -497,10 +497,10 @@ mod platform {
                     // After a successful exchange the staged directory contains the old app.
                     // Preserve it if it cannot be moved to the normal backup location.
                     let kept = stage.keep();
-                    eprintln!(
+                    crate::session_log::early("WARN", "update.diagnostic", &format!(
                         "Previous macOS application retained at {}: {error}",
                         kept.display()
-                    );
+                    ));
                     return Ok(kept.join(BUNDLE_NAME));
                 }
                 Ok(backup)
@@ -519,7 +519,7 @@ mod platform {
             Ok(()) => {
                 validate_bundle(target, Some(version))?;
                 if let Err(error) = fs::remove_dir_all(backup) {
-                    eprintln!("Unable to remove the failed macOS update: {error}");
+                    crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to remove the failed macOS update: {error}"));
                 }
             }
             Err(_) => {
@@ -720,8 +720,8 @@ mod platform {
                 }
             }
             crate::session_log::append(&app, "INFO", "update.restart", vec![("version", version)]);
-            if let Err(error) = staging.close() { eprintln!("Unable to clean the macOS update download directory: {error}"); }
-            if let Err(error) = startup_directory.close() { eprintln!("Unable to clean the macOS update startup directory: {error}"); }
+            if let Err(error) = staging.close() { crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clean the macOS update download directory: {error}")); }
+            if let Err(error) = startup_directory.close() { crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clean the macOS update startup directory: {error}")); }
             app.exit(0);
             Ok(())
         }).await.map_err(|e| failure(e.to_string()))?

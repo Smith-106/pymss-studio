@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 /**
  * Litegraph-based node editor for comfy-mss workflows.
  *
@@ -40,6 +42,8 @@ import type { NodeSpec } from '@/litegraph/nodeSpecs'
 import { translateNodeCategory, translateNodeTitle, type NodeTranslator } from '@/litegraph/nodeLocalization'
 import { isGraphWorkflowDefinition } from '@/workflows/formats'
 import { applyGraphDefaultWidgets, type GraphDefaults } from '@/workflows/graphDefaults'
+
+const studioLog = createLogger('ui.components.workflow.WorkflowNodeEditorLite')
 
 // All node specs the palette offers (pymss nodes + ComfyUI builtin audio/string nodes).
 const ALL_SPECS: Record<string, NodeSpec> = { ...NODE_SPECS, ...BUILTIN_SPECS }
@@ -417,7 +421,7 @@ function initializeGraph() {
       throw new Error(t('workflows.graphEditorFormatRequired'))
     }
   } catch (error) {
-    console.error('[workflow-node-editor] failed to restore graph', error)
+    studioLog.error('[workflow-node-editor] failed to restore graph', error)
     reportLoadError(error)
     return
   }
@@ -452,7 +456,7 @@ watch(definition, () => {
     emit('initialized')
     ;(canvasRef.value as any)?.setDirty(true, true)
   } catch (error) {
-    console.error('[workflow-node-editor] failed to hydrate late graph definition', error)
+    studioLog.error('[workflow-node-editor] failed to hydrate late graph definition', error)
     reportLoadError(error)
   }
 })

@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -7,6 +8,8 @@ import { useAppStore } from '@/stores/app'
 import { useSettingsStore } from '@/stores/settings'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
 import { isMainTaskOwner } from '@/utils/taskOwner'
+
+const studioLog = createLogger('ui.stores.update')
 
 export type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'installing' | 'failed'
 
@@ -122,7 +125,7 @@ export const useUpdateStore = defineStore('update', () => {
         } catch (error) {
           // Update state is optional; keep the progress listener alive even
           // when a damaged or older store backend cannot read it.
-          console.warn('Failed to load update state', error)
+          studioLog.warn('Failed to load update state', error)
           payload = null
         }
         deferredVersion.value = String(payload?.deferredVersion || '')
@@ -321,7 +324,7 @@ export const useUpdateStore = defineStore('update', () => {
         // The helper is already waiting for this process to exit. A persistence failure must
         // not enter the outer error path and leave the helper blocked indefinitely.
         appendDownloadLog('Update state could not be saved; continuing with restart')
-        console.warn('Failed to persist update state after staging update', persistError)
+        studioLog.warn('Failed to persist update state after staging update', persistError)
       }
       await exit(0)
       return true

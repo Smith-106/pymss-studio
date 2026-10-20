@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from worker_protocol import emit, emit_error
+from worker_protocol import emit, emit_error, task_logging
 from worker_paths import normalize_output_dir as _normalize_output_dir
 
 
@@ -1262,7 +1262,9 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             )))
         from worker_workflow_logs import workflow_logging
 
-        log_scope = cleanup.enter_context(workflow_logging(task_id))
+        log_scope = cleanup.enter_context(workflow_logging(
+            task_id, batch=isinstance(payload.get("tasks"), list) and bool(payload["tasks"]),
+        ))
         if separator_cache is None:
             separator_cache = cleanup.enter_context(graph.SeparatorCache(factory=_workflow_separator_factory))
         # Negotiate the optional kernel protocol once. Published runtimes retain
@@ -1429,15 +1431,16 @@ def _cmd_infer_workflow_batch(payload: dict[str, Any], raw_tasks: list[Any]) -> 
             }, task_id=task_id)
             emit("task_stage", {"stage": "validating_input", "message": "Validating workflow input", "progress": 12}, task_id=task_id)
             try:
-                result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index),
-                                    **({"workbenchOutputs": item.get("workbenchOutputs", payload.get("workbenchOutputs"))}
-                                       if payload.get("workbench") is True else {})}, task_id,
-                                    input_path=input_path or None,
-                                    inputs=item_inputs or None,
-                                    output_dir=output_dir, output_layout=output_layout,
-                                    **({"separator_cache": separator_cache} if separator_cache is not None else {}))
-                emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
-                emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
+                with task_logging(task_id):
+                    result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index),
+                                        **({"workbenchOutputs": item.get("workbenchOutputs", payload.get("workbenchOutputs"))}
+                                           if payload.get("workbench") is True else {})}, task_id,
+                                        input_path=input_path or None,
+                                        inputs=item_inputs or None,
+                                        output_dir=output_dir, output_layout=output_layout,
+                                        **({"separator_cache": separator_cache} if separator_cache is not None else {}))
+                    emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
+                    emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
             except Exception as exc:
                 failed = True
                 _emit_workflow_failure(task_id, exc)

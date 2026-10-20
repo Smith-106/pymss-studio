@@ -184,6 +184,16 @@ pub async fn debug_log_info(app: AppHandle) -> AppResult<DebugLogInfo> {
 }
 
 #[tauri::command]
+pub fn write_frontend_log(app: AppHandle, window: tauri::WebviewWindow, record: Value) -> AppResult<()> {
+    let mut record = crate::log_record::LogRecord::from_payload(&record)
+        .ok_or_else(|| AppError::Worker("Invalid frontend log record".into()))?;
+    record.source = "studio".into();
+    record.context.insert("windowLabel".into(), Value::String(window.label().into()));
+    session_log::append_record(&app, record);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn debug_log_read(app: AppHandle) -> AppResult<DebugLogContent> {
     require_runtime_debug_developer_mode(&app)?;
     session_log::read_tail(&app)
@@ -1395,6 +1405,7 @@ fn write_editor_project(app: &AppHandle, project: &Value) -> AppResult<Value> {
         .ok_or_else(|| AppError::Worker("missing editor project id".into()))?;
     let dir = editor_project_dir(app, project_id)?;
     storage::write_json_file(&dir.join("project.json"), project)?;
+    session_log::record_editor_project(project);
     Ok(project.clone())
 }
 
@@ -2079,6 +2090,7 @@ pub async fn load_editor_project(app: AppHandle, project_id: String) -> AppResul
     if enrich_editor_project_sources(&mut project) {
         write_editor_project(&app, &project)?;
     }
+    session_log::record_editor_project(&project);
     Ok(project)
 }
 
@@ -2389,6 +2401,7 @@ pub async fn cancel_task(
             let _ = child.wait();
         }
         for cancelled_task_id in cancelled_task_ids {
+            session_log::append(&app, "INFO", "task.cancelled", vec![("taskId", cancelled_task_id.clone()), ("message", "Task cancelled".into())]);
             let _ = app.emit(
                 "pymss://worker-event",
                 serde_json::json!({

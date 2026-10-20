@@ -1,3 +1,5 @@
+import { createLogger } from '@/utils/logger'
+import { workerLogRecord, type LogEntry } from '@/utils/logRecord'
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -6,6 +8,8 @@ import { activeRuntimeEnvironment, supportsRuntimeCoreUpdate, supportsRuntimeMan
 import { isTauriRuntime } from '@/utils/appStore'
 import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
 import { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.stores.app')
 
 export type EnvInfo = {
   pythonVersion?: string
@@ -162,7 +166,7 @@ export const useAppStore = defineStore('app', () => {
   const runtimeInstallStatus = ref<'idle' | 'installing' | 'success' | 'error' | 'cancelled'>('idle')
   const runtimeInstallBackend = ref<string | null>(null)
   const runtimeInstallMessage = ref('')
-  const runtimeInstallLogs = ref<string[]>([])
+  const runtimeInstallLogs = ref<LogEntry[]>([])
   const runtimeCoreVersions = ref<RuntimeCoreVersions | null>(null)
   const runtimeCoreVersionsLoading = ref(false)
   const runtimeCoreUpdateTaskId = ref<string | null>(null)
@@ -794,13 +798,13 @@ export const useAppStore = defineStore('app', () => {
           }
         }
         void checkEnv().catch((error) => {
-          console.warn('Failed to refresh environment details after a core update', error)
+          studioLog.warn('Failed to refresh environment details after a core update', error)
         })
         void checkRuntimeInfo().then(() => loadRuntimeCoreVersions()).catch((error) => {
-          console.warn('Failed to refresh runtime versions after a core update', error)
+          studioLog.warn('Failed to refresh runtime versions after a core update', error)
         })
         void import('@/stores/model').then(({ useModelStore }) => useModelStore().loadModels()).catch((error) => {
-          console.warn('Failed to refresh models after a runtime change', error)
+          studioLog.warn('Failed to refresh models after a runtime change', error)
         })
       } else if (event?.type === 'runtime_core_update_started') {
         if (runtimeCoreUpdateStatus.value !== 'preparing') runtimeCoreUpdateStatus.value = 'updating'
@@ -849,7 +853,7 @@ export const useAppStore = defineStore('app', () => {
     } else if (event?.type === 'runtime_install_stage' || event?.type === 'runtime_install_log') {
       runtimeInstallMessage.value = event.payload?.message || event.payload?.stage || ''
       const line = event.payload?.message || event.payload?.stage
-      if (line) runtimeInstallLogs.value = [...runtimeInstallLogs.value, String(line)].slice(-300)
+      if (line) runtimeInstallLogs.value = [...runtimeInstallLogs.value, workerLogRecord(event)].slice(-300)
     } else if (event?.type === 'runtime_install_failed' || event?.type === 'error') {
       runtimeInstallStatus.value = 'error'
       runtimeInstallMessage.value = event.payload?.message || 'Runtime installation failed'

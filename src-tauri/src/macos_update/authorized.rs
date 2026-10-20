@@ -222,7 +222,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.finished {
             if let Err(error) = self.complete(false) {
-                eprintln!("Unable to complete authorized macOS update recovery: {error}");
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to complete authorized macOS update recovery: {error}"));
             }
         }
     }

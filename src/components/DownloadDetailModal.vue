@@ -14,6 +14,8 @@ import {
 } from '@vicons/ionicons5'
 import type { DownloadLogEntry, DownloadTask } from '@/stores/model'
 import { formatBytes, formatSpeedMBps } from '@/utils/format'
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import { formatLogRecord, normalizeLogRecord } from '@/utils/logRecord'
 
 const props = defineProps<{
   show: boolean
@@ -156,10 +158,6 @@ function formatTime(ts: number) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-function levelClass(level: string) {
-  return `dl-log--${level}`
-}
-
 async function scrollToBottom() {
   if (!autoScroll.value) return
   await nextTick()
@@ -190,7 +188,7 @@ function onScroll(e: Event) {
 async function copyAllLogs() {
   if (!props.task) return
   const text = props.task.logs
-    .map((log) => `[${formatTime(log.ts)}] [${log.level}] ${log.message}`)
+    .map((log) => log.record ? formatLogRecord(log.record) : `[${formatTime(log.ts)}] [${log.level}] ${log.message}`)
     .join('\n')
   if (!text) {
     message.info(t('models.downloadLogsEmpty'))
@@ -303,15 +301,7 @@ function handleClose() {
             <div v-if="!logs.length" class="ddm-logs-empty">
               {{ t('models.downloadLogsEmpty') }}
             </div>
-            <div
-              v-for="(log, idx) in logs"
-              :key="idx"
-              :class="['dl-log', levelClass(log.level)]"
-            >
-              <span class="dl-log-time">{{ formatTime(log.ts) }}</span>
-              <span class="dl-log-level">{{ log.level }}</span>
-              <span class="dl-log-msg">{{ log.message }}</span>
-            </div>
+            <TaskLogConsole v-else :lines="logs.map(log => log.record || normalizeLogRecord({ message: log.message, level: log.level, timestamp: new Date(log.ts).toISOString(), source: 'worker' }))" embedded />
           </div>
           <!-- Scrolling up pauses the follow-along so a line being read does not slide away; this
                is how to get back to it. -->

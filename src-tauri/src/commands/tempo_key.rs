@@ -5,8 +5,10 @@
 //! treats this tool like any other.
 
 use crate::error::{AppError, AppResult};
-use crate::python::worker::bundled_bin_dirs;
+use crate::python::protocol::WorkerEnvelope;
+use crate::python::worker::{bundled_bin_dirs, log_worker_event};
 use crate::rba;
+use crate::session_log;
 use crate::state::AppState;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -61,17 +63,20 @@ fn bpm_result(analysis: &rba::Analysis, path: &Path) -> Result<Value, String> {
     }))
 }
 
+fn native_envelope(event_type: &str, request_id: &str, payload: Value) -> WorkerEnvelope {
+    WorkerEnvelope {
+        event_type: event_type.to_string(),
+        request_id: Some(request_id.to_string()),
+        task_id: Some(request_id.to_string()),
+        timestamp: Some(chrono::Utc::now().to_rfc3339()),
+        payload,
+    }
+}
+
 fn emit(app: &AppHandle, event_type: &str, request_id: &str, payload: Value) {
-    let _ = app.emit(
-        "pymss://worker-event",
-        json!({
-            "type": event_type,
-            "requestId": request_id,
-            "taskId": request_id,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "payload": payload,
-        }),
-    );
+    let mut envelope = native_envelope(event_type, request_id, payload);
+    log_worker_event(app, "audio_tools", &mut envelope);
+    let _ = app.emit("pymss://worker-event", &envelope);
 }
 
 fn input_paths(payload: &Value) -> Vec<PathBuf> {
@@ -133,6 +138,15 @@ pub async fn start_tempo_key_analysis(
     state: State<'_, AppState>,
     payload: Value,
 ) -> AppResult<Value> {
+    let operation_id = session_log::record_operation_request(&app, "audio_tools", &payload, None);
+    let result = start_native_analysis(&app, &state, payload);
+    if let Err(error) = &result {
+        session_log::record_operation_failure(&app, "audio_tools", &operation_id, &error.to_string());
+    }
+    result
+}
+
+fn start_native_analysis(app: &AppHandle, state: &AppState, payload: Value) -> AppResult<Value> {
     let request_id = payload
         .get("requestId")
         .and_then(Value::as_str)
@@ -211,6 +225,28 @@ pub fn cancel_native_task(state: &AppState, task_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_analysis_envelope_retains_worker_event_contract() {
+        let payload = json!({ "operation": "tempo_key", "succeeded": 1, "items": [] });
+        let envelope = native_envelope("audio_tool_result", "analysis-request", payload.clone());
+        let serialized = serde_json::to_value(envelope).unwrap();
+        assert_eq!(serialized["type"], "audio_tool_result");
+        assert_eq!(serialized["requestId"], "analysis-request");
+        assert_eq!(serialized["taskId"], "analysis-request");
+        assert_eq!(serialized["payload"], payload);
+        assert!(chrono::DateTime::parse_from_rfc3339(serialized["timestamp"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn native_midi_envelope_preserves_operation_and_action() {
+        let payload = json!({ "operation": "midi", "action": "detect_bpm", "bpm": 128.0 });
+        let envelope = native_envelope("audio_tool_result", "midi-request", payload.clone());
+        assert_eq!(envelope.event_type, "audio_tool_result");
+        assert_eq!(envelope.request_id.as_deref(), Some("midi-request"));
+        assert_eq!(envelope.task_id.as_deref(), Some("midi-request"));
+        assert_eq!(envelope.payload, payload);
+    }
 
     #[test]
     fn bpm_detection_uses_midi_result_contract_and_rejects_missing_tempo() {

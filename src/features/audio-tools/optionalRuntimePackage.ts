@@ -2,6 +2,7 @@ import { ref, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { registerWindowCloseGuard } from '../../utils/windowCloseGuards.ts'
+import { workerLogRecord, type LogRecord } from '../../utils/logRecord.ts'
 
 export type OptionalPackageStatus = {
   package: string
@@ -22,6 +23,7 @@ export type OptionalPackageLogEntry = {
   timestamp: number
   level: 'stage' | 'output' | 'success' | 'error'
   message: string
+  record?: LogRecord
 }
 
 type OptionalPackageEvent = {
@@ -31,6 +33,7 @@ type OptionalPackageEvent = {
     package?: string
     action?: OptionalPackageAction
     message?: string
+    logRecord?: LogRecord
   }
 }
 
@@ -109,6 +112,8 @@ function createOptionalRuntimePackage(packageName: string): OptionalRuntimePacka
             String(payload.message || ''),
             workerEvent.type === 'optional_package_stage' ? 'stage' : 'output',
           )
+          const last = logs.value.at(-1)
+          if (last && payload.logRecord) last.record = workerLogRecord({ ...workerEvent, taskId: workerEvent.taskId || undefined, payload })
           return
         }
         if (workerEvent.type === 'optional_package_status' && payload?.package === packageName) {

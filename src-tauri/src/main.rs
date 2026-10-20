@@ -1,7 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod commands;
+mod automatic_report;
+mod diagnostic_context;
+mod diagnostic_report;
 mod error;
+mod log_record;
 mod model_dir_migration;
 #[cfg(any(target_os = "macos", test))]
 mod macos_update;
@@ -20,6 +24,10 @@ use state::AppState;
 use tauri::{Emitter, Manager};
 
 fn main() {
+    terminal::attach_parent();
+    if session_log::configure_startup_logging(std::env::args_os().skip(1)) {
+        session_log::early("DEBUG", "app.debug", "Verbose logging enabled by --debug");
+    }
     if let Some(code) = update_manager::run_helper_from_args() {
         std::process::exit(code);
     }
@@ -36,11 +44,10 @@ fn main() {
             // A mutex failure is rare (for example, a restricted user
             // session). Keep the application usable, while making the loss
             // of single-instance enforcement visible in diagnostics.
-            eprintln!("Unable to create the single-instance mutex: {error}");
+            crate::session_log::early("WARN", "app.diagnostic", &format!("Unable to create the single-instance mutex: {error}"));
             None
         }
     };
-    terminal::attach_parent();
 
     let builder = tauri::Builder::default()
         .on_page_load(|webview, _payload| {
@@ -82,6 +89,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_cmd::cancel_task,
+            commands::app_cmd::write_frontend_log,
             commands::app_cmd::close_current_window,
             commands::app_cmd::minimize_current_window,
             commands::app_cmd::toggle_maximize_current_window,
@@ -192,6 +200,11 @@ fn main() {
             commands::app_cmd::delete_runtime,
             commands::app_cmd::worker_health,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Pymss Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building Pymss Studio")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                session_log::finish_automatic_reports(app);
+            }
+        });
 }

@@ -497,10 +497,10 @@ pub fn run_helper_from_args() -> Option<i32> {
             let signature = args.next()?.to_string_lossy().to_string();
             let result = apply_managed_update(pid, root.clone(), archive, version, signature, mode == "--apply-managed-update-elevated");
             if let Err(error) = &result {
-                eprintln!("Managed update helper failed: {error}");
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update helper failed: {error}"));
                 append_helper_log(&root, &format!("update failed: {error}"));
                 if let Err(recovery_error) = recover_or_relaunch(&root, mode == "--apply-managed-update-elevated") {
-                    eprintln!("Managed update recovery failed: {recovery_error}");
+                    crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update recovery failed: {recovery_error}"));
                     append_helper_log(&root, &format!("recovery failed: {recovery_error}"));
                 }
             }
@@ -525,9 +525,9 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
         Ok(Some(transaction)) => transaction,
         Ok(None) => return None,
         Err(error) => {
-            eprintln!("Unable to read interrupted update transaction: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to read interrupted update transaction: {error}"));
             if let Err(quarantine_error) = quarantine_update_transaction(&root) {
-                eprintln!("Unable to quarantine the invalid update transaction: {quarantine_error}");
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to quarantine the invalid update transaction: {quarantine_error}"));
             }
             return None;
         }
@@ -535,7 +535,7 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
     let _update_mutex = match acquire_update_mutex() {
         Ok(mutex) => mutex,
         Err(AppError::Worker(message)) if message == "Another managed update is already in progress" => {
-            eprintln!("Managed update recovery is waiting for another update process: {message}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update recovery is waiting for another update process: {message}"));
             // The active updater holds this mutex while it launches the new
             // application and verifies the replacement.  Let the new process
             // continue booting; exiting here makes the helper treat the
@@ -543,14 +543,14 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
             return None;
         }
         Err(error) => {
-            eprintln!("Unable to acquire the managed update mutex during startup recovery: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to acquire the managed update mutex during startup recovery: {error}"));
             return Some(1);
         }
     };
     let backup = PathBuf::from(&transaction.backup_dir);
     if transaction.phase == UpdatePhase::Prepared {
         if let Err(error) = cleanup_prepared_transaction(&root, &backup) {
-            eprintln!("Unable to clear prepared update transaction: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clear prepared update transaction: {error}"));
         }
         return None;
     }
@@ -558,7 +558,7 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
     if helper.is_ok() {
         Some(0)
     } else {
-        eprintln!("Unable to start interrupted update recovery; continuing with the current application");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to start interrupted update recovery; continuing with the current application"));
         if transaction.phase == UpdatePhase::Prepared {
             let _ = quarantine_update_transaction(&root);
             None
@@ -588,7 +588,7 @@ fn spawn_recovery_helper(root: &Path, backup: &Path) -> AppResult<()> {
 
 fn cleanup_prepared_transaction(root: &Path, backup: &Path) -> AppResult<()> {
     if let Err(error) = validate_backup_path(root, backup) {
-        eprintln!("Prepared update transaction has an invalid backup path: {error}");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Prepared update transaction has an invalid backup path: {error}"));
         quarantine_update_transaction(root)?;
         return Ok(());
     }
@@ -1070,7 +1070,7 @@ fn apply_managed_update(
     }
     remove_update_transaction(&root)?;
     if let Err(error) = fs::remove_dir_all(&backup) {
-        eprintln!("Managed update succeeded but backup cleanup failed at {}: {error}", backup.display());
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update succeeded but backup cleanup failed at {}: {error}", backup.display()));
     }
     Ok(())
 }
@@ -1107,7 +1107,7 @@ fn replace_executable(current: &Path, replacement: &Path, backup: Option<&Path>)
             match replace_executable_with_moves(current, replacement, backup) {
                 Ok(()) => return Ok(()),
                 Err(fallback_error) => {
-                    eprintln!("Executable replacement failed with {error}; fallback also failed with {fallback_error}");
+                    crate::session_log::early("WARN", "update.diagnostic", &format!("Executable replacement failed with {error}; fallback also failed with {fallback_error}"));
                 }
             }
             return Err(error.into());
@@ -1138,7 +1138,7 @@ fn replace_executable_with_moves(current: &Path, replacement: &Path, backup: Opt
                 )
             };
             if restored == 0 {
-                eprintln!("Unable to restore executable after fallback replacement failed: {}", std::io::Error::last_os_error());
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to restore executable after fallback replacement failed: {}", std::io::Error::last_os_error()));
             }
             return Err(replacement_error.into());
         }
@@ -1262,7 +1262,7 @@ fn remove_update_transaction(root: &Path) -> AppResult<()> {
 
 fn clear_recovered_transaction(root: &Path) -> AppResult<()> {
     if let Err(error) = remove_update_transaction(root) {
-        eprintln!("Recovered update files, but could not remove the transaction marker: {error}");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Recovered update files, but could not remove the transaction marker: {error}"));
         quarantine_update_transaction(root)?;
     }
     Ok(())

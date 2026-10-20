@@ -8,6 +8,7 @@ import { loadAudioToolsState, updateAudioToolsState } from '@/features/audio-too
 import type { AudioToolCategory, AudioToolKey } from '@/features/audio-tools/types'
 import { useAppStore } from '@/stores/app'
 import { detectRuntimePlatform } from '@/utils/runtime'
+import { recordFeatureVisit } from '@/utils/logger'
 defineOptions({ name: 'ToolsView' })
 const { t } = useI18n()
 const app = useAppStore()
@@ -27,9 +28,16 @@ const categories: Array<{ id: AudioToolCategory; titleKey: string }> = [
 ]
 const toolsByCategory = (category: AudioToolCategory) => visibleAudioTools.value.filter(tool => tool.category === category)
 let restored = false
-onMounted(async () => { const stored = await loadAudioToolsState(); if (stored?.activeTool && visibleAudioTools.value.some(tool => tool.id === stored.activeTool)) activeTool.value = stored.activeTool; restored = true; await runtime.start() })
+let lastVisitedTool: AudioToolKey | undefined
+function recordActiveToolVisit() {
+  const tool = activeDefinition.value.id
+  if (!restored || tool === lastVisitedTool) return
+  lastVisitedTool = tool
+  recordFeatureVisit('tools', tool)
+}
+onMounted(async () => { const stored = await loadAudioToolsState(); if (stored?.activeTool && visibleAudioTools.value.some(tool => tool.id === stored.activeTool)) activeTool.value = stored.activeTool; restored = true; recordActiveToolVisit(); await runtime.start() })
 watch(visibleAudioTools, tools => { if (!tools.some(tool => tool.id === activeTool.value) && tools[0]) activeTool.value = tools[0].id }, { immediate: true })
-watch(activeTool, value => { if (restored) void updateAudioToolsState({ activeTool: value }) })
+watch(activeTool, value => { if (restored) { recordActiveToolVisit(); void updateAudioToolsState({ activeTool: value }) } })
 </script>
 <template><div class="page tools-page audio-tools-page"><div class="page-header-compact"><div><h1>{{ t('tools.title') }}</h1><p>{{ t('tools.subtitle') }}</p></div></div>
   <n-select v-model:value="activeTool" class="audio-tools-mobile-select" :options="mobileToolOptions" />

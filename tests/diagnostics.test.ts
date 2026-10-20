@@ -57,9 +57,12 @@ test('the detailed device probe takes priority over cached runtime acceleration 
   assert.equal(checks.find(check => check.key === 'accelerator')?.value, 'CPU')
 })
 
-test('issue filtering recognizes workflow failure and cancellation lifecycle events', () => {
-  for (const event of ['node_failed', 'execution_failed', 'node_cancelled', 'execution_cancelled']) {
+test('issue filtering recognizes workflow failures while cancellation remains informational', () => {
+  for (const event of ['node_failed', 'execution_failed']) {
     assert.equal(isDiagnosticIssueEvent({ type: 'workflow_execution', payload: { version: 1, event } }), true, event)
+  }
+  for (const event of ['node_cancelled', 'execution_cancelled']) {
+    assert.equal(isDiagnosticIssueEvent({ type: 'workflow_execution', payload: { version: 1, event } }), false)
   }
 })
 
@@ -86,7 +89,7 @@ test('download log severity excludes normal messages and retains errors', () => 
 
 test('issue filtering preserves terminal error events and excludes normal progress', () => {
   assert.equal(isDiagnosticIssueEvent({ type: 'error', payload: { code: 'INVALID_INPUT' } }), true)
-  assert.equal(isDiagnosticIssueEvent({ type: 'task_cancelled' }), true)
+  assert.equal(isDiagnosticIssueEvent({ type: 'task_cancelled' }), false)
   assert.equal(isDiagnosticIssueEvent({ type: 'task_log', payload: { level: 'info', message: 'No error detected' } }), false)
   assert.equal(isDiagnosticIssueEvent({ type: 'workflow_execution', payload: { event: 'node_completed' } }), false)
   assert.equal(isDiagnosticIssueEvent({ type: 'workflow_execution', payload: { event: 'node_skipped' } }), false)

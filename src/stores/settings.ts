@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
 import { computed, nextTick, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -27,6 +28,8 @@ import {
   normalizeConcurrentSeparations,
 } from '@/features/tasks/concurrency'
 import type { EnvInfo } from '@/stores/app'
+
+const studioLog = createLogger('ui.stores.settings')
 
 type AppPathsPayload = {
   dataRoot: string
@@ -308,7 +311,7 @@ export const useSettingsStore = defineStore('settings', () => {
     if (scaleApplyTimer) clearTimeout(scaleApplyTimer)
     scaleApplyTimer = setTimeout(() => {
       scaleApplyTimer = null
-      void applyScaleFactor(value).catch((error) => console.warn('Failed to apply scale factor', error))
+      void applyScaleFactor(value).catch((error) => studioLog.warn('Failed to apply scale factor', error))
     }, 140)
   }
 
@@ -322,7 +325,7 @@ export const useSettingsStore = defineStore('settings', () => {
       }).catch((error) => {
         if (persistErrorReported) return
         persistErrorReported = true
-        console.warn('Failed to persist app settings', error)
+        studioLog.warn('Failed to persist app settings', error)
       })
     }, 80)
   }
@@ -370,11 +373,11 @@ export const useSettingsStore = defineStore('settings', () => {
       || String(stored.startupOnboardingSeenVersion || '').trim().length > 0
 
     applyTheme(themeMode.value, themeAccent.value)
-    await applyScaleFactor(scaleFactor.value).catch((error) => console.warn('Failed to apply scale factor', error))
+    await applyScaleFactor(scaleFactor.value).catch((error) => studioLog.warn('Failed to apply scale factor', error))
     setLocale(locale.value)
     initialized.value = true
     if (shouldPersistNormalizedOnboarding) queuePersist()
-    await syncProxyToBackend().catch((error) => console.warn('Failed to sync proxy settings', error))
+    await syncProxyToBackend().catch((error) => studioLog.warn('Failed to sync proxy settings', error))
   }
 
   watch(themeMode, (value) => {
@@ -403,7 +406,7 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       await saveAppStore('app-settings', persistable.value)
     } catch (error) {
-      console.warn('Failed to persist app settings', error)
+      studioLog.warn('Failed to persist app settings', error)
     }
   })
   watch(
@@ -435,7 +438,7 @@ export const useSettingsStore = defineStore('settings', () => {
   watch(
     [proxyMode, proxyUrl, proxyBypass],
     () => {
-      void syncProxyToBackend().catch((error) => console.warn('Failed to sync proxy settings', error))
+      void syncProxyToBackend().catch((error) => studioLog.warn('Failed to sync proxy settings', error))
     },
   )
 
@@ -536,12 +539,12 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       await modelStore.loadModels()
     } catch (error) {
-      console.warn('Failed to refresh models after model directory change', error)
+      studioLog.warn('Failed to refresh models after model directory change', error)
     }
     try {
       await modelStore.loadModelStorageSummary({ force: true })
     } catch (error) {
-      console.warn('Failed to refresh model storage after model directory change', error)
+      studioLog.warn('Failed to refresh model storage after model directory change', error)
     }
     const selectedModelName = modelStore.selectedModel
     if (selectedModelName) {

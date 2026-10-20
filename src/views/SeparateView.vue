@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -49,6 +51,8 @@ import { SEPARATE_MODEL_PAGE_SIZES } from '@/utils/pagination'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
+
+const studioLog = createLogger('ui.views.SeparateView')
 
 const { t, locale } = useI18n()
 const message = useMessage()
@@ -327,7 +331,7 @@ async function saveCurrentModelInferenceDefaults() {
     applyCurrentModelInferenceDefaults(info)
     message.success(t('models.inferenceDefaultsSaved'))
   } catch (error) {
-    console.error('Failed to persist model inference defaults', error)
+    studioLog.error('Failed to persist model inference defaults', error)
     message.error(t('models.inferenceDefaultsSaveFailed'))
   }
 }
@@ -340,7 +344,7 @@ async function resetCurrentModelInferenceDefaults() {
     applyCurrentModelInferenceDefaults(info)
     message.success(t('models.inferenceDefaultsReset'))
   } catch (error) {
-    console.error('Failed to restore model inference defaults', error)
+    studioLog.error('Failed to restore model inference defaults', error)
     message.error(t('models.inferenceDefaultsResetFailed'))
   }
 }

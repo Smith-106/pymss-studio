@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -40,6 +42,8 @@ import ModelProgressBlock from '@/components/ModelProgressBlock.vue'
 import DownloadDetailModal from '@/components/DownloadDetailModal.vue'
 import CustomModelImportDialog from '@/components/CustomModelImportDialog.vue'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
+
+const studioLog = createLogger('ui.views.ModelsView')
 
 const { t, locale } = useI18n()
 const message = useMessage()
@@ -574,7 +578,7 @@ async function saveInferenceDefaults() {
     closeInferenceEditor()
     message.success(t('models.inferenceDefaultsSaved'))
   } catch (error) {
-    console.error('Failed to persist model inference defaults', error)
+    studioLog.error('Failed to persist model inference defaults', error)
     message.error(t('models.inferenceDefaultsSaveFailed'))
   }
 }
@@ -607,7 +611,7 @@ async function resetInferenceDefaults() {
     }
     message.success(t('models.inferenceDefaultsReset'))
   } catch (error) {
-    console.error('Failed to restore model inference defaults', error)
+    studioLog.error('Failed to restore model inference defaults', error)
     message.error(t('models.inferenceDefaultsResetFailed'))
   }
 }
