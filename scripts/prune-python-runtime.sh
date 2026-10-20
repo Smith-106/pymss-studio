@@ -16,6 +16,7 @@ rm -rf \
   "$RUNTIME_DIR/condabin" \
   "$RUNTIME_DIR/libexec" \
   "$RUNTIME_DIR/shell"
+# Keep xmlrpc: pip installation commands require xmlrpc.client.
 if [[ "$KEEP_VENV" != "--keep-venv" ]]; then
   find "$RUNTIME_DIR/lib" -maxdepth 2 -type d \( \
     -name 'ensurepip' -o \
@@ -23,16 +24,14 @@ if [[ "$KEEP_VENV" != "--keep-venv" ]]; then
     -name 'idlelib' -o \
     -name 'lib2to3' -o \
     -name 'tkinter' -o \
-    -name 'turtledemo' -o \
-    -name 'xmlrpc' \
+    -name 'turtledemo' \
   \) -prune -exec rm -rf {} + 2>/dev/null || true
 else
   find "$RUNTIME_DIR/lib" -maxdepth 2 -type d \( \
     -name 'idlelib' -o \
     -name 'lib2to3' -o \
     -name 'tkinter' -o \
-    -name 'turtledemo' -o \
-    -name 'xmlrpc' \
+    -name 'turtledemo' \
   \) -prune -exec rm -rf {} + 2>/dev/null || true
 fi
 find "$RUNTIME_DIR/lib" -maxdepth 2 -type f \( -name 'turtle.py' \) -delete 2>/dev/null || true

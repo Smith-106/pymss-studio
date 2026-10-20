@@ -71,7 +71,8 @@ runtime_python() {
 }
 
 verify_bootstrap_runtime() {
-  runtime_python - <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 runtime_python - <<'PY'
+import xmlrpc.client
 import requests
 import socks
 from pip._vendor.packaging.requirements import Requirement
@@ -80,6 +81,8 @@ from pip._vendor.packaging.version import Version
 assert Requirement("pymss>=2.1").name == "pymss"
 assert Version("2.1.5") > Version("2.1.4")
 PY
+  # Version queries do not load pip's installation dependencies.
+  PYTHONDONTWRITEBYTECODE=1 runtime_python -m pip install --help > /dev/null
 }
 
 MANIFEST_BOOTSTRAP_REQUIREMENTS=()
@@ -221,3 +224,4 @@ PY
 PYTHONDONTWRITEBYTECODE=1 runtime_python "$(dirname "$0")/../python/runtime_audio_probe.py" --check-core
 bash "$(dirname "$0")/prune-python-runtime.sh" "$RUNTIME_DIR" --keep-venv
 runtime_python -m pip --version
+verify_bootstrap_runtime

@@ -1,4 +1,5 @@
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -6,6 +7,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import types
 import unittest
@@ -86,6 +89,142 @@ $result | ConvertTo-Json -Compress
                         env={**os.environ, "OSTYPE": platform, "RUNTIME_HOME": "/standalone runtime", "PY": interpreter.as_posix(), "PYTHONHOME": "/inherited home"},
                     )
                     self.assertEqual(result.stdout.splitlines(), [expected_home, "1", "argument with spaces"])
+
+    def _run_shell_bootstrap_probe(self, *, missing_xmlrpc=False, broken_installer=False, final_prune=False):
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("Bash is required for runtime preparation tests")
+        script = (Path(__file__).resolve().parents[2] / "scripts/prepare-python-runtime.sh").read_text(encoding="utf-8")
+        helper = re.search(r"^verify_bootstrap_runtime\(\) \{\n.*?^\}", script, re.M | re.S)
+        self.assertIsNotNone(helper, "execute only the verification helper, never the runtime rebuild script")
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="pymss-bootstrap-probe-"))).resolve()
+        library = root / "lib"
+        library.mkdir()
+        for name in ("requests", "socks"):
+            (library / f"{name}.py").touch()
+        pip = library / "pip"
+        (pip / "_vendor").mkdir(parents=True)
+        (pip / "__init__.py").touch()
+        (pip / "_vendor/__init__.py").touch()
+        packaging = importlib.util.find_spec("pip._vendor.packaging")
+        self.assertIsNotNone(packaging)
+        shutil.copytree(
+            Path(packaging.origin).parent, pip / "_vendor/packaging",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        if not missing_xmlrpc:
+            shutil.copytree(
+                Path(sysconfig.get_path("stdlib")) / "xmlrpc", library / "xmlrpc",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+        (pip / "__main__.py").write_text('''
+import os, sys
+if sys.argv[1:] == ['--version']:
+    print('pip 26.2.1')
+elif sys.argv[1:] == ['install', '--help']:
+    if os.environ.get('PREPARE_TEST_BROKEN_INSTALLER') == '1':
+        raise RuntimeError('installer command is unavailable')
+    import xmlrpc.client
+    print('Usage: pip install [options]')
+else:
+    raise SystemExit('Unexpected package installer arguments')
+''', encoding="utf-8")
+        runner = root / "isolated-runtime.py"
+        runner.write_text('''
+import json, os, runpy, sys
+from importlib.machinery import PathFinder
+from pathlib import Path
+library = Path(sys.argv[1]).resolve()
+arguments = sys.argv[2:]
+sys.path.insert(0, str(library))
+class FixturePackages:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] not in {'requests', 'socks', 'pip', 'xmlrpc'}:
+            return None
+        spec = PathFinder.find_spec(fullname, path if path is not None else [str(library)])
+        if spec is None or not Path(spec.origin).resolve().is_relative_to(library):
+            raise ModuleNotFoundError('No module named ' + fullname)
+        return spec
+sys.meta_path.insert(0, FixturePackages())
+try:
+    if arguments == ['-']:
+        exec(compile(sys.stdin.read(), '<bootstrap-probe>', 'exec'), {'__name__': '__main__'})
+    elif arguments[:2] == ['-m', 'pip']:
+        sys.argv = ['pip', *arguments[2:]]
+        runpy.run_module('pip', run_name='__main__', alter_sys=True)
+    else:
+        raise SystemExit('Unexpected runtime invocation')
+finally:
+    module = sys.modules.get('xmlrpc.client')
+    with open(os.environ['PREPARE_TEST_CALLS'], 'a', encoding='utf-8') as output:
+        output.write(json.dumps({'arguments': arguments,
+            'dontWriteBytecode': os.environ.get('PYTHONDONTWRITEBYTECODE'),
+            'xmlrpcOrigin': getattr(module, '__file__', None)}) + '\\n')
+''', encoding="utf-8")
+        calls = root / "calls.jsonl"
+        environment = {
+            **os.environ, "PREPARE_TEST_PYTHON": sys.executable,
+            "PYTHONDONTWRITEBYTECODE": "0",
+            "PREPARE_TEST_RUNNER": runner.as_posix(), "PREPARE_TEST_LIBRARY": library.as_posix(),
+            "PREPARE_TEST_CALLS": str(calls),
+            "PREPARE_TEST_BROKEN_INSTALLER": "1" if broken_installer else "0",
+        }
+        version = subprocess.run(
+            [sys.executable, "-I", "-B", "-S", str(runner), str(library), "-m", "pip", "--version"],
+            capture_output=True, text=True, env=environment,
+        )
+        wrapper = '''
+runtime_python() {
+  "$PREPARE_TEST_PYTHON" -I -B -S "$PREPARE_TEST_RUNNER" "$PREPARE_TEST_LIBRARY" "$@"
+}
+'''
+        invocation = "\nverify_bootstrap_runtime\n"
+        if final_prune:
+            pruning = list(re.finditer(r"^bash [^\n]*prune-python-runtime\.sh[^\n]*\n", script, re.M))
+            self.assertTrue(pruning)
+            # Run only the final post-build tail. A faulty final pruning pass must
+            # be detected even if bootstrap verification succeeded earlier.
+            invocation = '''
+RUNTIME_DIR="$PREPARE_TEST_LIBRARY"
+bash() {
+  rm -rf -- "$PREPARE_TEST_LIBRARY/xmlrpc"
+}
+''' + script[pruning[-1].start():]
+        result = subprocess.run(
+            [bash, "-c", "set -euo pipefail\n" + wrapper + helper.group(0) + invocation],
+            capture_output=True, text=True, env=environment,
+        )
+        observations = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        return version, result, observations, library
+
+    def test_shell_bootstrap_probe_rejects_missing_xmlrpc_even_when_pip_version_works(self):
+        version, result, _calls, _library = self._run_shell_bootstrap_probe(missing_xmlrpc=True)
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertNotEqual(result.returncode, 0, "a usable pip version cannot compensate for missing standard-library modules")
+        self.assertIn("xmlrpc", result.stderr)
+
+    def test_shell_bootstrap_probe_rejects_a_broken_install_command(self):
+        version, result, _calls, _library = self._run_shell_bootstrap_probe(broken_installer=True)
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertNotEqual(result.returncode, 0, "probe the installer entry point rather than only pip --version")
+        self.assertIn("installer command is unavailable", result.stderr)
+
+    def test_shell_bootstrap_probe_accepts_complete_fixture_and_checks_the_installer(self):
+        version, result, calls, library = self._run_shell_bootstrap_probe()
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installer = [call for call in calls if call["arguments"] == ["-m", "pip", "install", "--help"]]
+        self.assertEqual(len(installer), 1, "successful validation must exercise pip install")
+        self.assertEqual(installer[0]["dontWriteBytecode"], "1")
+        imports = next(call for call in calls if call["arguments"] == ["-"])
+        self.assertEqual(Path(imports["xmlrpcOrigin"]).resolve(), library / "xmlrpc/client.py")
+
+    def test_shell_final_pruning_is_followed_by_bootstrap_validation(self):
+        version, result, calls, _library = self._run_shell_bootstrap_probe(final_prune=True)
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertNotEqual(result.returncode, 0, "the final pruning pass must not invalidate an earlier bootstrap check")
+        self.assertIn("xmlrpc", result.stderr)
+        self.assertTrue(any(call["arguments"] == ["-"] for call in calls))
 
 
 if __name__ == "__main__":

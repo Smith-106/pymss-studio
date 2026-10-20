@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,3 +125,51 @@ class RuntimePruningTests(unittest.TestCase):
         self.assertFalse((core_meta_dir / "WHEEL").exists())
         self.assertFalse((site_packages / "cachepkg" / "__pycache__").exists())
         self.assertFalse((site_packages / "cachepkg" / "tests").exists())
+
+    def _check_posix_xmlrpc_survives_pruning(self, *, keep_venv: bool) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is required for the POSIX pruning script test")
+        runtime = (self.root / "xmlrpc-runtime").resolve()
+        stdlib = runtime / "lib" / "python3.12"
+        shutil.copytree(
+            Path(sysconfig.get_path("stdlib")) / "xmlrpc", stdlib / "xmlrpc",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        for name in ("idlelib", "tkinter", "venv", "ensurepip"):
+            package = stdlib / name
+            package.mkdir()
+            (package / "__init__.py").touch()
+        script = Path(__file__).resolve().parents[2] / "scripts/prune-python-runtime.sh"
+        result = subprocess.run(
+            [bash, str(script), str(runtime), *(["--keep-venv"] if keep_venv else [])],
+            capture_output=True, text=True, cwd=runtime,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((stdlib / "xmlrpc/client.py").is_file(), "pip install requires the retained xmlrpc package")
+        probe = subprocess.run(
+            [sys.executable, "-I", "-B", "-S", "-c", """
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+import xmlrpc, xmlrpc.client
+assert Path(xmlrpc.__file__).resolve() == root / 'xmlrpc/__init__.py'
+assert Path(xmlrpc.client.__file__).resolve() == root / 'xmlrpc/client.py'
+value = {'status': 'ready'}
+assert xmlrpc.client.loads(xmlrpc.client.dumps((value,)))[0] == (value,)
+print(json.dumps({'origin': xmlrpc.client.__file__}))
+""", str(stdlib)], capture_output=True, text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(Path(json.loads(probe.stdout)["origin"]).resolve(), stdlib / "xmlrpc/client.py")
+        self.assertFalse((stdlib / "idlelib").exists())
+        self.assertFalse((stdlib / "tkinter").exists())
+        self.assertEqual((stdlib / "venv").exists(), keep_venv)
+        self.assertEqual((stdlib / "ensurepip").exists(), keep_venv)
+
+    def test_posix_prune_preserves_xmlrpc_for_the_package_installer(self) -> None:
+        self._check_posix_xmlrpc_survives_pruning(keep_venv=False)
+
+    def test_posix_prune_with_venv_preserves_xmlrpc_for_the_package_installer(self) -> None:
+        self._check_posix_xmlrpc_survives_pruning(keep_venv=True)
