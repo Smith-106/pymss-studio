@@ -18,6 +18,7 @@ import {
 } from '@vicons/ionicons5'
 import { formatTime } from '@/utils/editorTime'
 import type { TransportPendingAction, TransportVisualState } from '@/stores/editorPlayback'
+import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
 
 const props = defineProps<{
   sessionName: string
@@ -310,8 +311,11 @@ function clearTransportPressed() {
               <strong>{{ t('editor.masterVolume') }}</strong>
               <span>{{ masterVolumePercent }}</span>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="masterVolume"
+              :reset-value="1"
+              :label="t('editor.masterVolume')"
+              :reset-label="t('editor.sliderDefaultVolume')"
               :min="0"
               :max="2"
               :step="0.01"
@@ -325,8 +329,11 @@ function clearTransportPressed() {
               <strong>{{ t('editor.balanceShort') }}</strong>
               <span>{{ formatTrackPan(masterPan) }}</span>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="masterPan"
+              :reset-value="0"
+              :label="t('editor.balanceShort')"
+              :reset-label="t('editor.sliderDefaultCenter')"
               :min="-1"
               :max="1"
               :step="0.01"

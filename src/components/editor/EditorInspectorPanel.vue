@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
+import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
 
 const props = defineProps<{
   session: EditorSession
@@ -192,13 +193,16 @@ function applyEffectPreset(value: string) {
           </label>
 
           <div class="dual-fields dual-fields--stacked">
-            <label class="panel-field panel-field--compact">
+            <div class="panel-field panel-field--compact">
               <div class="panel-field__split panel-field__split--compact">
                 <span class="panel-field__label">{{ t('editor.trackVolume') }}</span>
                 <strong>{{ formatTrackVolume(selectedTrack.volume) }}</strong>
               </div>
-              <n-slider
+              <EditorParameterSlider
                 :value="selectedTrack.volume"
+                :reset-value="1"
+                :label="t('editor.trackVolume')"
+                :reset-label="t('editor.sliderDefaultVolume')"
                 :min="0"
                 :max="2"
                 :step="0.01"
@@ -207,15 +211,18 @@ function applyEffectPreset(value: string) {
                 @dragstart="emit('beginTrackVolume')"
                 @dragend="emit('commitTrackVolume')"
               />
-            </label>
+            </div>
 
-            <label class="panel-field panel-field--compact">
+            <div class="panel-field panel-field--compact">
               <div class="panel-field__split panel-field__split--compact">
                 <span class="panel-field__label">{{ t('editor.balance') }}</span>
                 <strong>{{ formatTrackPan(selectedTrack.pan) }}</strong>
               </div>
-              <n-slider
+              <EditorParameterSlider
                 :value="selectedTrack.pan"
+                :reset-value="0"
+                :label="t('editor.balance')"
+                :reset-label="t('editor.sliderDefaultCenter')"
                 :min="-1"
                 :max="1"
                 :step="0.01"
@@ -224,7 +231,7 @@ function applyEffectPreset(value: string) {
                 @dragstart="emit('beginTrackPan')"
                 @dragend="emit('commitTrackPan')"
               />
-            </label>
+            </div>
           </div>
         </div>
       </section>
@@ -248,13 +255,16 @@ function applyEffectPreset(value: string) {
 
           <p class="effect-hint">{{ t('editor.effectPresetHint') }}</p>
 
-          <label class="panel-field panel-field--compact">
+          <div class="panel-field panel-field--compact">
             <div class="panel-field__split panel-field__split--compact">
               <span class="panel-field__label">{{ t('editor.effectClarity') }}</span>
               <strong>{{ Math.round(trackEffects.clarity * 100) }}%</strong>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="trackEffects.clarity"
+              :reset-value="0"
+              :label="t('editor.effectClarity')"
+              :reset-label="t('editor.sliderDefaultOff')"
               :min="0"
               :max="1"
               :step="0.01"
@@ -263,15 +273,18 @@ function applyEffectPreset(value: string) {
               @dragstart="emit('beginTrackEffects')"
               @dragend="emit('commitTrackEffects')"
             />
-          </label>
+          </div>
 
-          <label class="panel-field panel-field--compact">
+          <div class="panel-field panel-field--compact">
             <div class="panel-field__split panel-field__split--compact">
               <span class="panel-field__label">{{ t('editor.effectCompressor') }}</span>
               <strong>{{ Math.round(trackEffects.compressor * 100) }}%</strong>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="trackEffects.compressor"
+              :reset-value="0"
+              :label="t('editor.effectCompressor')"
+              :reset-label="t('editor.sliderDefaultOff')"
               :min="0"
               :max="1"
               :step="0.01"
@@ -280,15 +293,18 @@ function applyEffectPreset(value: string) {
               @dragstart="emit('beginTrackEffects')"
               @dragend="emit('commitTrackEffects')"
             />
-          </label>
+          </div>
 
-          <label class="panel-field panel-field--compact">
+          <div class="panel-field panel-field--compact">
             <div class="panel-field__split panel-field__split--compact">
               <span class="panel-field__label">{{ t('editor.effectReverb') }}</span>
               <strong>{{ Math.round(trackEffects.reverb * 100) }}%</strong>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="trackEffects.reverb"
+              :reset-value="0"
+              :label="t('editor.effectReverb')"
+              :reset-label="t('editor.sliderDefaultOff')"
               :min="0"
               :max="1"
               :step="0.01"
@@ -297,15 +313,18 @@ function applyEffectPreset(value: string) {
               @dragstart="emit('beginTrackEffects')"
               @dragend="emit('commitTrackEffects')"
             />
-          </label>
+          </div>
 
-          <label class="panel-field panel-field--compact">
+          <div class="panel-field panel-field--compact">
             <div class="panel-field__split panel-field__split--compact">
               <span class="panel-field__label">{{ t('editor.effectDelay') }}</span>
               <strong>{{ Math.round(trackEffects.delay * 100) }}%</strong>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="trackEffects.delay"
+              :reset-value="0"
+              :label="t('editor.effectDelay')"
+              :reset-label="t('editor.sliderDefaultOff')"
               :min="0"
               :max="1"
               :step="0.01"
@@ -314,7 +333,7 @@ function applyEffectPreset(value: string) {
               @dragstart="emit('beginTrackEffects')"
               @dragend="emit('commitTrackEffects')"
             />
-          </label>
+          </div>
 
           <label class="panel-field panel-field--compact">
             <span class="panel-field__label">{{ t('editor.effectDelayTime') }}</span>
