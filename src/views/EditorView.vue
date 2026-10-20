@@ -95,11 +95,14 @@ const {
   session,
   clearAssetPointerDrag,
 })
-const { isDraggingExternal } = useEditorProjectBridge({
+const { isDraggingExternal, isDraggingExternalOnMixer, isImportingExternal } = useEditorProjectBridge({
   routeProjectId,
   hasTauriApis,
   editor,
   assetPanelEl,
+  mixerRef,
+  canDropToMixer: () => !recordingBusy.value,
+  zoomFactor: computed(() => settings.scaleFactor),
   message,
   t,
 })
@@ -242,6 +245,10 @@ async function togglePlayback() {
 }
 
 async function handleRecordingToggle() {
+  if (recordingState.value === 'idle' && isImportingExternal.value) {
+    message.warning(t('editor.recordingImportPending'))
+    return
+  }
   const wasRecording = isRecording.value
   const ok = await toggleRecording()
   if (!ok && recordingError.value) {
@@ -441,6 +448,7 @@ watch(
         :missing-asset-preview="missingAssetPreview"
         :relinking-missing-assets="relinkingMissingAssets"
         :recording-state="recordingState"
+        :recording-start-disabled="isImportingExternal"
         :recording-devices="recordingDevices"
         :recording-device-id="recordingDeviceId"
         :recording-input-level="recordingInputLevel"
@@ -537,6 +545,8 @@ watch(
             :pixels-per-second="editor.pixelsPerSecond"
             :track-levels="trackLevels"
             :editing-disabled="recordingBusy"
+            :external-dragging="isDraggingExternalOnMixer"
+            :external-importing="isImportingExternal"
             :recording-preview="recordingPreview"
             @scroll-ready="handleMixerScrollReady"
             @select-track="editor.selectTrack"

@@ -40,6 +40,7 @@ const props = defineProps<{
   missingAssetPreview?: string[]
   relinkingMissingAssets?: boolean
   recordingState?: 'idle' | 'preparing' | 'recording' | 'stopping'
+  recordingStartDisabled?: boolean
   recordingDevices?: Array<{ deviceId: string; label: string }>
   recordingDeviceId?: string
   recordingInputLevel?: number
@@ -217,9 +218,9 @@ function clearTransportPressed() {
                   class="transport-record"
                   type="button"
                   :class="{ 'transport-record--active': recordingActive }"
-                  :disabled="disabled || recordingPending"
+                  :disabled="disabled || recordingPending || (!recordingActive && recordingStartDisabled)"
                   :aria-label="recordingActive ? t('editor.recordingStop') : t('editor.recordingStart')"
-                  :title="recordingActive ? t('editor.recordingStop') : t('editor.recordingStart')"
+                  :title="recordingActive ? t('editor.recordingStop') : t(recordingStartDisabled ? 'editor.recordingImportPending' : 'editor.recordingStart')"
                   @click.stop="emit('toggleRecording')"
                 >
                   <n-icon :component="recordingActive ? StopOutline : Mic" />
