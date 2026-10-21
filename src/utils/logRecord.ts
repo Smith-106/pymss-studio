@@ -136,7 +136,7 @@ function legacyRecord(raw: string, index: number): LogRecord {
   let level = normalizeLogLevel(envelope?.[2])
   let source: LogSource = event.startsWith('worker.') ? 'worker' : envelope ? 'studio' : 'unknown'
   if (envelope?.[2] === 'PY') level = /exception|failed/.test(event) ? 'error' : 'debug'
-  const prefix = message.match(/^\s*(?:\[(trace|debug|info|warn|warning|error|fatal|critical)\]|(trace|debug|info|warn|warning|error|fatal|critical):)\s*/i)
+  const prefix = message.match(/^\s*(?:\[(trace|debug|info|warn|warning|error|fatal|critical)\]|(trace|debug|info|warn|warning|error|fatal|critical):)[\t ]?/i)
   if (prefix) {
     level = normalizeLogLevel(prefix[1] || prefix[2])
     message = message.slice(prefix[0].length)

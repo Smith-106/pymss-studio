@@ -2,11 +2,17 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { locationLabel, logClock, logRecordRenderKeys, normalizeLogEntries, sourceLabel, type LogEntry, type LogRecord } from '@/utils/logRecord'
+import { groupLogTracebacks, type LogRecordGroup } from '@/utils/logTracebacks'
 
 const props = withDefaults(defineProps<{ lines: readonly LogEntry[]; compact?: boolean; embedded?: boolean }>(), { compact: false, embedded: false })
 const { t } = useI18n()
 const records = computed(() => normalizeLogEntries(props.lines))
 const recordKeys = computed(() => logRecordRenderKeys(records.value))
+const groups = computed(() => groupLogTracebacks(records.value))
+function lineNumber(group: LogRecordGroup) {
+  const first = String(group.firstIndex + 1).padStart(3, '0')
+  return group.lastIndex === group.firstIndex ? first : `${first}–${String(group.lastIndex + 1).padStart(3, '0')}`
+}
 function recordContext(record: LogRecord) {
   const { taskId, nodeId, jobId, requestId, location, context } = record
   return JSON.stringify({ taskId, nodeId, jobId, requestId, location, ...context }, null, 2)
@@ -24,19 +30,21 @@ function guardLogKeys(event: KeyboardEvent) {
 
 <template>
   <div v-if="lines.length" class="log-console" :class="{ 'log-console--compact': compact, 'log-console--embedded': embedded }" role="region" :aria-label="t('tasks.logs')" tabindex="0" @wheel.stop @pointerdown.stop @dblclick.stop @contextmenu.stop @keydown="guardLogKeys">
-    <div v-for="(record, index) in records" :key="recordKeys[index]" class="log-line" :class="['log-line--' + (record.level || 'unclassified'), 'log-source--' + record.source]">
+    <div v-for="group in groups" :key="recordKeys[group.firstIndex]" class="log-line" :class="['log-line--' + (group.record.level || 'unclassified'), 'log-source--' + group.record.source]">
       <div class="log-line-meta">
-        <span v-if="!compact" class="log-line-number">{{ String(index + 1).padStart(3, '0') }}</span>
-        <time v-if="record.timestamp" class="log-line-time" :datetime="record.timestamp">{{ logClock(record.timestamp) }}</time>
-        <span class="log-level-badge" :class="{ 'log-line-level': !compact }">{{ record.level?.toUpperCase() || t('debug.logUnclassified') }}</span>
-        <span class="log-source-badge">{{ logSource(record) }}</span>
-        <span v-if="record.logger && !compact" class="log-line-logger" :title="record.logger">{{ record.logger }}</span>
+        <span v-if="!compact" class="log-line-number">{{ lineNumber(group) }}</span>
+        <time v-if="group.record.timestamp" class="log-line-time" :datetime="group.record.timestamp">{{ logClock(group.record.timestamp) }}</time>
+        <span class="log-level-badge" :class="{ 'log-line-level': !compact }">{{ group.record.level?.toUpperCase() || t('debug.logUnclassified') }}</span>
+        <span v-if="group.record.source !== 'unknown'" class="log-source-badge">{{ logSource(group.record) }}</span>
+        <span v-if="group.record.logger && !compact" class="log-line-logger" :title="group.record.logger">{{ group.record.logger }}</span>
       </div>
-      <span class="log-line-text">{{ record.message }}</span>
-      <details v-if="hasDetails(record)" class="log-line-detail" @click.stop>
+      <span class="log-line-text">{{ group.message }}</span>
+      <details v-if="group.records.some(hasDetails)" class="log-line-detail" @click.stop>
         <summary>{{ t('debug.logDetails') }}</summary>
-        <pre v-if="record.detail" class="log-line-exception">{{ record.detail }}</pre>
-        <pre>{{ recordContext(record) }}</pre>
+        <template v-for="(record, index) in group.records" :key="index">
+          <pre v-if="record.detail" class="log-line-exception">{{ record.detail }}</pre>
+          <pre v-if="hasDetails(record)">{{ recordContext(record) }}</pre>
+        </template>
       </details>
     </div>
   </div>
@@ -57,6 +65,7 @@ function guardLogKeys(event: KeyboardEvent) {
   color: #c9d6ec;
   font-family: var(--font-mono);
   font-size: 12px;
+  font-weight: 400;
   line-height: 1.55;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, #94a3b8 46%, transparent) transparent;
