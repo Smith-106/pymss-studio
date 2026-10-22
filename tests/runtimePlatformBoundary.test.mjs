@@ -44,6 +44,8 @@ test('the ASR page only offers removal for removable components', () => {
 for (const [platform, machine, expected] of [
   ['darwin', 'arm64', ['mlx']],
   ['darwin', 'aarch64', ['mlx']],
+  ['darwin', 'x86_64', ['mlx']],
+  ['darwin', '', ['mlx']],
   ['win32', 'AMD64', ['cpu', 'cuda', 'rocm']],
 ]) {
   test(`${platform}/${machine} settings and onboarding offer the intended runtime environments`, () => {
@@ -63,9 +65,20 @@ for (const [platform, machine, expected] of [
   })
 }
 
+test('onboarding offers only MLX on Intel and unidentified Macs', () => {
+  for (const machine of ['x86_64', '']) {
+    const choices = componentComputed('../src/components/StartupOnboarding.vue', 'runtimeBackendChoices', {
+      runtimePlatform: { value: detectRuntimePlatform({ platform: 'darwin', machine }) },
+      runtimeBackendName: backend => backend, t: key => key, backendInstalled: () => false,
+      runtimeRecommendedBackend: { value: 'mlx' }, runtimeSizeHint: () => '',
+    })
+    assert.deepEqual(Array.from(choices, item => item.value), ['mlx'])
+  }
+})
+
 for (const platform of ['darwin', 'linux', 'win32']) {
   for (const installed of [false, true]) {
-    test(`${platform} onboarding with ${installed ? 'an installed' : 'a missing'} runtime respects the management boundary`, async () => {
+    test(`${platform} onboarding hands ${installed ? 'an installed' : 'a missing'} runtime to management`, async () => {
       const actions = []
       const app = {
         runtimeManagementSupported: platform === 'win32',
@@ -74,24 +87,14 @@ for (const platform of ['darwin', 'linux', 'win32']) {
         activateRuntime: async () => actions.push('activate'),
         installRuntime: async () => actions.push('install'),
       }
-      const finish = componentFunction('../src/components/StartupOnboarding.vue', 'finishOnboarding', {
+      const primary = componentFunction('../src/components/StartupOnboarding.vue', 'primaryAction', {
         app,
-        selectedBackend: { value: 'cpu' },
-        backendInstalled: () => installed,
-        settings: { markStartupOnboardingCompleted: async () => actions.push('complete') },
-        router: { push: async () => actions.push('settings') },
-        emit: () => actions.push('emitted'),
-        runRippleViewTransition: async action => action(),
-        getElementOrigin: () => null,
-        completeButtonRef: { value: null },
-        window: { innerWidth: 1280, innerHeight: 800 },
-        runtimeMirror: { value: 'auto' },
-        currentLocale: { value: 'zh-CN' },
+        currentStep: { value: 'runtime' }, canGoNext: { value: true },
+        selectedBackendReady: { value: false },
+        finishOnboarding: async (_event, skip, manage) => actions.push({ skip, manage }),
       })
-      await finish()
-      assert.deepEqual(actions, platform === 'win32'
-        ? ['complete', 'settings', 'emitted', installed ? 'activate' : 'install']
-        : ['complete', 'emitted'])
+      await primary({})
+      assert.deepEqual(actions, [{ skip: true, manage: true }])
     })
   }
 }

@@ -198,8 +198,8 @@ export function detectRuntimePlatform(info: RuntimeInfo | null | undefined) {
  * would leave a user unable to install the backend they actually need.
  */
 export function recommendedRuntimeBackend(info: RuntimeInfo | null | undefined): RuntimeBackend | null {
-  const { isMac, isAppleSilicon } = detectRuntimePlatform(info)
-  if (isMac) return isAppleSilicon ? 'mlx' : 'cpu'
+  const { isMac } = detectRuntimePlatform(info)
+  if (isMac) return 'mlx'
   const vendors = info?.gpuVendors
   if (!vendors?.length) return null
   // A discrete NVIDIA card wins over an AMD integrated one when both are present.

@@ -338,7 +338,7 @@ const themeOverrides = computed(() => {
               </div>
             </n-alert>
           </div>
-          <div class="app-body">
+          <div class="app-body" :inert="showStartupOnboarding || undefined">
             <SideNav v-if="!isStandaloneRoute" />
             <main class="app-content">
               <router-view v-slot="{ Component, route }">

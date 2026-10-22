@@ -309,9 +309,10 @@ test('ROCm is never recommended off Windows', () => {
   assert.equal(recommendedRuntimeBackend({ platform: 'linux', gpuVendors: ['nvidia'] }), 'cuda')
 })
 
-test('macOS is decided by architecture, not by GPU vendor', () => {
+test('macOS recommends MLX even before its architecture is identified', () => {
   assert.equal(recommendedRuntimeBackend({ platform: 'darwin', machine: 'arm64' }), 'mlx')
-  assert.equal(recommendedRuntimeBackend({ platform: 'darwin', machine: 'x86_64' }), 'cpu')
+  assert.equal(recommendedRuntimeBackend({ platform: 'darwin', machine: 'x86_64' }), 'mlx')
+  assert.equal(recommendedRuntimeBackend({ platform: 'darwin' }), 'mlx')
 })
 
 test('undetectable hardware yields no recommendation at all', () => {

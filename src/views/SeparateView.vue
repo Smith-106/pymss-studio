@@ -2553,7 +2553,7 @@ async function retryCurrentTask() {
                   </div>
                   <strong>{{ modelPanelLoading ? t('separate.modelPanelLoadingTitle') : t('separate.modelPanelEmptyTitle') }}</strong>
                   <p>{{ modelPanelLoading ? t('separate.modelPanelLoadingDesc') : t('separate.modelPanelEmptyDesc') }}</p>
-                  <n-button v-if="!modelPanelLoading" secondary @click="model.loadModels()">
+                  <n-button v-if="!modelPanelLoading" secondary @click="router.push('/models')">
                     {{ t('separate.modelPanelPrimaryAction') }}
                   </n-button>
                 </div>

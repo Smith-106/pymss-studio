@@ -245,8 +245,8 @@ function runtimeBackendDescription(backend: RuntimeBackend | string) {
 type BackendCardBase = { backend: RuntimeBackend; label: string; description: string; offCatalog: boolean }
 
 const runtimeBackendCatalog = computed<BackendCardBase[]>(() => {
-  const { isMac, isAppleSilicon } = runtimePlatform.value
-  const backends: RuntimeBackend[] = isAppleSilicon ? ['mlx'] : ['cpu']
+  const { isMac } = runtimePlatform.value
+  const backends: RuntimeBackend[] = isMac ? ['mlx'] : ['cpu']
   if (!isMac) backends.push('cuda', 'rocm')
   return backends.map((backend) => ({
     backend,
@@ -349,6 +349,24 @@ function runtimeCoreVersionLabel(card: { pymssVersion?: string; pymssCoreVersion
 function runtimeBackendLabel(value: RuntimeBackend | string | null | undefined) {
   return value ? runtimeBackendName(value) : t('settings.envNotChecked')
 }
+
+let locatedRuntimeBackend = ''
+function locateRuntimeBackend() {
+  const backend = route.query.backend
+  if (activeSection.value !== 'runtime' || app.runtimeInfoLoading || typeof backend !== 'string' || backend === locatedRuntimeBackend) return
+  if (!runtimeBackendCatalog.value.some(item => item.backend === backend)) return
+  const card = Array.from(document.querySelectorAll<HTMLElement>('[data-runtime-backend]'))
+    .find(element => element.dataset.runtimeBackend === backend)
+  if (card) {
+    card.scrollIntoView({ block: 'nearest' })
+    locatedRuntimeBackend = backend
+  }
+}
+
+watch([() => route.query.backend, activeSection, () => app.runtimeInfoLoading], async () => {
+  await nextTick()
+  locateRuntimeBackend()
+}, { immediate: true, flush: 'post' })
 
 function confirmRuntimeAction(title: string, content: string, positiveText: string) {
   return new Promise<boolean>((resolve) => {
@@ -1606,7 +1624,7 @@ onMounted(async () => {
               </span>
             </div>
             <p v-if="app.runtimeInfoError" class="runtime-read-error">{{ app.runtimeInfoError }}</p>
-            <Transition name="runtime-content" mode="out-in">
+            <Transition name="runtime-content" mode="out-in" @after-enter="locateRuntimeBackend">
             <div v-if="!app.runtimeInfo && app.runtimeInfoLoading" key="loading" class="runtime-envs-list" :aria-label="t('settings.runtimeChecking')" aria-busy="true">
               <div v-for="backend in runtimeBackendCatalog" :key="backend.backend" class="runtime-env-card runtime-env-card--skeleton">
                 <strong class="runtime-env-card__backend">{{ backend.label }}</strong>
@@ -1620,9 +1638,11 @@ onMounted(async () => {
                 v-for="card in runtimeBackendCards"
                 :key="card.key"
                 class="runtime-env-card"
+                :data-runtime-backend="card.backend"
                 :class="{
                   'runtime-env-card--active': card.state === 'active',
                   'runtime-env-card--muted': card.state === 'not_installed',
+                  'runtime-env-card--requested': route.query.backend === card.backend,
                 }"
               >
                 <div class="runtime-env-card__head">
@@ -3140,6 +3160,12 @@ onMounted(async () => {
 .runtime-env-card--muted {
   background: color-mix(in srgb, var(--surface-2) 18%, transparent);
   border-style: dashed;
+}
+
+.runtime-env-card--requested {
+  border-style: solid;
+  border-color: var(--primary-border);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .runtime-env-card__desc {
