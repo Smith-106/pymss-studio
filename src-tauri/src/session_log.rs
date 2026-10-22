@@ -141,6 +141,7 @@ pub fn configure_startup_logging(args: impl IntoIterator<Item = std::ffi::OsStri
         .take_while(|arg| arg != "--")
         .any(|arg| arg == "--debug");
     STARTUP_DEBUG_LOG.store(enabled, Ordering::Relaxed);
+    terminal::set_verbose(enabled);
     enabled
 }
 
@@ -1389,6 +1390,7 @@ mod tests {
             fn drop(&mut self) {
                 set_developer_mode(self.0);
                 STARTUP_DEBUG_LOG.store(self.1, Ordering::Relaxed);
+                terminal::set_verbose(self.1);
             }
         }
         let _restore = RestoreLoggingMode(previous_developer_mode, previous_startup_debug);
