@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+from importlib import metadata
 import io
 import json
 import os
@@ -16,6 +17,35 @@ from unittest.mock import patch
 
 
 class PrepareRuntimeProbeTests(unittest.TestCase):
+    def test_macos_bundled_state_records_torch_and_rejects_an_absent_installation(self):
+        script = (Path(__file__).resolve().parents[2] / "scripts/prepare-python-runtime.sh").read_text(encoding="utf-8")
+        recorder = re.search(r'runtime_python - "\$RUNTIME_ENVS_DIR" .*? <<\'PY\'\n(.*?)\nPY', script, re.S)
+        self.assertIsNotNone(recorder)
+        for torch_installed in (True, False):
+            with self.subTest(torch_installed=torch_installed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = root / "manifest.json"
+                manifest.write_text(json.dumps({"manifestVersion": "2026.10.2", "common": {"pymss": "pymss==2.1.8"}}), encoding="utf-8")
+
+                def version(name):
+                    if name == "torch" and not torch_installed:
+                        raise metadata.PackageNotFoundError(name)
+                    return {"pymss": "2.1.8", "torch": "2.7.1", "mlx": "0.32.4"}[name]
+
+                with patch.object(sys, "argv", ["-", str(root), str(manifest)]), \
+                        patch.object(metadata, "version", side_effect=version), \
+                        patch.object(importlib.util, "find_spec", return_value=object()):
+                    if not torch_installed:
+                        with self.assertRaisesRegex(SystemExit, "torch"):
+                            exec(compile(recorder.group(1), "bundled-state-recorder", "exec"), {})
+                        self.assertFalse((root / "active-runtime.json").exists())
+                        continue
+                    exec(compile(recorder.group(1), "bundled-state-recorder", "exec"), {})
+                state = json.loads((root / "active-runtime.json").read_text(encoding="utf-8"))
+                self.assertEqual(state["torchVersion"], "2.7.1")
+                self.assertEqual(state["packageVersions"]["torch"], "2.7.1")
+                self.assertTrue(state["packages"]["torch"])
+
     def test_windows_backend_extras_omit_missing_and_blank_requirements(self):
         powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
         if powershell is None:

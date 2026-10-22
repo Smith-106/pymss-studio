@@ -166,8 +166,13 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
         mode=None,
         channel="stable",
         rollback_after=False,
+        state_overrides=None,
     ):
         bundled_root, env, python = self.make_env(backend, manifest_version=manifest_version, bundled=bundled, platform=platform, bootstrap=bootstrap)
+        if state_overrides:
+            for path in (self.active, env / "pymss-runtime-state.json"):
+                state = json.loads(path.read_text(encoding="utf-8"))
+                path.write_text(json.dumps({**state, **state_overrides}), encoding="utf-8")
         base = probe(backend, pymss="2.1.3")
         final = overlay_probe or probe(backend)
         probe_calls = [base, base, final]

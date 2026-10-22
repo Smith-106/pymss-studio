@@ -118,6 +118,20 @@ class CorePlanTests(unittest.TestCase):
         self.assertEqual(cached.get("overlayPath"), active.get("overlayPath"))
         self.assertEqual(active["previousRuntime"]["pymssVersion"], "2.1.4")
 
+    def test_missing_cached_torch_version_does_not_disable_verified_core_rollback(self):
+        compatible = manifest()
+        compatible["common"]["pymss"] = "pymss[proxy]>=2.1.3"
+        status, _commands, _env, _python, events = self.case.run_update(
+            manifest_value=compatible, state_overrides={"torchVersion": None}, rollback_after=True,
+        )
+        self.assertEqual(status, 0)
+        finished = [event["payload"] for event in events if event["type"] == "runtime_core_update_finished"]
+        self.assertTrue(finished[0]["rollbackAvailable"])
+        active = json.loads(self.case.active.read_text(encoding="utf-8"))
+        self.assertEqual(active["pymssVersion"], "2.1.3")
+        self.assertEqual(active["torchVersion"], "2.7.1")
+        self.assertEqual(active["previousRuntime"]["torchVersion"], "2.7.1")
+
 
 class ChannelTests(unittest.TestCase):
     def test_discovery_excludes_yanked_and_empty_releases_and_follows_channel(self):

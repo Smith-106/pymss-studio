@@ -2012,7 +2012,9 @@ def _make_posix_venv_relocatable(env_dir: Path) -> bool:
     bootstrap = _bootstrap_python_path().resolve()
     if not bin_dir.is_dir() or not bootstrap.is_file():
         return False
-    relative = os.path.relpath(bootstrap, bin_dir)
+    # Resolve both ends: on macOS /var aliases /private/var, and lexical
+    # traversal from the alias can otherwise leave a dangling interpreter link.
+    relative = os.path.relpath(bootstrap, bin_dir.resolve())
     names = {"python", "python3", f"python{sys.version_info.major}.{sys.version_info.minor}"}
     changed = False
     for name in names:
@@ -2398,6 +2400,14 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
     if not torch_version:
         from worker_protocol import emit_error
         return emit_error("RUNTIME_CORE_UPDATE_FAILED", "Unable to determine the installed Torch version; refusing to update the runtime core.", task_id=task_id, recoverable=True)
+    # Older bundled state omitted Torch's version. Preserve the live base facts
+    # in both generations so a healthy previous core remains eligible for rollback.
+    runtime_facts = {
+        key: base_probe[key]
+        for key in ("pythonVersion", "torchBackend", "acceleratorAvailable")
+        if key in base_probe
+    }
+    runtime_facts["torchVersion"] = torch_version
     staging_generation: Path | None = None
     promoted_generation: Path | None = None
     overlay_committed = False
@@ -2590,6 +2600,7 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
         overlay_path = final_generation / "site-packages"
         updated = {
             **(state or {}),
+            **runtime_facts,
             "backend": backend,
             "manifestVersion": manifest.get("manifestVersion"),
             "pythonPath": str(python_path),
@@ -2604,6 +2615,7 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             "previousRuntime": {key: value for key, value in active.items() if key not in {"previousRuntime", "activationId"}},
         }
         updated["previousRuntime"].update({
+            **runtime_facts,
             "packageVersions": package_versions,
             "pymssVersion": package_versions.get("pymss"),
             "pymssCoreVersion": package_versions.get("pymss-core"),

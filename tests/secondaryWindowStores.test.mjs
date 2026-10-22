@@ -45,7 +45,6 @@ function environment(initial = {}) {
   let failWrites = false
   let confirmCalls = 0
   let callbackId = 0
-  let secondaryUpdateGate = null
   function activate(label, pinia) {
     if (pinia) setActivePinia(pinia)
     globalThis.window = {
@@ -76,7 +75,6 @@ function environment(initial = {}) {
           }
           if (command === 'plugin:event|listen' || command === 'plugin:event|unlisten') return ++callbackId
           if (command === 'check_managed_update') {
-            if (label !== 'main' && secondaryUpdateGate) await secondaryUpdateGate
             return {
               currentVersion: '0.0.12', version: '0.0.13', prerelease: false, distribution: 'portable',
               autoUpdateSupported: true, requiresManualInstall: false,
@@ -101,11 +99,6 @@ function environment(initial = {}) {
   }
   return {
     state, calls, writes, instance, fail: value => { failWrites = value },
-    holdSecondaryUpdateCheck() {
-      let resume
-      secondaryUpdateGate = new Promise(resolve => { resume = resolve })
-      return resume
-    },
   }
 }
 
@@ -208,7 +201,7 @@ test('only the main window confirms model migration and remaps registrations', a
   assert.equal(env.calls.filter(call => call.command === 'remap_custom_model_paths').length, 1)
 })
 
-test('a late secondary-window update check cannot clear newer deferred update preferences', async () => {
+test('secondary-window update checks stay idle and preserve newer main-window preferences', async () => {
   const env = environment()
   const main = env.instance('main')
   const mainUpdates = useUpdateStore(main.pinia)
@@ -220,7 +213,6 @@ test('a late secondary-window update check cannot clear newer deferred update pr
   useAppStore(child.pinia).buildInfoUpdateSupported = true
   stores.push(childUpdates)
   await childUpdates.initialize()
-  const resumeChild = env.holdSecondaryUpdateCheck()
   const childCheck = childUpdates.checkForUpdates()
   main.activate()
   await mainUpdates.checkForUpdates()
@@ -228,11 +220,17 @@ test('a late secondary-window update check cannot clear newer deferred update pr
   const baseline = clone(env.state['update-state'])
   assert.equal(baseline.deferredVersion, '0.0.13')
   child.activate()
-  resumeChild()
-  await childCheck
+  assert.equal(await childCheck, null)
+  assert.equal(await childUpdates.checkForUpdates(true), null)
   await waitForSave()
-  assert.equal(childUpdates.currentVersion, '0.0.12')
-  assert.equal(childUpdates.latestVersion, '0.0.13')
+  assert.equal(childUpdates.currentVersion, '')
+  assert.equal(childUpdates.latestVersion, '')
+  assert.equal(childUpdates.status, 'idle')
+  assert.equal(env.calls.some(call => call.label === 'workflow-simple-editor-a' && (
+    call.command === 'check_managed_update'
+    || call.command === 'plugin:event|listen'
+    || (call.command === 'load_app_store' && call.args.name === 'update-state')
+  )), false)
   assert.deepEqual(env.state['update-state'], baseline)
   assert.ok(env.writes.every(write => write.label === 'main'))
 })

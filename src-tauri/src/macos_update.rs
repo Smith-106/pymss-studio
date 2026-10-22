@@ -523,16 +523,7 @@ mod platform {
             return Err(failure("Invalid macOS update startup token"));
         }
         let directory = storage::temp_dir(app)?.join(&token);
-        let metadata = fs::symlink_metadata(&directory)?;
-        // SAFETY: geteuid has no preconditions.
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(failure(
-                "The application startup transaction directory is invalid",
-            ));
-        }
+        startup::secure_directory(&directory)?;
         let request = startup::read_request(&directory)?;
         let target = current_bundle()?;
         if request.target != target
@@ -652,7 +643,7 @@ mod platform {
                 return Err(failure("The signed update changes the installed runtime contract and requires manual installation"));
             }
             require_space(target.parent().unwrap(), size)?;
-            let startup_directory = tempfile::Builder::new().prefix("macos-update-startup-").tempdir_in(&root)?;
+            let startup_directory = startup::create_directory(&root, "macos-update-startup-")?;
             let mut request = startup::Request {
                 token: startup_directory.path().file_name().unwrap().to_str().unwrap().into(),
                 target: target.clone(), version: version.clone(), privileged: false,

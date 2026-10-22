@@ -63,6 +63,35 @@ fn startup_process_matches(launcher: u32, pid: u32, token: &str) -> bool {
     false
 }
 
+pub(super) fn create_directory(parent: &Path, prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent)
+}
+
+#[cfg(unix)]
+pub(super) fn secure_directory(directory: &Path) -> AppResult<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(directory)?;
+    // Earlier updaters used tempfile's default directory mode (usually 0755).
+    // Accept owner-controlled legacy directories, then make the acknowledgement
+    // private. A symlink or a directory writable by another user is never trusted.
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    let user_id = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != user_id || metadata.mode() & 0o022 != 0 {
+        return Err(failure(
+            "The application startup transaction directory is invalid",
+        ));
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 pub(super) fn valid_token(token: &str) -> bool {
     token
         .strip_prefix("macos-update-startup-")
@@ -201,6 +230,46 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_directory_is_private_and_seals_legacy_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let directory = create_directory(parent.path(), "macos-update-startup-").unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        secure_directory(directory.path()).unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(secure_directory(directory.path()).is_err());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = parent.path().join("alias");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+        assert!(secure_directory(&alias).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_directories_keep_platform_tokens_and_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        for prefix in ["macos-update-startup-", "linux-update-startup-"] {
+            let directory = create_directory(parent.path(), prefix).unwrap();
+            let token = directory.path().file_name().unwrap().to_str().unwrap();
+            assert!(token.starts_with(prefix));
+            assert!(valid_token(token));
+            assert_eq!(
+                fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
     #[test]
     fn token_arguments_cannot_select_arbitrary_paths() {
         for invalid in [

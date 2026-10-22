@@ -255,9 +255,9 @@ class MultipleEnvironmentTests(unittest.TestCase):
             self.assertEqual(worker_bootstrap.cmd_activate_runtime({"backend": "cpu"}), 0)
             after_cpu = self._active()
         self.assertEqual(after_cuda["backend"], "cuda")
-        self.assertTrue(after_cuda["pythonPath"].endswith("cuda\\Scripts\\python.exe"))
+        self.assertEqual(Path(after_cuda["pythonPath"]), self.envs_dir / "cuda" / "Scripts" / "python.exe")
         self.assertEqual(after_cpu["backend"], "cpu")
-        self.assertTrue(after_cpu["pythonPath"].endswith("cpu\\Scripts\\python.exe"))
+        self.assertEqual(Path(after_cpu["pythonPath"]), self.envs_dir / "cpu" / "Scripts" / "python.exe")
         # Switching back and forth must not damage either environment.
         with self._runtime():
             self.assertEqual(len(worker_bootstrap._installed_envs(MANIFEST)), 2)
@@ -888,7 +888,7 @@ class EnvironmentStateTrustTests(unittest.TestCase):
         self.assertEqual(state["torchBackend"], "cpu")
         self.assertIs(state["acceleratorAvailable"], False)
         # Probed the environment's own interpreter, not the active runtime's.
-        self.assertTrue(str(probe.call_args.args[0]).endswith("cpu\\Scripts\\python.exe"))
+        self.assertEqual(Path(probe.call_args.args[0]), self.envs_dir / "cpu" / "Scripts" / "python.exe")
         # Corrected on disk, so the cost is paid once.
         self.assertEqual(self._stored("cpu")["torchBackend"], "cpu")
 

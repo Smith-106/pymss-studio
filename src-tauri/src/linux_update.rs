@@ -402,7 +402,7 @@ mod platform {
             fs::set_permissions(&image, fs::Permissions::from_mode(mode | 0o100))?;
             let root = storage::temp_dir(&app)?;
             fs::create_dir_all(&root)?;
-            let startup_directory = tempfile::Builder::new().prefix("linux-update-startup-").tempdir_in(root)?;
+            let startup_directory = startup::create_directory(&root, "linux-update-startup-")?;
             let request = startup::Request { token: startup_directory.path().file_name().unwrap().to_str().unwrap().into(), target: target.clone(), version: version.clone(), privileged: false };
             startup::save_request(startup_directory.path(), &request)?;
             let logs = storage::logs_dir(&app)?;

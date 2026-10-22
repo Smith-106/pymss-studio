@@ -197,7 +197,7 @@ envs = Path(sys.argv[1])
 manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 package_versions = {}
 packages = {}
-for name in (*manifest["common"], "mlx"):
+for name in (*manifest["common"], "torch", "mlx"):
     try:
         package_versions[name] = metadata.version(name)
         packages[name] = True
