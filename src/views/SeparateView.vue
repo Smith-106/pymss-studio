@@ -3881,6 +3881,16 @@ async function retryCurrentTask() {
 .stage-view--failed { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 40%, transparent), var(--shadow-panel); }
 .stage-view--cancelled { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 40%, transparent), var(--shadow-panel); }
 
+.dark-theme .rail-card,
+.dark-theme .stage-view {
+  background: var(--surface-1);
+}
+.dark-theme .rail-card,
+.dark-theme .stage-view--ready {
+  box-shadow: inset 0 0 0 1px var(--outline);
+}
+.dark-theme .launch-bar__go { box-shadow: none; }
+
 .stage-swap-enter-active { transition: opacity 260ms cubic-bezier(0.22,1,0.36,1), transform 300ms cubic-bezier(0.22,1,0.36,1); }
 .stage-swap-leave-active { transition: opacity 160ms ease, transform 160ms ease; }
 .stage-swap-enter-from { opacity: 0; transform: translateY(10px) scale(0.99); }

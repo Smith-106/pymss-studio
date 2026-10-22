@@ -32,6 +32,7 @@ import {
   type SimpleWorkflowReasonCode,
 } from '@/utils/workflowSimple'
 import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
+import { themeIsDark } from '@/utils/theme'
 import { hasInvalidSimpleStructure, isGraphWorkflowDefinition, isSimpleWorkflowDefinition } from '@/workflows/formats'
 import { litegraphToComfy } from '@/litegraph/graphAdapter'
 import {
@@ -747,7 +748,8 @@ watch([workflows, selectedWorkflowId], () => {
         </n-button>
         <n-button
           class="workflow-create-button"
-          type="primary"
+          :type="themeIsDark ? 'default' : 'primary'"
+          :secondary="themeIsDark"
           :disabled="isAnyEditorOpen"
           @click="openWorkflowCreateChooser"
         >
@@ -819,7 +821,7 @@ watch([workflows, selectedWorkflowId], () => {
             <n-icon :component="GitNetworkOutline" />
             <strong>{{ t('workflows.emptyTitle') }}</strong>
             <span>{{ t('workflows.emptyDesc') }}</span>
-            <n-button class="workflow-create-button" type="primary" size="small" @click="openWorkflowCreateChooser">
+            <n-button class="workflow-create-button" :type="themeIsDark ? 'default' : 'primary'" :secondary="themeIsDark" size="small" @click="openWorkflowCreateChooser">
               <span class="workflow-create-button__mark" aria-hidden="true" />
               {{ t('workflows.newWorkflow') }}
             </n-button>
@@ -1032,6 +1034,12 @@ watch([workflows, selectedWorkflowId], () => {
 .workflow-create-button:active {
   transform: translateY(1px) scale(0.985);
   box-shadow: 0 3px 9px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.dark-theme .workflow-create-button,
+.dark-theme .workflow-create-button:hover,
+.dark-theme .workflow-create-button:active {
+  box-shadow: none;
 }
 
 .workflow-create-button__mark {
@@ -1374,6 +1382,12 @@ watch([workflows, selectedWorkflowId], () => {
     inset 0 0 0 1px color-mix(in srgb, var(--outline) 80%, transparent),
     var(--shadow-panel);
   overflow: hidden;
+}
+
+.dark-theme .console__rail,
+.dark-theme .console__stage {
+  background: var(--surface-1);
+  box-shadow: inset 0 0 0 1px var(--outline);
 }
 
 .wf-overview-empty {

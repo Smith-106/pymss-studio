@@ -2157,6 +2157,25 @@ onMounted(() => {
   opacity: 0.55;
 }
 
+.dark-theme .model-card {
+  background: var(--surface-1);
+  border-color: var(--outline);
+}
+.dark-theme .model-card:hover {
+  background: color-mix(in srgb, var(--surface-2) 50%, var(--surface-1));
+  border-color: var(--outline-strong);
+  box-shadow: none;
+}
+.dark-theme .model-card--selected {
+  border-color: var(--primary-border) !important;
+  background: color-mix(in srgb, var(--primary-soft) 45%, var(--surface-1));
+}
+.dark-theme .model-card--busy {
+  border-color: var(--primary-border);
+  background: color-mix(in srgb, var(--primary-softer) 45%, var(--surface-1));
+}
+.dark-theme .mc-name { color: var(--on-surface-heading); }
+
 /* Card header */
 .mc-header {
   display: flex;
