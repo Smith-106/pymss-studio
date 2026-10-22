@@ -17,6 +17,8 @@ const MAX_CATALOG_PAGE_BYTES: usize = 1024 * 1024;
 pub fn platform_slug() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "macos-arm64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x64"
     } else {
         "windows-x64"
     }
@@ -168,6 +170,8 @@ fn latest_mirror_manifest(paths: &HashSet<String>, filename: &str) -> Option<Mir
             // A partially uploaded release must not advertise an unavailable update archive.
             let archive = if filename.ends_with("-macos-arm64-update.json") {
                 archive_name_for(folder, "macos-arm64")
+            } else if filename.ends_with("-linux-x64-update.json") {
+                archive_name_for(folder, "linux-x64")
             } else {
                 archive_name_for(folder, "windows-x64")
             };
@@ -190,6 +194,8 @@ pub fn archive_name(version: &str) -> String {
 fn archive_name_for(version: &str, platform: &str) -> String {
     if platform == "macos-arm64" {
         format!("Pymss-Studio-{version}-macos-arm64-update.app.tar.gz")
+    } else if platform == "linux-x64" {
+        format!("Pymss-Studio-{version}-linux-x64.AppImage")
     } else {
         format!("Pymss-Studio-{version}-windows-x64-update.zip")
     }
@@ -259,6 +265,20 @@ mod tests {
 
     fn paths(values: &[&str]) -> HashSet<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn linux_update_sources_require_an_appimage_instead_of_a_windows_archive() {
+        let files = paths(&[
+            "1.0.0/stable-v1-linux-x64-update.json",
+            "1.0.0/Pymss-Studio-1.0.0-linux-x64.AppImage",
+            "2.0.0/stable-v1-linux-x64-update.json",
+            "2.0.0/Pymss-Studio-2.0.0-windows-x64-update.zip",
+        ]);
+        assert_eq!(latest_mirror_manifest(&files, "stable-v1-linux-x64-update.json").unwrap().version, "1.0.0");
+        let github = Url::parse("https://github.com/pymss-project/pymss-studio/releases/download/v1.0.0/Pymss-Studio-1.0.0-linux-x64.AppImage").unwrap();
+        assert!(archive_url_for(&github, "1.0.0", UpdateProvider::Modelscope, "linux-x64").is_some());
+        assert!(archive_url_for(&github, "1.0.0", UpdateProvider::Github, "windows-x64").is_none());
     }
 
     #[test]

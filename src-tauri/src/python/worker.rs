@@ -280,6 +280,17 @@ fn bootstrap_python_path(app: &AppHandle) -> AppResult<String> {
         return Ok(value);
     }
     if let Some(embedded) = embedded_python_path(app)? {
+        #[cfg(target_os = "linux")]
+        if !storage::is_development_executable()
+            && std::env::var_os("APPIMAGE").is_some_and(|path| Path::new(&path).is_file())
+        {
+            let runtime = embedded.parent().and_then(Path::parent)
+                .ok_or_else(|| AppError::Worker("Invalid bundled Python path".into()))?;
+            let cached = super::bootstrap_cache::cached_python(
+                runtime, &storage::data_root_dir(app)?, env!("CARGO_PKG_VERSION"),
+            )?;
+            return Ok(cached.to_string_lossy().into_owned());
+        }
         return Ok(embedded.to_string_lossy().to_string());
     }
     if cfg!(windows) {

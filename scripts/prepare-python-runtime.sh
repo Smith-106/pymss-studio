@@ -40,6 +40,7 @@ import sys
 
 manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
 backend = manifest.get("backends", {}).get(sys.argv[2], {})
+backend.update(backend.get("platformOverrides", {}).get(sys.platform, {}))
 kind = sys.argv[3]
 if kind == "bootstrap":
     for requirement in manifest.get("bootstrap", {}).values():
@@ -119,25 +120,41 @@ if [[ "$TORCH_INDEX_URL_WAS_SET" != "x" ]]; then
   TORCH_INDEX_URL="$MANIFEST_TORCH_INDEX_URL"
 fi
 
-if [[ "$OSTYPE" == darwin* ]]; then
-  ARCHIVE="cpython-${PBS_PYTHON_VERSION}+${PBS_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
+if [[ "$OSTYPE" == darwin* || "$OSTYPE" == linux* ]]; then
+  if [[ "$OSTYPE" == darwin* ]]; then
+    PBS_TARGET="aarch64-apple-darwin"
+  else
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+      echo "Linux runtime packaging currently requires x86_64" >&2
+      exit 1
+    fi
+    PBS_TARGET="x86_64-unknown-linux-gnu"
+  fi
+  ARCHIVE="cpython-${PBS_PYTHON_VERSION}+${PBS_TAG}-${PBS_TARGET}-install_only_stripped.tar.gz"
   URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${ARCHIVE//+/%2B}"
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "$TMP_DIR"' EXIT
   curl -L --fail --retry 3 --retry-delay 2 -o "$TMP_DIR/pbs.tar.gz" "$URL"
+  if [[ "$OSTYPE" == linux* ]]; then
+    PBS_SHA256="${PBS_SHA256:-191b5188b42886fb8a14968d714571e8f3d1cef92ac7ad4c7e24cc4d0929b194}"
+    printf '%s  %s\n' "$PBS_SHA256" "$TMP_DIR/pbs.tar.gz" | sha256sum --check --status
+  fi
   tar -xzf "$TMP_DIR/pbs.tar.gz" -C "$TMP_DIR"
   mv "$TMP_DIR/python" "$RUNTIME_DIR"
   PY="$RUNTIME_DIR/bin/python3"
   if [[ ! -x "$PY" ]]; then
-    echo "Bundled macOS standalone python executable not found in $RUNTIME_DIR/bin/python3" >&2
+    echo "Standalone Python executable not found in $RUNTIME_DIR/bin/python3" >&2
     exit 1
+  fi
+  if [[ "$OSTYPE" == linux* ]]; then
+    printf 'pbs-%s-%s-%s-%s\n' "$PBS_TAG" "$PBS_PYTHON_VERSION" "$PBS_TARGET" "${PBS_SHA256:0:12}" > "$RUNTIME_DIR/bootstrap-id"
   fi
 else
   "$PYTHON_BIN" -m venv "$RUNTIME_DIR"
   PY="$RUNTIME_DIR/bin/python"
 fi
 
-if [[ "$OSTYPE" == darwin* && -z "$INITIAL_BACKEND" && "$VARIANT" != "mlx" && "$VARIANT" != "mps" ]]; then
+if [[ "$VARIANT" == "minimal" || ( "$OSTYPE" == darwin* && -z "$INITIAL_BACKEND" && "$VARIANT" != "mlx" && "$VARIANT" != "mps" ) ]]; then
   runtime_python -m ensurepip --upgrade
   runtime_python -m pip install --upgrade pip setuptools wheel
   runtime_python -m pip install --no-cache-dir "${MANIFEST_BOOTSTRAP_REQUIREMENTS[@]}"

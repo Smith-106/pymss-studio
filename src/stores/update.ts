@@ -25,7 +25,7 @@ type ManagedUpdate = {
   date?: string
   body?: string
   prerelease: boolean
-  distribution: 'inno' | 'portable' | 'macosApp'
+  distribution: 'inno' | 'portable' | 'macosApp' | 'appImage'
   autoUpdateSupported: boolean
   requiresManualInstall: boolean
   updateMessage?: string

@@ -238,6 +238,7 @@ const RUNTIME_BACKEND_DESC_KEYS: Record<RuntimeBackend, string> = {
 }
 
 function runtimeBackendDescription(backend: RuntimeBackend | string) {
+  if (backend === 'rocm' && app.runtimeInfo?.platform === 'linux') return t('onboarding.runtimeRocmLinux')
   const key = RUNTIME_BACKEND_DESC_KEYS[backend as RuntimeBackend]
   return key ? t(key) : ''
 }

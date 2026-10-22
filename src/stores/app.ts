@@ -586,9 +586,14 @@ export const useAppStore = defineStore('app', () => {
   const runtimeCoreUpdateSupported = computed(() => supportsRuntimeCoreUpdate({
     platform: runtimeInfo.value?.platform || envInfo.value?.platform,
   }))
+  const runtimeDebugSupported = computed(() => {
+    const platform = String(runtimeInfo.value?.platform || envInfo.value?.platform || '').toLowerCase()
+    return platform ? ['win32', 'windows'].includes(platform)
+      : typeof navigator !== 'undefined' && /^win/i.test(navigator.platform)
+  })
 
   function requireRuntimeManagement() {
-    if (!runtimeManagementSupported.value) throw new Error('Runtime management is only available on Windows.')
+    if (!runtimeManagementSupported.value) throw new Error('Runtime management is only available on Windows and Linux.')
   }
 
   async function installRuntime(backend: RuntimeBackend, mirror = 'auto', locale = '') {
@@ -705,7 +710,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function updateDebugRuntime<T>(command: RuntimeDebugCommand, payload: Record<string, unknown>): Promise<T> {
-    requireRuntimeManagement()
+    if (!runtimeDebugSupported.value) throw new Error('Runtime file editing is only available on Windows.')
     const result = await mutateRuntime(() => invoke<T>(command, { payload }))
     // A debug write may deliberately leave the interpreter unusable. Preserve the
     // successful file-write result while recording probe failures in diagnostics.
@@ -884,6 +889,7 @@ export const useAppStore = defineStore('app', () => {
     checkEnvInBackground,
     runtimeInfo,
     runtimeManagementSupported,
+    runtimeDebugSupported,
     runtimeCoreUpdateSupported,
     runtimeInfoLoading,
     runtimeInfoError,

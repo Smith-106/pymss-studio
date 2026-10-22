@@ -47,9 +47,11 @@ for (const [platform, machine, expected] of [
   ['darwin', 'x86_64', ['mlx']],
   ['darwin', '', ['mlx']],
   ['win32', 'AMD64', ['cpu', 'cuda', 'rocm']],
+  ['linux', 'x86_64', ['cpu', 'cuda', 'rocm']],
 ]) {
   test(`${platform}/${machine} settings and onboarding offer the intended runtime environments`, () => {
     const scope = {
+      app: { runtimeInfo: { platform, machine } },
       runtimePlatform: { value: detectRuntimePlatform({ platform, machine }) },
       runtimeBackendName: backend => backend,
       runtimeBackendDescription: backend => backend,
@@ -81,7 +83,7 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     test(`${platform} onboarding hands ${installed ? 'an installed' : 'a missing'} runtime to management`, async () => {
       const actions = []
       const app = {
-        runtimeManagementSupported: platform === 'win32',
+        runtimeManagementSupported: platform === 'win32' || platform === 'linux',
         runtimeReadyForBackend: () => false,
         runtimeInfo: { installedEnvironments: [{ backend: 'cpu', pythonPath: '/runtime/cpu/bin/python' }] },
         activateRuntime: async () => actions.push('activate'),
@@ -229,7 +231,7 @@ test('core confirmation keeps its plan exclusive until the confirmed apply is di
 })
 
 test('non-Windows developer controls cannot open an editor or mutate runtime files', async () => {
-  const scope = { app: { runtimeManagementSupported: false } }
+  const scope = { app: { runtimeManagementSupported: true, runtimeDebugSupported: false } }
   for (const name of ['openRuntimeDebugEditor', 'saveRuntimeDebugEditor', 'restoreRuntimeDebugFile', 'overrideActiveRuntimePointer']) {
     await componentFunction('../src/views/DebugView.vue', name, scope)({ editable: true, backupExists: true })
   }

@@ -16,6 +16,7 @@ on:
           - all
           - macos
           - windows
+          - linux
       publish:
         description: "Publish a GitHub Release"
         required: true
@@ -53,6 +54,13 @@ jobs:
       version: ${{ github.event.inputs.version || github.ref_name }}
     secrets: inherit
 
+  linux:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux'
+    uses: ./.github/workflows/release-linux.yml
+    with:
+      version: ${{ github.event.inputs.version || github.ref_name }}
+    secrets: inherit
+
   github-release:
     name: Publish GitHub Release
     if: >-
@@ -63,7 +71,7 @@ jobs:
       ) &&
       !contains(needs.*.result, 'failure') &&
       !contains(needs.*.result, 'cancelled')
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -100,7 +108,8 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           windows_result="${{ needs.windows.result }}"
           macos_result="${{ needs.macos.result }}"
-          if [[ "$windows_result" != "success" && "$macos_result" != "success" ]]; then
+          linux_result="${{ needs.linux.result }}"
+          if [[ "$windows_result" != "success" && "$macos_result" != "success" && "$linux_result" != "success" ]]; then
             echo "RELEASE_PRERELEASE=true" >> "$GITHUB_ENV"
           elif [[ "$version" == *-* ]]; then
             echo "RELEASE_PRERELEASE=true" >> "$GITHUB_ENV"
@@ -191,6 +200,13 @@ jobs:
           path: artifacts
           merge-multiple: true
           pattern: Pymss-Studio-${{ steps.release_meta.outputs.version }}-macos-*-mlx
+      - name: Download Linux release artifacts
+        if: needs.linux.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+          pattern: Pymss-Studio-${{ steps.release_meta.outputs.version }}-linux-x64-appimage
       - name: Validate release asset sizes
         shell: bash
         run: |
@@ -207,11 +223,12 @@ jobs:
             fi
           done
       - name: Sign managed update assets
-        if: needs.windows.result == 'success' || needs.macos.result == 'success'
+        if: needs.windows.result == 'success' || needs.macos.result == 'success' || needs.linux.result == 'success'
         shell: bash
         env:
           WINDOWS_BUILD_RESULT: ${{ needs.windows.result }}
           MACOS_BUILD_RESULT: ${{ needs.macos.result }}
+          LINUX_BUILD_RESULT: ${{ needs.linux.result }}
         run: |
           set -euo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
@@ -236,6 +253,14 @@ jobs:
             fi
             files+=("${macos[@]}")
           fi
+          if [ "$LINUX_BUILD_RESULT" = "success" ]; then
+            linux=(artifacts/*-linux-x64.AppImage)
+            if [ "${#linux[@]}" -ne 1 ]; then
+              echo "Expected one Linux AppImage" >&2
+              exit 1
+            fi
+            files+=("${linux[@]}")
+          fi
           for file in "${files[@]}"; do
             max_update_size=$((2 * 1024 * 1024 * 1024 - 1))
             if [[ "$file" == *-windows-x64-update.zip ]]; then
@@ -248,7 +273,7 @@ jobs:
             pnpm dlx @tauri-apps/cli@2.11.0 signer sign "$file"
           done
       - name: Generate managed update metadata
-        if: needs.windows.result == 'success' || needs.macos.result == 'success'
+        if: needs.windows.result == 'success' || needs.macos.result == 'success' || needs.linux.result == 'success'
         run: python3 scripts/generate-update-metadata.py
       - name: Generate release checksums
         shell: bash
@@ -284,7 +309,7 @@ jobs:
           files: artifacts/*
 
       - uses: softprops/action-gh-release@v2
-        if: needs.windows.result == 'success' || needs.macos.result == 'success'
+        if: needs.windows.result == 'success' || needs.macos.result == 'success' || needs.linux.result == 'success'
         with:
           tag_name: updater
           name: Pymss Studio Update Channel

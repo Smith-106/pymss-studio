@@ -1189,14 +1189,14 @@ async function loadRuntimeDebugPointers() {
 }
 
 function openRuntimeDebugEditor(file: DebugRuntimeFileInfo) {
-  if (!app.runtimeManagementSupported || !developerMode.value || !file.editable) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !file.editable) return
   runtimeDebugEditingPath.value = file.path
   runtimeDebugEditingContent.value = file.content || ''
   runtimeDebugEditorVisible.value = true
 }
 
 async function saveRuntimeDebugEditor() {
-  if (!app.runtimeManagementSupported) return
+  if (!app.runtimeDebugSupported) return
   const path = runtimeDebugEditingPath.value
   if (!path) return
   runtimeDebugSaving.value = path
@@ -1217,7 +1217,7 @@ async function saveRuntimeDebugEditor() {
 }
 
 async function restoreRuntimeDebugFile(file: DebugRuntimeFileInfo) {
-  if (!app.runtimeManagementSupported || !developerMode.value || !file.backupExists) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !file.backupExists) return
   runtimeDebugSaving.value = file.path
   try {
     const info = await app.updateDebugRuntime<DebugRuntimePointers>('debug_runtime_restore_file', { path: file.path })
@@ -1303,7 +1303,7 @@ function markRuntimeOverrideDirty() {
 }
 
 async function overrideActiveRuntimePointer() {
-  if (!app.runtimeManagementSupported || !developerMode.value || !runtimeOverrideBackend.value || !runtimeOverridePythonPath.value.trim()) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !runtimeOverrideBackend.value || !runtimeOverridePythonPath.value.trim()) return
   runtimeDebugSaving.value = 'active-runtime'
   try {
     const info = await app.updateDebugRuntime<DebugRuntimePointers>('debug_runtime_override_active', {
@@ -1586,8 +1586,8 @@ watch(developerMode, (enabled) => {
         </div>
       </template>
       <n-alert v-if="runtimeDebugError" type="error" class="debug-log-read-error">{{ runtimeDebugError }}</n-alert>
-      <n-alert v-if="!app.runtimeManagementSupported" type="info" :title="t('settings.runtimeManagementWindowsOnly')">
-        {{ t('settings.runtimeManagementReadOnlyHint') }}
+      <n-alert v-if="!app.runtimeDebugSupported" type="info" :title="t('settings.runtimeDebugWindowsOnly')">
+        {{ t('settings.runtimeDebugReadOnlyHint') }}
       </n-alert>
       <section class="runtime-status-panel">
         <div class="runtime-panel-copy">
@@ -1634,11 +1634,11 @@ watch(developerMode, (enabled) => {
                 </div>
                 <div class="runtime-file-editor__actions">
                   <n-button size="tiny" secondary :disabled="!runtimeDebugActiveFile.path" @click="revealPath(runtimeDebugActiveFile.path)">{{ t('common.open') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!app.runtimeManagementSupported || !developerMode || !runtimeDebugActiveFile.editable" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!app.runtimeManagementSupported || !developerMode || !runtimeDebugActiveFile.backupExists" :loading="runtimeDebugSaving === runtimeDebugActiveFile.path" @click="restoreRuntimeDebugFile(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.editable" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.backupExists" :loading="runtimeDebugSaving === runtimeDebugActiveFile.path" @click="restoreRuntimeDebugFile(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
                 </div>
               </div>
-              <button type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeManagementSupported || !developerMode || !runtimeDebugActiveFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">
+              <button type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">
                 <code class="runtime-file-editor__path">{{ runtimeDebugActiveFile.path }}</code>
               </button>
             </article>
@@ -1650,8 +1650,8 @@ watch(developerMode, (enabled) => {
                 </div>
                 <div class="runtime-file-editor__actions">
                   <n-button size="tiny" secondary :disabled="!envItem.pythonPath" @click="revealPath(envItem.pythonPath)">{{ t('debug.runtimeOpenPython') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!app.runtimeManagementSupported || !developerMode || !envItem.editableFile?.editable" @click="envItem.editableFile && openRuntimeDebugEditor(envItem.editableFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!app.runtimeManagementSupported || !developerMode || !envItem.editableFile?.backupExists" :loading="runtimeDebugSaving === envItem.editablePath" @click="envItem.editableFile && restoreRuntimeDebugFile(envItem.editableFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile?.editable" @click="envItem.editableFile && openRuntimeDebugEditor(envItem.editableFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile?.backupExists" :loading="runtimeDebugSaving === envItem.editablePath" @click="envItem.editableFile && restoreRuntimeDebugFile(envItem.editableFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
                 </div>
               </div>
               <div class="runtime-file-editor__paths">
@@ -1659,7 +1659,7 @@ watch(developerMode, (enabled) => {
                   <span>{{ t('debug.runtimePythonExecutable') }}</span>
                   <code :title="envItem.pythonPath || '-'">{{ envItem.pythonPath || '-' }}</code>
                 </div>
-                <button v-if="envItem.editableFile" type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeManagementSupported || !developerMode || !envItem.editableFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(envItem.editableFile)">
+                <button v-if="envItem.editableFile" type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(envItem.editableFile)">
                   <span>{{ t('debug.runtimeVenvConfig') }}</span>
                   <code class="runtime-file-editor__path runtime-file-editor__path--config">{{ envItem.editablePath }}</code>
                 </button>
@@ -1676,7 +1676,7 @@ watch(developerMode, (enabled) => {
               <p>{{ t('debug.runtimeOverrideHint') }}</p>
             </div>
           </div>
-          <div v-if="app.runtimeManagementSupported" class="runtime-override-form">
+          <div v-if="app.runtimeDebugSupported" class="runtime-override-form">
             <label>
               <span>{{ t('debug.runtimeOverrideBackend') }}</span>
               <n-select v-model:value="runtimeOverrideBackend" size="small" :options="runtimeBackendOptions" @update:value="markRuntimeOverrideDirty" />
@@ -1755,7 +1755,7 @@ watch(developerMode, (enabled) => {
       <template #footer>
         <div class="runtime-debug-editor-modal__footer">
           <n-button secondary @click="runtimeDebugEditorVisible = false">{{ t('common.close') }}</n-button>
-          <n-button type="primary" secondary :disabled="!app.runtimeManagementSupported" :loading="runtimeDebugSaving === runtimeDebugEditingPath" @click="saveRuntimeDebugEditor">
+          <n-button type="primary" secondary :disabled="!app.runtimeDebugSupported" :loading="runtimeDebugSaving === runtimeDebugEditingPath" @click="saveRuntimeDebugEditor">
             {{ t('common.save') }}
           </n-button>
         </div>

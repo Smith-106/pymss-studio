@@ -275,7 +275,7 @@ test('the macOS MLX runtime still supports selecting CPU as an inference device'
   settings.$dispose()
 })
 
-for (const platform of ['darwin', 'linux']) {
+for (const platform of ['darwin']) {
   test(`${platform} rejects environment management before IPC and preserves read-only probes`, async () => {
     const commands = []
     const app = appStore(async command => {
@@ -306,6 +306,29 @@ for (const platform of ['darwin', 'linux']) {
     app.$dispose()
   })
 
+}
+
+test('Linux dispatches runtime installation through the existing task queue', async () => {
+  const calls = []
+  const app = appStore(async command => {
+    calls.push(command)
+    if (command === 'runtime_info') return { platform: 'linux', ready: false }
+    if (command === 'start_runtime_install') return true
+    throw new Error(`unexpected ${command}`)
+  })
+  await app.checkRuntimeInfo()
+  assert.equal(app.runtimeManagementSupported, true)
+  assert.equal(app.runtimeDebugSupported, false)
+  await assert.rejects(() => app.updateDebugRuntime('debug_runtime_write_file', { path: '/runtime/active-runtime.json', content: '{}' }), /only available on Windows/)
+  const taskId = await within(app.installRuntime('rocm'), 'Linux runtime installation ACK')
+  assert.ok(calls.includes('start_runtime_install'))
+  assert.equal(app.runtimeInstallBackend, 'rocm')
+  assert.equal(app.runtimeInstallStatus, 'installing')
+  app.handleRuntimeEvent({ type: 'task_cancelled', taskId })
+  app.$dispose()
+})
+
+for (const platform of ['darwin', 'linux']) {
   test(`${platform} updates the active core and refreshes its versions after success`, async () => {
     const calls = []
     const refreshed = deferred()
@@ -328,7 +351,7 @@ for (const platform of ['darwin', 'linux']) {
     await within(refreshed.promise, 'runtime refresh after core update')
     await app.ensureRuntimeCoreVersions()
     assert.equal(app.runtimeCoreVersions.packages.pymss.latestVersion, '2.2.0')
-    assert.equal(app.runtimeManagementSupported, false)
+    assert.equal(app.runtimeManagementSupported, platform === 'linux')
     app.$dispose()
   })
 }

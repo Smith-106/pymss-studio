@@ -70,6 +70,8 @@ pub enum DistributionKind {
     Portable,
     #[cfg(target_os = "macos")]
     MacosApp,
+    #[cfg(target_os = "linux")]
+    AppImage,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -163,7 +165,13 @@ pub fn current_distribution() -> Option<DistributionKind> {
     {
         return crate::macos_update::current_bundle().ok().map(|_| DistributionKind::MacosApp);
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(target_os = "linux")]
+    {
+        return std::env::var_os("APPIMAGE")
+            .filter(|path| Path::new(path).is_file())
+            .map(|_| DistributionKind::AppImage);
+    }
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
     {
         let root = current_app_root().ok()?;
         distribution_at(&root)
@@ -181,7 +189,7 @@ fn distribution_at(root: &Path) -> Option<DistributionKind> {
 }
 
 pub fn update_supported() -> bool {
-    cfg!(any(windows, all(target_os = "macos", target_arch = "aarch64")))
+    cfg!(any(windows, all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))
         && is_official_build() && current_distribution().is_some()
 }
 
@@ -200,7 +208,9 @@ pub async fn check(
         .and_then(|bundle| crate::macos_update::check_location(&bundle))
         .and_then(|_| update.as_ref().map_or(Ok(()), |checked| crate::macos_update::check_runtime_contract(app, &checked.update.raw_json)))
         .err().map(|e| e.to_string());
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let installation_error = Some("Download the new AppImage from the release page and replace the previous file.".to_string());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let installation_error: Option<String> = None;
     Ok(update.map(|checked| {
         let update = checked.update;
@@ -243,6 +253,9 @@ pub async fn start(
     expected_version: String,
     source: UpdateSource,
 ) -> AppResult<()> {
+    if cfg!(target_os = "linux") {
+        return Err(AppError::Worker("AppImage updates require manual installation from the release page.".into()));
+    }
     let Some(_) = current_distribution() else {
         return Err(AppError::Worker("This application directory is not managed by an installer or portable package".into()));
     };

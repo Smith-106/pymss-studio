@@ -2,8 +2,8 @@ import type { EnvInfo, InstalledRuntime, RuntimeBackend, RuntimeCoreVersions, Ru
 
 export function supportsRuntimeManagement(info: Pick<RuntimeInfo, 'platform'> | null | undefined): boolean {
   const reported = String(info?.platform || '').toLowerCase()
-  if (reported) return reported === 'win32' || reported === 'windows'
-  return typeof navigator !== 'undefined' && /^win/i.test(navigator.platform)
+  if (reported) return ['win32', 'windows', 'linux'].includes(reported)
+  return typeof navigator !== 'undefined' && /^(win|linux)/i.test(navigator.platform)
 }
 
 export function supportsRuntimeCoreUpdate(info: Pick<RuntimeInfo, 'platform'> | null | undefined): boolean {
@@ -204,8 +204,7 @@ export function recommendedRuntimeBackend(info: RuntimeInfo | null | undefined):
   if (!vendors?.length) return null
   // A discrete NVIDIA card wins over an AMD integrated one when both are present.
   if (vendors.includes('nvidia')) return 'cuda'
-  // ROCm is Windows-only in the manifest; recommending it elsewhere would fail at install time.
-  if (vendors.includes('amd')) return String(info?.platform || '') === 'win32' ? 'rocm' : 'cpu'
+  if (vendors.includes('amd')) return supportsRuntimeManagement(info) ? 'rocm' : 'cpu'
   return 'cpu'
 }
 

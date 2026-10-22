@@ -32,6 +32,30 @@ jobs:
       - name: Verify optional components preserve the fixed runtime
         run: python -m unittest discover -s tests/python -t tests -p "test_worker_optional_packages.py"
 
+  linux-native:
+    name: Linux native runtime and backend
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            libwebkit2gtk-4.1-dev libssl-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify Linux release and environment contracts
+        run: python -m unittest discover -s tests/python -t tests -p 'test_linux_*.py'
+      - name: Check backend and bootstrap relocation
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml
+          cargo test --manifest-path src-tauri/Cargo.toml bootstrap_cache
+          cargo test --manifest-path src-tauri/Cargo.toml update_sources
+          cargo test --manifest-path src-tauri/Cargo.toml single_instance
+
   macos-updater:
     name: macOS updater
     runs-on: macos-14

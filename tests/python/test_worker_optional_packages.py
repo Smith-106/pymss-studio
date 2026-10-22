@@ -303,6 +303,17 @@ class OptionalRuntimePackageTests(unittest.TestCase):
             ("torchaudio==2.7.1", "https://download.pytorch.org/whl/cu128"),
         )
 
+    def test_linux_rocm_audio_uses_the_linux_index_instead_of_windows_wheels(self) -> None:
+        self.active_file.write_text(json.dumps({"backend": "rocm"}), encoding="utf-8")
+        with mock.patch("worker_bootstrap.sys.platform", "linux"), mock.patch.object(
+            optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
+                "torch": "2.10.0+rocm7.1", "torchaudio": None,
+            }.get(name),
+        ):
+            self.assertEqual(optional_packages._torchaudio_requirement(), (
+                "torchaudio==2.10.0", "https://download.pytorch.org/whl/rocm7.1",
+            ))
+
     def test_matching_torchaudio_is_not_reinstalled(self) -> None:
         with mock.patch.object(optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
             "torch": "2.7.1+cu128",

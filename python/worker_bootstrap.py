@@ -55,7 +55,12 @@ PACKAGE_IMPORT_NAMES = {
 
 
 def _manifest() -> dict[str, Any]:
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    for spec in manifest.get("backends", {}).values():
+        override = spec.get("platformOverrides", {}).get(sys.platform)
+        if isinstance(override, dict):
+            spec.update(override)
+    return manifest
 
 
 def _pin_manifest_requirement(requirement: Any, version: str) -> str:

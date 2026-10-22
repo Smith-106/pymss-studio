@@ -20,12 +20,12 @@ import {
   supportsRuntimeCoreUpdate,
 } from '../src/utils/runtime.ts'
 
-test('runtime management is available only on Windows regardless of browser platform', () => {
+test('runtime management is available on Windows and Linux regardless of browser platform', () => {
   assert.equal(supportsRuntimeManagement({ platform: 'win32' }), true)
   assert.equal(supportsRuntimeManagement({ platform: 'Win32' }), true)
   assert.equal(supportsRuntimeManagement({ platform: 'windows' }), true)
   assert.equal(supportsRuntimeManagement({ platform: 'darwin' }), false)
-  assert.equal(supportsRuntimeManagement({ platform: 'linux' }), false)
+  assert.equal(supportsRuntimeManagement({ platform: 'linux' }), true)
   assert.equal(supportsRuntimeManagement({ platform: 'unknown' }), false)
 })
 
@@ -303,9 +303,8 @@ test('a discrete NVIDIA card outranks an integrated AMD one', () => {
   assert.equal(recommendedRuntimeBackend({ platform: 'win32', gpuVendors: ['amd', 'nvidia'] }), 'cuda')
 })
 
-test('ROCm is never recommended off Windows', () => {
-  // The manifest restricts rocm to win32; the installer rejects it anywhere else.
-  assert.equal(recommendedRuntimeBackend({ platform: 'linux', gpuVendors: ['amd'] }), 'cpu')
+test('Linux GPU recommendations use the supported accelerator environments', () => {
+  assert.equal(recommendedRuntimeBackend({ platform: 'linux', gpuVendors: ['amd'] }), 'rocm')
   assert.equal(recommendedRuntimeBackend({ platform: 'linux', gpuVendors: ['nvidia'] }), 'cuda')
 })
 
