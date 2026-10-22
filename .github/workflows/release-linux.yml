@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev \
             libxdo-dev libayatana-appindicator3-dev librsvg2-dev patchelf file \
-            libfuse2 ffmpeg aria2 gstreamer1.0-plugins-base \
+            libfuse2 squashfs-tools ffmpeg aria2 gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
       - uses: ./.github/actions/setup-release-env
       - name: Sync build version metadata

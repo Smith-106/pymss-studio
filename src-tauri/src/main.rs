@@ -9,6 +9,12 @@ mod log_record;
 mod model_dir_migration;
 #[cfg(any(target_os = "macos", test))]
 mod macos_update;
+#[cfg(any(target_os = "linux", test))]
+mod linux_update;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_startup;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_stream;
 mod python;
 mod rba;
 mod session_log;

@@ -16,5 +16,11 @@ before installing. GPU support depends on the driver, distribution and GPU model
 
 If FUSE is unavailable, run: ./Pymss-Studio-<version>-linux-x64.AppImage --appimage-extract-and-run
 
-To update, download the new AppImage and replace the previous file after closing
-the application. Keep ~/.pymss-studio to preserve settings and runtime environments.
+Check for updates in Settings. Releases enabled for automatic updates can be
+downloaded, verified and installed in the application. Keep the AppImage in a
+directory owned and writable by your user. Save your work and close additional
+editor windows before updating. If the new version cannot start, the previous
+AppImage is restored. Settings and runtime environments remain in ~/.pymss-studio.
+
+For read-only locations or releases requiring manual installation, download the
+new AppImage and replace the previous file after closing the application.

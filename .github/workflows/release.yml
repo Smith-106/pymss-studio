@@ -118,6 +118,7 @@ jobs:
           fi
           requested_auto_update="${{ github.event_name == 'workflow_dispatch' && inputs.allow_auto_update == true }}"
           echo "RELEASE_MACOS_AUTO_UPDATE_SUPPORTED=$requested_auto_update" >> "$GITHUB_ENV"
+          echo "RELEASE_LINUX_AUTO_UPDATE_SUPPORTED=$requested_auto_update" >> "$GITHUB_ENV"
           previous_tag="$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | grep -v "^${release_tag}$" | head -n 1 || true)"
           runtime_compatible=false
           compatibility_reason="No previous release with a complete Windows runtime and package contract was found."

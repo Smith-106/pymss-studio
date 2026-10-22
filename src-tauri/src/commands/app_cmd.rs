@@ -159,7 +159,11 @@ pub fn confirm_managed_update_startup(window: tauri::WebviewWindow) -> AppResult
     if window.label() == "main" {
         crate::macos_update::confirm_startup(window.app_handle())?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    if window.label() == "main" {
+        crate::linux_update::confirm_startup(window.app_handle())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = window;
     Ok(())
 }

@@ -50,3 +50,18 @@ class LinuxReleaseTests(unittest.TestCase):
             (artifacts / "Pymss-Studio-1.2.3-linux-x64.AppImage").touch()
             with self.assertRaises(FileNotFoundError):
                 METADATA.generate(artifacts, {"RELEASE_TAG": "v1.2.3"})
+
+    def test_linux_online_install_requires_its_own_explicit_release_flag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            asset = "Pymss-Studio-1.2.3-linux-x64.AppImage"
+            (artifacts / asset).touch()
+            (artifacts / f"{asset}.sig").write_text("release-signature", encoding="utf-8")
+            METADATA.generate(artifacts, {
+                "RELEASE_TAG": "v1.2.3", "RELEASE_LINUX_AUTO_UPDATE_SUPPORTED": "true",
+            })
+            data = json.loads((artifacts / "stable-v1-linux-x64-update.json").read_text(encoding="utf-8"))
+            self.assertTrue(data["pymss_update_supported"])
+            self.assertFalse(data["pymss_requires_manual_install"])
+            self.assertEqual(data["platforms"]["linux-x86_64"]["signature"], "release-signature")
+            self.assertTrue(data["platforms"]["linux-x86_64"]["url"].endswith('/' + asset))

@@ -209,7 +209,9 @@ pub async fn check(
         .and_then(|_| update.as_ref().map_or(Ok(()), |checked| crate::macos_update::check_runtime_contract(app, &checked.update.raw_json)))
         .err().map(|e| e.to_string());
     #[cfg(target_os = "linux")]
-    let installation_error = Some("Download the new AppImage from the release page and replace the previous file.".to_string());
+    let installation_error = crate::linux_update::current_image()
+        .and_then(|image| crate::linux_update::check_location(&image))
+        .err().map(|error| error.to_string());
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let installation_error: Option<String> = None;
     Ok(update.map(|checked| {
@@ -253,9 +255,6 @@ pub async fn start(
     expected_version: String,
     source: UpdateSource,
 ) -> AppResult<()> {
-    if cfg!(target_os = "linux") {
-        return Err(AppError::Worker("AppImage updates require manual installation from the release page.".into()));
-    }
     let Some(_) = current_distribution() else {
         return Err(AppError::Worker("This application directory is not managed by an installer or portable package".into()));
     };
@@ -277,7 +276,11 @@ pub async fn start(
     {
         return crate::macos_update::start(app, &update, checked.provider, source).await;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        return crate::linux_update::start(app, &update, checked.provider, source).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let candidates = download_candidates(&update.version, &update.download_url, checked.provider, source)?;
         let candidates = order_download_candidates(app, candidates).await?;

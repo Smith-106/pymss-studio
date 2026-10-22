@@ -17,9 +17,9 @@ def generate(artifacts: Path, environment: dict[str, str]) -> list[str]:
     for slug, target, suffix, capability in (
         ("windows-x64", "windows-x86_64", "zip", "RELEASE_AUTO_UPDATE_SUPPORTED"),
         ("macos-arm64", "darwin-aarch64", "app.tar.gz", "RELEASE_MACOS_AUTO_UPDATE_SUPPORTED"),
-        ("linux-x64", "linux-x86_64", "AppImage", ""),
+        ("linux-x64", "linux-x86_64", "AppImage", "RELEASE_LINUX_AUTO_UPDATE_SUPPORTED"),
     ):
-        asset = f"Pymss-Studio-{version}-{slug}{'-update' if capability else ''}.{suffix}"
+        asset = f"Pymss-Studio-{version}-{slug}{'' if slug == 'linux-x64' else '-update'}.{suffix}"
         if not (artifacts / asset).is_file():
             continue
         signature = (artifacts / f"{asset}.sig").read_text(encoding="utf-8").strip()

@@ -78,3 +78,4 @@ import sys
 from pathlib import Path
 assert Path(sys.base_prefix).resolve() == Path(sys.argv[1]).resolve()
 PY
+python3 tests/manual/linux_appimage_update_smoke.py "$IMAGE" "$APPDIR"

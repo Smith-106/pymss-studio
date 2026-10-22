@@ -37,6 +37,7 @@ afterEach(() => {
 })
 
 const { useUpdateStore } = await vite.ssrLoadModule('/src/stores/update.ts')
+const { runWindowCloseGuards } = await vite.ssrLoadModule('/src/utils/windowCloseGuards.ts')
 const { settings } = await vite.ssrLoadModule('/src/stores/settings.ts')
 const stores = []
 afterEach(() => {
@@ -70,7 +71,7 @@ function browserStorage(raw = JSON.stringify(persisted016)) {
   return { values, writes }
 }
 
-function desktopStorage({ update = offeredUpdate, checkError, installError, loadError, onSave } = {}) {
+function desktopStorage({ update = offeredUpdate, checkError, installError, loadError, onSave, windowLabel = 'main' } = {}) {
   let payload = structuredClone(persisted016)
   const writes = []
   const commands = []
@@ -78,7 +79,7 @@ function desktopStorage({ update = offeredUpdate, checkError, installError, load
   let eventCallback
   globalThis.window = {
     __TAURI_INTERNALS__: {
-      metadata: { currentWindow: { label: 'main' } },
+      metadata: { currentWindow: { label: windowLabel } },
       transformCallback: callback => { eventCallback = callback; return 1 },
       invoke: async (command, args) => {
         commands.push(command)
@@ -113,7 +114,7 @@ function desktopStorage({ update = offeredUpdate, checkError, installError, load
       },
     },
   }
-  return { writes, commands, argumentsList, payload: () => payload, emit: payload => eventCallback({ event: 'pymss://managed-update-event', id: 1, payload }) }
+  return { writes, commands, argumentsList, window: globalThis.window, payload: () => payload, emit: payload => eventCallback?.({ event: 'pymss://managed-update-event', id: 1, payload }) }
 }
 
 for (const source of ['auto', 'github', 'modelscope']) {
@@ -398,17 +399,19 @@ test('manual-install releases never dispatch an in-place install', async () => {
   assert.deepEqual(storage.payload(), persisted016)
 })
 
-test('macOS installation leaves restart and exit to the backend', async () => {
-  const storage = desktopStorage({ update: { ...offeredUpdate, distribution: 'macosApp' } })
-  const store = newStore()
-  await store.initialize()
-  await store.checkForUpdates(true)
-  assert.equal(await store.downloadAndInstall(), true)
-  assert.equal(store.status, 'installing')
-  assert.equal(storage.commands.includes('start_managed_update'), true)
-  assert.equal(storage.commands.includes('plugin:process|exit'), false)
-  assert.deepEqual(storage.payload(), persisted016)
-})
+for (const distribution of ['macosApp', 'appImage']) {
+  test(`${distribution} installation leaves restart and exit to the backend`, async () => {
+    const storage = desktopStorage({ update: { ...offeredUpdate, distribution } })
+    const store = newStore()
+    await store.initialize()
+    await store.checkForUpdates(true)
+    assert.equal(await store.downloadAndInstall(), true)
+    assert.equal(store.status, 'installing')
+    assert.equal(storage.commands.includes('start_managed_update'), true)
+    assert.equal(storage.commands.includes('plugin:process|exit'), false)
+    assert.deepEqual(storage.payload(), persisted016)
+  })
+}
 
 test('Windows installation saves acceptance before exiting for its update helper', async () => {
   const storage = desktopStorage()
@@ -419,3 +422,55 @@ test('Windows installation saves acceptance before exiting for its update helper
   assert.equal(storage.commands.at(-1), 'plugin:process|exit')
   assert.deepEqual(storage.payload(), { lastAcceptedVersion: offeredUpdate.version })
 })
+
+test('an application update blocks window closing until installation finishes or fails', async () => {
+  const store = newStore()
+  for (const status of ['downloading', 'installing']) {
+    store.status = status
+    await assert.rejects(runWindowCloseGuards(), /update is in progress/)
+  }
+  store.status = 'failed'
+  await runWindowCloseGuards()
+})
+
+for (const windowLabel of ['editor-1', 'workflow-node-editor-1', 'workflow-simple-editor-1']) {
+  for (const status of ['downloading', 'installing']) {
+    test(`${windowLabel} ignores ${status} progress from a failed main-window update`, async () => {
+      const main = desktopStorage({ installError: new Error('Update interrupted') })
+      const origin = newStore()
+      await origin.initialize()
+      await origin.checkForUpdates(true)
+
+      const editor = desktopStorage({ windowLabel })
+      const recipient = newStore()
+      await recipient.initialize()
+      assert.equal(await recipient.checkForUpdates(true), null)
+      assert.equal(editor.commands.includes('plugin:event|listen'), false)
+      assert.equal(editor.commands.includes('check_managed_update'), false)
+
+      globalThis.window = main.window
+      const installation = origin.downloadAndInstall()
+      globalThis.window = editor.window
+      editor.emit({ event: 'SourceSelected', data: { source: 'github' } })
+      if (status === 'installing') editor.emit({ event: 'Finished' })
+
+      globalThis.window = main.window
+      await assert.rejects(installation, /Update interrupted/)
+      assert.equal(origin.status, 'failed')
+      assert.equal(recipient.status, 'idle')
+      assert.equal(recipient.isInstallOverlayVisible, false)
+
+      globalThis.window = editor.window
+      await runWindowCloseGuards()
+    })
+  }
+
+  test(`${windowLabel} never blocks closing for application update state`, async () => {
+    desktopStorage({ windowLabel })
+    const store = newStore()
+    for (const status of ['downloading', 'installing']) {
+      store.status = status
+      await runWindowCloseGuards()
+    }
+  })
+}

@@ -1,11 +1,14 @@
-use super::failure;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
+
+fn failure(message: impl Into<String>) -> AppError {
+    AppError::Worker(message.into())
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Request {
@@ -23,9 +26,47 @@ struct Acknowledgement {
     pid: u32,
 }
 
+fn startup_process_matches(launcher: u32, pid: u32, token: &str) -> bool {
+    if pid == launcher {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if token.starts_with("linux-update-startup-") {
+        // Extract-and-run keeps a launcher process alive while its AppRun child
+        // runs. Accept that child only while its ancestry still leads to ours.
+        let mut current = pid;
+        for _ in 0..64 {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{current}/stat")) else {
+                return false;
+            };
+            let Some((_, fields)) = stat.rsplit_once(')') else {
+                return false;
+            };
+            let mut fields = fields.split_whitespace();
+            if matches!(fields.next(), None | Some("Z") | Some("X")) {
+                return false;
+            }
+            let Some(parent) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+                return false;
+            };
+            if parent == launcher {
+                return true;
+            }
+            if parent < 2 || parent == current {
+                return false;
+            }
+            current = parent;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = token;
+    false
+}
+
 pub(super) fn valid_token(token: &str) -> bool {
     token
         .strip_prefix("macos-update-startup-")
+        .or_else(|| token.strip_prefix("linux-update-startup-"))
         .is_some_and(|suffix| {
             (6..=64).contains(&suffix.len())
                 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
@@ -113,7 +154,7 @@ pub(super) fn wait_for_acknowledgement(
                     let mut bytes = Vec::new();
                     file.take(16 * 1024).read_to_end(&mut bytes)?;
                     let ack: Acknowledgement = serde_json::from_slice(&bytes)?;
-                    if ack.pid != child.id()
+                    if !startup_process_matches(child.id(), ack.pid, &request.token)
                         || ack.token != request.token
                         || ack.version != request.version
                         || ack.target != request.target
@@ -122,13 +163,20 @@ pub(super) fn wait_for_acknowledgement(
                             "The application startup acknowledgement does not match this update",
                         ));
                     }
-                    confirmed = Some(Instant::now());
+                    confirmed = Some((Instant::now(), ack.pid));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error.into()),
             }
         }
-        if confirmed.is_some_and(|at| at.elapsed() >= Duration::from_millis(250)) {
+        if confirmed
+            .is_some_and(|(_, pid)| !startup_process_matches(child.id(), pid, &request.token))
+        {
+            return Err(failure(
+                "The updated application exited before startup completed",
+            ));
+        }
+        if confirmed.is_some_and(|(at, _)| at.elapsed() >= Duration::from_millis(250)) {
             return Ok(());
         }
         if started.elapsed() >= timeout {
@@ -164,6 +212,7 @@ mod tests {
             assert!(!valid_token(invalid));
         }
         assert!(valid_token("macos-update-startup-aBc123"));
+        assert!(valid_token("linux-update-startup-aBc123"));
         assert!(argument_token(["--pymss-update-startup".into()].into_iter()).is_err());
     }
 
@@ -173,6 +222,31 @@ mod tests {
             return;
         };
         let directory = PathBuf::from(std::env::var_os("PYMSS_STARTUP_TEST_DIRECTORY").unwrap());
+        #[cfg(target_os = "linux")]
+        if mode.starts_with("wrapper") {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update_startup::tests::startup_child",
+                    "--nocapture",
+                ])
+                .env(
+                    "PYMSS_STARTUP_TEST_MODE",
+                    if mode == "wrapper" {
+                        "ready"
+                    } else {
+                        "exit_after_ack"
+                    },
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = child.wait().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(status.code().unwrap_or(1));
+        }
         if mode == "exit" {
             std::process::exit(42);
         }
@@ -191,7 +265,11 @@ mod tests {
 
     fn run_child(mode: &str) -> (tempfile::TempDir, Request, Child) {
         let directory = tempfile::Builder::new()
-            .prefix("macos-update-startup-")
+            .prefix(if mode.starts_with("wrapper") {
+                "linux-update-startup-"
+            } else {
+                "macos-update-startup-"
+            })
             .tempdir()
             .unwrap();
         let request = Request {
@@ -207,19 +285,24 @@ mod tests {
             privileged: false,
         };
         save_request(directory.path(), &request).unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
-                "macos_update::startup::tests::startup_child",
+                "update_startup::tests::startup_child",
                 "--nocapture",
             ])
             .env("PYMSS_STARTUP_TEST_MODE", mode)
             .env("PYMSS_STARTUP_TEST_DIRECTORY", directory.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        #[cfg(target_os = "linux")]
+        if mode.starts_with("wrapper") {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = command.spawn().unwrap();
         (directory, request, child)
     }
 
@@ -245,6 +328,30 @@ mod tests {
             stop_child(&mut child).unwrap();
             assert!(result.is_err(), "{mode}");
             assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_update_confirms_wrapped_appimage_children_and_rejects_exited_ui() {
+        for mode in ["wrapper", "wrapper_exited_ui"] {
+            let (directory, request, mut child) = run_child(mode);
+            assert!(!startup_process_matches(
+                child.id(),
+                std::process::id(),
+                &request.token
+            ));
+            let result = wait_for_acknowledgement(
+                &mut child,
+                directory.path(),
+                &request,
+                Duration::from_secs(3),
+            );
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            child.wait().unwrap();
+            assert_eq!(result.is_ok(), mode == "wrapper", "{mode}");
         }
     }
 }

@@ -53,15 +53,6 @@ impl Drop for InstanceMutex {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-impl Drop for InstanceMutex {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
 /// Acquire the main-process mutex.
 ///
 /// Returns a guard for the first instance. When another copy is already
@@ -90,13 +81,13 @@ pub fn acquire_or_focus() -> Result<Option<InstanceMutex>, String> {
 
 #[cfg(unix)]
 pub fn acquire_or_focus() -> Result<Option<InstanceMutex>, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(guard) = handoff::from_environment(&instance_lock_path()) {
         handoff::remember(&guard);
         return Ok(Some(guard));
     }
     let guard = acquire_lock(&instance_lock_path())?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(guard) = guard.as_ref() {
         handoff::remember(guard);
     }
@@ -131,7 +122,7 @@ fn acquire_lock(path: &Path) -> Result<Option<InstanceMutex>, String> {
     Err(error.to_string())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod handoff {
     use super::*;
     use std::os::fd::FromRawFd;
@@ -256,7 +247,7 @@ mod handoff {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use handoff::configure_child as configure_update_child;
 
 #[cfg(all(test, unix))]

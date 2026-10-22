@@ -1,7 +1,9 @@
 use crate::error::{AppError, AppResult};
 #[cfg(target_os = "macos")]
 mod authorized;
-mod startup;
+#[cfg(target_os = "macos")]
+use crate::update_startup as startup;
+use crate::update_stream::VerifiedStream;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -28,38 +30,6 @@ fn previous_bundle(target: &Path) -> PathBuf {
         .parent()
         .unwrap()
         .join(format!(".pymss-studio-previous-{identity}.app"))
-}
-
-struct VerifiedStream<'a> {
-    verifier: minisign_verify::StreamVerifier<'a>,
-    digest: Sha256,
-}
-
-impl<'a> VerifiedStream<'a> {
-    fn new(
-        key: &'a minisign_verify::PublicKey,
-        signature: &'a minisign_verify::Signature,
-    ) -> AppResult<Self> {
-        let verifier = key.verify_stream(signature).map_err(|error| {
-            failure(format!("Unable to verify the macOS update stream: {error}"))
-        })?;
-        Ok(Self {
-            verifier,
-            digest: Sha256::new(),
-        })
-    }
-
-    fn update(&mut self, chunk: &[u8]) {
-        self.verifier.update(chunk);
-        self.digest.update(chunk);
-    }
-
-    fn finish(mut self) -> AppResult<String> {
-        self.verifier
-            .finalize()
-            .map_err(|error| failure(format!("Update signature verification failed: {error}")))?;
-        Ok(format!("{:x}", self.digest.finalize()))
-    }
 }
 
 fn bundle_from_executable(executable: &Path) -> Option<PathBuf> {
@@ -549,6 +519,9 @@ mod platform {
         let Some(token) = startup::argument_token(std::env::args().skip(1))? else {
             return Ok(());
         };
+        if !token.starts_with("macos-update-startup-") {
+            return Err(failure("Invalid macOS update startup token"));
+        }
         let directory = storage::temp_dir(app)?.join(&token);
         let metadata = fs::symlink_metadata(&directory)?;
         // SAFETY: geteuid has no preconditions.

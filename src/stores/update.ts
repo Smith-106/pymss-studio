@@ -1,6 +1,6 @@
 import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { exit } from '@tauri-apps/plugin-process'
@@ -8,6 +8,7 @@ import { useAppStore } from '@/stores/app'
 import { useSettingsStore } from '@/stores/settings'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
 import { isMainTaskOwner } from '@/utils/taskOwner'
+import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
 
 const studioLog = createLogger('ui.stores.update')
 
@@ -81,6 +82,12 @@ export const useUpdateStore = defineStore('update', () => {
   const isBusy = computed(() => ['checking', 'downloading', 'installing'].includes(status.value))
   const isInstallingUpdate = computed(() => ['downloading', 'installing'].includes(status.value))
   const isInstallOverlayVisible = computed(() => isInstallingUpdate.value || installErrorVisible.value)
+  if (isMainTaskOwner()) {
+    const removeCloseGuard = registerWindowCloseGuard(() => {
+      if (isInstallingUpdate.value) throw new Error('An application update is in progress. Wait for it to finish before closing.')
+    }, 100)
+    onScopeDispose(removeCloseGuard)
+  }
   const downloadProgressPercent = computed(() => {
     if (downloadTotalBytes.value <= 0) return 0
     return Math.min(100, Math.round((downloadDownloadedBytes.value / downloadTotalBytes.value) * 100))
@@ -115,7 +122,7 @@ export const useUpdateStore = defineStore('update', () => {
   }
 
   async function initialize() {
-    if (initialized.value) return
+    if (initialized.value || !isMainTaskOwner()) return
     if (!initializeInFlight) {
       initializeInFlight = (async () => {
         autoCheckCompleted.value = false
@@ -233,6 +240,7 @@ export const useUpdateStore = defineStore('update', () => {
   }
 
   async function checkForUpdates(manual = false) {
+    if (!isMainTaskOwner()) return null
     const app = useAppStore()
     const settings = useSettingsStore()
     if (!manual && autoCheckCompleted.value) return availableUpdate.value
@@ -308,8 +316,8 @@ export const useUpdateStore = defineStore('update', () => {
         source: settings.updateSource || 'auto',
       })
       status.value = 'installing'
-      if (update.distribution === 'macosApp') {
-        // The backend owns replacement and restart once the macOS bundle changes.
+      if (update.distribution === 'macosApp' || update.distribution === 'appImage') {
+        // Unix updaters confirm the replacement has started before exiting this process.
         return true
       }
       appendDownloadLog('Update package staged; restarting application')
