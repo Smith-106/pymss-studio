@@ -1,0 +1,30 @@
+Source: https://github.com/storytold/soundcraft
+Commit: 52471b37e957feaea56dfd48932ef16d314cc74a
+License: MIT OR Apache-2.0 (license texts included in each crate)
+
+soundcraft-vst3-host: host sources and test fixture imported from crates/vst3-host.
+soundcraft-au-host: AUv2 effect host imported from crates/au-host at the same commit;
+locally extended to AUv2/AUv3 effects and adapted to fallible DSP, queued parameters,
+stopped-worker property refresh, bounded state and a generic parameter controller.
+Native Cocoa view hosting and AUEventListener integration are local adaptations;
+view/unit lifetime follows the helper's stopped-worker and UI-thread teardown.
+AUv3 uses Apple's documented AudioComponentInstantiate and RequestViewController
+C compatibility bridge. Bounded main-runloop waits, late-result retirement,
+retained view controllers and distinct au3: identities are local additions.
+No private AUAudioUnit property/getter or 64-bit parameter-address cast is used.
+API reference:
+https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api
+soundcraft-dsp: only the plugin interfaces and data types from crates/dsp/src/lib.rs;
+built-in DSP, application, editor and DAW engine implementations are excluded.
+
+Local adaptations: descriptor-based explicit loading; fallible processor configuration
+and processing; normalized parameter delivery without controller calls on the audio
+thread; host message/attribute COM objects; hidden/bypass parameter and preset refresh
+synchronization; controlled process lifecycle and error propagation; macOS helper event-loop
+and autorelease scopes; Linux X11/XEmbed windows and per-context/frame IRunLoop ownership.
+Application integrations
+are maintained in native/audio-host, not in the upstream FFI implementation.
+
+native/vst2-host is a local effect adapter. Its ABI declarations reference the
+MIT-licensed RustAudio/vst-rs source; the corresponding notice is included in
+native/vst2-host/THIRD-PARTY-LICENSES.txt. No Steinberg SDK headers are distributed.

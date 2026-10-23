@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
 import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
+import EditorPluginPanel from '@/components/editor/EditorPluginPanel.vue'
 
 const props = defineProps<{
   session: EditorSession
@@ -217,6 +218,7 @@ function applyEffectPreset(value: string) {
     </div>
 
     <div class="editor-inspector__scroll">
+      <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" />
       <section v-if="selectedTrack" class="inspector-group inspector-group--primary">
         <div class="inspector-group__header">
           <strong>{{ t('editor.inspectorSectionCommon') }}</strong>

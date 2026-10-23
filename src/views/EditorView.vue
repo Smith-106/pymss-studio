@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { isTutorialFrame } from '@/features/onboarding/demoContext'
 import { computed, nextTick, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { FolderOpenOutline, MusicalNotesOutline, OptionsOutline } from '@vicons/ionicons5'
@@ -384,9 +384,25 @@ function handleClipTiming(payload: {
 }
 
 async function save() {
-  await editor.saveProject()
-  message.success(t('editor.saved'))
+  try {
+    await editor.saveProject()
+    message.success(t('editor.saved'))
+  } catch (cause) { if (!editor.pluginStateError) message.error(editor.lastError || String(cause)) }
 }
+
+watch(() => editor.pluginStateError, error => {
+  if (error) message.error(error, { duration: 10000 })
+})
+
+onBeforeRouteLeave(async () => {
+  try {
+    if (editor.session) await editor.releasePluginSession(editor.session)
+    return true
+  } catch (cause) {
+    if (!editor.pluginStateError) message.error(editor.lastError || String(cause))
+    return false
+  }
+})
 
 useEditorShortcuts({
   togglePlay: togglePlayback,

@@ -77,3 +77,9 @@ src-tauri/tauri.bundle.resources.json
 *.exe
 !src-tauri/icons/*.ico
 .uv-cache/
+
+# Isolated native audio experiments
+native/target/
+native/vendor/soundcraft-vst3-host/tests/fixture/target/
+data-vst-lab/
+.cache/

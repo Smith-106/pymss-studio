@@ -3,15 +3,20 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
-import { effectScope, reactive, ref, watch, nextTick } from 'vue'
+import { computed, effectScope, reactive, ref, watch, nextTick } from 'vue'
 import { createPinia, setActivePinia, storeToRefs } from 'pinia'
 import { useEditorPlaybackStore } from '../src/stores/editorPlayback.ts'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '../src/utils/editorClips.ts'
 import { EditorTimelinePlayback } from '../src/utils/editorAudio.ts'
 import { applyEditorTrackEffects } from '../src/utils/editorEffects.ts'
+import { hasEditorPlugins, pluginProjectSignature } from '../src/utils/editorPlugins.ts'
 
 const source = ts.createSourceFile('playback.ts', readFileSync(new URL('../src/composables/useEditorPlayback.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
 const code = ts.transpileModule(source.statements.filter(item => !ts.isImportDeclaration(item)).map(item => item.getText(source)).join('\n').replace('export function useEditorPlayback', 'function useEditorPlayback'), {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+}).outputText
+const nativeSource = ts.createSourceFile('native.ts', readFileSync(new URL('../src/composables/useEditorNativePlayback.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
+const nativeCode = ts.transpileModule(nativeSource.statements.filter(item => !ts.isImportDeclaration(item)).map(item => item.getText(nativeSource)).join('\n').replace('export function useEditorNativePlayback', 'function useEditorNativePlayback'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText
 const flush = async () => { await nextTick(); await new Promise(resolve => setImmediate(resolve)) }
@@ -21,8 +26,9 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], contextState = 'running', resumeGate, platform = '', chunksGate, metadataReadyState = 4 } = {}) {
-  let now = 0, rafId = 0, unmount, parameterWrites = 0, contextCreations = 0, chunkReads = 0
+function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], contextState = 'running', resumeGate, platform = '', chunksGate, metadataReadyState = 4, nativePlugins = false, nativePauseGate } = {}) {
+  let now = 0, rafId = 0, parameterWrites = 0, contextCreations = 0, chunkReads = 0
+  const unmount = [], nativeCalls = []
   const frames = new Map(), audios = []
   const graphNodes = new Map()
   const node = () => new Proxy({
@@ -132,16 +138,32 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
     sourceMap: new Map(sources.map(item => [item.id, item])),
     duration: Math.max(...clips.map(clip => clip.start + clip.duration)),
     masterVolume: 1, masterPan: 0,
+    async releasePluginSession(project) { nativeCalls.push({ op: 'unload', projectId: project.id }) },
+  })
+  if (nativePlugins) editor.session.pluginChain = [{ id: 'slot', format: 'vst3', pluginId: 'gain', path: '/gain.vst3', bypassed: false }]
+  let nativePlaying = false, nativePosition = 0
+  const createNative = vm.runInNewContext(`${nativeCode}\nuseEditorNativePlayback`, {
+    computed, watch, hasEditorPlugins, pluginProjectSignature, useEditorPlaybackStore,
+    onBeforeUnmount: callback => unmount.push(callback),
+    setTimeout: () => 1, clearTimeout() {}, ensurePluginSession: async () => {},
+    async pluginHostRequest(request) {
+      nativeCalls.push(request)
+      if (request.op === 'play') { nativePlaying = true; nativePosition = request.position }
+      if (request.op === 'pause') { if (nativePauseGate) await nativePauseGate.promise; nativePlaying = false }
+      if (request.op === 'seek') nativePosition = request.position
+      return { projectId: request.projectId, position: nativePosition, playing: nativePlaying, duration: editor.duration }
+    },
   })
   const create = vm.runInNewContext(`${code}\nuseEditorPlayback`, {
     applyEditorTrackEffects,
+    useEditorNativePlayback: nativePlugins ? createNative : () => ({ required: ref(false) }),
     watch, storeToRefs, useEditorPlaybackStore, clipIsActive, clipMediaTime, clipsForTrack, EditorTimelinePlayback,
     createPreviewChunkReader: () => async () => {
       chunkReads++
       if (chunksGate) await chunksGate.promise
       return ctx.createBuffer(2, 48000 * 4)
     },
-    onBeforeUnmount: callback => { unmount = callback },
+    onBeforeUnmount: callback => unmount.push(callback),
     convertFileSrc: value => value,
     createEditorAudioElement: url => { const audio = new FakeAudio(); audio.src = url; audios.push(audio); return audio },
     i18n: { global: { t: key => key } },
@@ -153,7 +175,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
   const scope = effectScope()
   const playback = scope.run(() => create({ editor, scrollEl: ref(null) }))
   let disposed = false
-  const dispose = () => { if (!disposed) { disposed = true; unmount(); scope.stop(); store.$dispose() } }
+  const dispose = () => { if (!disposed) { disposed = true; unmount.forEach(callback => callback()); scope.stop(); store.$dispose() } }
   t.after(dispose)
   function frame(ms = 16, advanceMedia = true) {
     now += ms
@@ -163,9 +185,27 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
     frames.clear()
     pending.forEach(callback => callback(now))
   }
-  return { playback, store, editor, audios, ctx, graphNodes, frame, dispose,
+  return { playback, store, editor, audios, ctx, graphNodes, frame, dispose, nativeCalls,
     resources: () => ({ contextCreations, chunkReads }), parameterWrites: () => parameterWrites }
 }
+
+test('removing the last plugin waits for native pause and restores the Web Audio transport', async t => {
+  const pauseGate = deferred()
+  const env = environment(t, { nativePlugins: true, nativePauseGate: pauseGate })
+  assert.equal(await env.playback.requestPlay(2), true)
+  env.editor.session.pluginChain = []
+  await flush()
+  assert.equal(env.store.status, 'pausing')
+  assert.equal(env.store.transportCanToggle, false)
+  pauseGate.resolve()
+  await flush()
+  assert.equal(env.store.status, 'paused')
+  assert.equal(env.store.transportCanToggle, true)
+  assert.equal(env.store.currentTime, 2)
+  assert.equal(await env.playback.requestPlay(), true)
+  assert.equal(env.audios.length, 1)
+  assert.ok(env.nativeCalls.some(request => request.op === 'pause'))
+})
 
 test('a stalled media clock does not advance the playhead or trigger repeated seeks', async t => {
   const env = environment(t)

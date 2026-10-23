@@ -40,6 +40,18 @@ export type EditorTrackEffects = {
   compressor: number
 }
 
+/** Persist unknown formats and opaque state references so projects remain recoverable. */
+export type EditorPluginSlot = {
+  id: string
+  format: string
+  pluginId: string
+  name: string
+  path: string
+  bypassed: boolean
+  state?: string
+  [key: string]: unknown
+}
+
 export type EditorTrack = {
   id: string
   sourceId: string
@@ -54,6 +66,7 @@ export type EditorTrack = {
   solo: boolean
   fadeIn: number
   fadeOut: number
+  pluginChain?: EditorPluginSlot[]
   effects?: EditorTrackEffects
   type?: 'stem' | 'audio' | 'reference' | 'recording'
   clips?: EditorClip[]
@@ -66,6 +79,7 @@ export type EditorSession = {
   sourceResultDir?: string
   masterVolume: number
   masterPan: number
+  pluginChain?: EditorPluginSlot[]
   sources: EditorSource[]
   tracks: EditorTrack[]
   createdAt: number

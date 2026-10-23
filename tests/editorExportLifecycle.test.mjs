@@ -33,7 +33,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function environment({ startGate, cancelAccepted = true } = {}) {
+function environment({ startGate, cancelAccepted = true, nativeRenderGate } = {}) {
   const callbacks = new Map()
   const listeners = new Map()
   const calls = []
@@ -51,6 +51,14 @@ function environment({ startGate, cancelAccepted = true } = {}) {
           return null
         }
         calls.push({ command, args })
+        if (command === 'plugin_host_capabilities') return { enabled: true, experimental: true }
+        if (command === 'save_editor_project') return args.project
+        if (command === 'plugin_host_render') {
+          if (nativeRenderGate) return nativeRenderGate.promise
+          return { path: 'D:/native-render.wav', duration: 1.5, sampleRate: 48000, channels: 2, tailLimited: true }
+        }
+        if (command === 'plugin_host_cancel_render') { nativeRenderGate?.reject(new Error('Rendering cancelled')); return true }
+        if (command === 'plugin_host_cleanup_render') return null
         if (command === 'cleanup_editor_export_render') return null
         if (command === 'start_editor_mix_export') {
           if (startGate) await startGate.promise
@@ -225,4 +233,70 @@ test('long effect clips are rejected before native audio allocation or cache wri
   assert.equal(env.calls.filter(call => call.command === 'append_editor_export_render_chunk').length, 0)
   assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
   assert.equal(env.store.exporting, false)
+})
+
+const pluginSlot = { id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false, state: 'sha256:opaque' }
+
+test('plugin rendering is encoded once with neutral master and cleaned after completion', async () => {
+  const env = environment()
+  env.store.session.masterVolume = 0.5
+  env.store.session.pluginChain = [{ ...pluginSlot }]
+  const exporting = env.store.exportMix({ format: 'flac' })
+  await flush()
+  const render = env.calls.find(call => call.command === 'plugin_host_render')
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.equal(render.args.project.masterVolume, 0.5)
+  assert.equal(render.args.project.pluginChain[0].state, 'sha256:opaque')
+  assert.equal(start.args.payload.project.masterVolume, 1)
+  assert.equal(start.args.payload.project.masterPan, 0)
+  assert.equal(start.args.payload.project.tracks.length, 1)
+  assert.equal(start.args.payload.project.tracks[0].volume, 1)
+  assert.equal(start.args.payload.project.assets[0].path, 'D:/native-render.wav')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/mix.flac', format: 'flac', duration: 1.5, sampleRate: 48000, channels: 2 } })
+  const result = await exporting
+  assert.equal(result.pluginTailLimited, true)
+  assert.equal(env.store.lastExport.pluginTailLimited, true)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cleanup_render').length, 1)
+})
+
+test('cancelling native rendering terminates the render without starting the encoder', async () => {
+  const nativeRenderGate = deferred()
+  const env = environment({ nativeRenderGate })
+  env.store.session.pluginChain = [{ ...pluginSlot }]
+  const exporting = env.store.exportMix()
+  await flush()
+  assert.ok(env.calls.some(call => call.command === 'plugin_host_render'))
+  await env.store.cancelExport()
+  await assert.rejects(exporting, EditorExportCancelledError)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_render').length, 1)
+  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cleanup_render').length, 1)
+})
+
+test('plugin projects reject built-in effects without silently encoding dry audio', async () => {
+  const env = environment()
+  env.store.session.pluginChain = [{ ...pluginSlot }]
+  env.store.session.tracks[0].effects = { reverb: 0.2, delay: 0, delayTime: 0.24, clarity: 0, compressor: 0 }
+  await assert.rejects(env.store.exportMix(), /built-in effects|内置效果/)
+  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
+  assert.equal(env.store.exporting, false)
+  assert.ok(env.store.lastError)
+})
+
+test('history and persistence retain independent master and track chains with unknown states', async () => {
+  const env = environment()
+  const unknown = { ...pluginSlot, format: 'au', state: 'opaque:keep', extension: { revision: 9 } }
+  env.store.setPluginChain(null, [unknown])
+  env.store.setPluginChain('track', [{ ...pluginSlot, id: 'track-slot' }])
+  env.store.undo()
+  assert.equal(env.store.session.tracks[0].pluginChain, undefined)
+  assert.equal(env.store.session.pluginChain[0].state, 'opaque:keep')
+  env.store.redo()
+  assert.equal(env.store.session.tracks[0].pluginChain[0].id, 'track-slot')
+  await env.store.flushSave()
+  const saved = env.calls.filter(call => call.command === 'save_editor_project').at(-1).args.project
+  assert.equal(saved.version, 4)
+  assert.deepEqual(saved.pluginChain[0], unknown)
+  assert.equal(saved.tracks[0].pluginChain[0].state, 'sha256:opaque')
 })

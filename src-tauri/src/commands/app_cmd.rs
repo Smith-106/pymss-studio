@@ -107,7 +107,8 @@ pub fn get_build_info() -> BuildInfo {
         build_time: option_env!("PYMSS_BUILD_TIME").unwrap_or(""),
         target: option_env!("PYMSS_BUILD_TARGET").unwrap_or("dev"),
         variant: option_env!("PYMSS_BUILD_VARIANT").unwrap_or("development"),
-        update_supported: option_env!("PYMSS_BUILD_UPDATE_SUPPORTED") == Some("true")
+        update_supported: !cfg!(feature = "vst-lab")
+            && option_env!("PYMSS_BUILD_UPDATE_SUPPORTED") == Some("true")
             && option_env!("PYMSS_BUILD_OFFICIAL") == Some("true")
             && update_manager::update_supported(),
         official: option_env!("PYMSS_BUILD_OFFICIAL") == Some("true"),
@@ -121,6 +122,9 @@ pub async fn check_managed_update(
     endpoint_override: Option<String>,
     source: Option<update_manager::UpdateSource>,
 ) -> AppResult<Option<update_manager::ManagedUpdateInfo>> {
+    if cfg!(feature = "vst-lab") {
+        return Err(AppError::Worker("Updates are disabled in VST Lab".into()));
+    }
     update_manager::check(&app, channel, endpoint_override, source.unwrap_or_default()).await
 }
 
@@ -132,6 +136,9 @@ pub async fn start_managed_update(
     expected_version: String,
     source: Option<update_manager::UpdateSource>,
 ) -> AppResult<()> {
+    if cfg!(feature = "vst-lab") {
+        return Err(AppError::Worker("Updates are disabled in VST Lab".into()));
+    }
     update_manager::start(&app, channel, endpoint_override, expected_version, source.unwrap_or_default()).await
 }
 
@@ -142,6 +149,9 @@ pub fn get_managed_update_state() -> Value {
 
 #[tauri::command]
 pub fn confirm_managed_update_startup(window: tauri::WebviewWindow) -> AppResult<()> {
+    if cfg!(feature = "vst-lab") {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     if window.label() == "main" {
         crate::macos_update::confirm_startup(window.app_handle())?;

@@ -1,0 +1,189 @@
+VST 原始需求对照检查
+检查日期：2026-10-24
+检查起点：6e95a33（保留前两轮的验证记录）
+实验分支：codex/vst3-host-lab
+工作目录：D:/项目/pymss-studio-vst-lab
+
+结论：核心效果器链路已接通，但“四格式、三平台正式支持”尚未全部验收。
+AAX 真实加载未实现；macOS/Linux 实机、第三方 VST2/AU 和签名发布包验证待完成。
+本次执行代码检查、自动化测试及本地原生测试夹具，不启动桌面界面或第三方插件。
+
+1. 原始要求与当前证据
+
+要求                              状态及限制
+参考指定 Rust VST3 项目             已采用 Soundcraft 固定提交的宿主代码；来源、许可证和
+                                  本地适配记录见 native/vendor/UPSTREAM.txt。
+新分支测试、避免影响主分支           实验分支及 worktree 独立；本轮未合并、推送或改写主分支。
+                                  Lab 另有应用标识、单实例锁、数据及运行环境目录，禁用正式更新。
+三平台                             Windows 原生编译及自动化测试；Linux x64、macOS ARM64/x64
+                                  完整原生音频宿主含测试代码交叉类型检查通过。
+                                  后两者未链接/运行完整桌面包，不能据此认定正式兼容。
+VST3                               三平台效果器代码、状态、参数、原生窗口和混合链路已接通。
+                                  Windows 第三方插件运行记录属于早期提交，见 VST-LAB.txt；
+                                  本次最新代码仅跑自动化夹具，仍需实机回归。
+VST2                               三平台效果器、shell 子插件选择与原生窗口已接通；
+                                  Linux 为 X11/XWayland。有假 ABI 测试，尚无第三方运行验收。
+AU                                 已接 macOS AUv2/AUv3 效果器、异步创建及 Cocoa/远程视图。
+                                  AUv3 经 Apple C 兼容桥接，具体插件兼容性待实机确认。
+                                  Windows 上只执行可移植单测，macOS 专属测试只编译未运行。
+AAX                                未实现宿主加载。识别并拒绝 .aaxplugin，以及保留旁路槽位的
+                                  原始状态，均不等于支持 AAX。
+
+“三平台”按格式本身适用的平台核对；当前 AU 实现仅适用于 macOS。
+已说明的一阶段边界：效果器，不含 MIDI/乐器、额外总线、32 位桥接；
+Linux 不含原生 Wayland 和旧共享 Display/_XEventProc 协议。插件项目的内置效果共用及
+新录音仍有限制。这些范围不能计入已完成能力，也不在本轮伪装为已支持。
+
+2. 第七轮（04cde28）发现并修复的流程遗漏
+
+A. 删除最后一个插件后，播放按钮可能永久处于 pausing。
+原因：两个宿主切换 watcher 都更新 requestId，迟到的原生暂停响应被当作过期响应丢弃。
+修复：离开原生图时保留暂停请求的身份，等待其结算后再允许 Web Audio 播放。
+回归覆盖实际播放组合层与 playback store，而非仅检查独立 native adapter。
+
+B. 导出准备期间修改插件、Undo 或重新定位，可能混合旧混音与新插件状态。
+原因：导出先复制项目，再等待捕获，之后仅按 slot ID 向旧副本拷入新 state。
+修复：状态捕获后一次性冻结原项目的完整状态；切换项目不混入新项目，取消不启动渲染。
+冻结语义为“捕获完成时”，并重新校验格式和内置效果限制。后续渲染和编码固定使用该快照。
+
+C. 第三方插件向 stdout 打印诊断文本，会破坏扫描和宿主 JSON 协议。
+修复：helper 启动时保存原 stdout 的私有、不可继承输出通道，再重定向插件可见的
+OS stdout 与 C runtime fd 1 到空设备；仅宿主 JSON 使用私有通道，stderr 保持原有行为。
+普通 Tauri 启动不重定向。不会靠跳过非 JSON 行掩盖问题，也不接受插件伪造的 JSON 行。
+原生夹具分别通过 C puts、Rust stdout、Win32 WriteFile 输出噪声和 JSON 形文本：
+旧协议测试失败；修复后扫描仅返回一个 JSON 对象，宿主返回四条正确请求响应。
+
+D. VST2/VST3 修改混响或延迟参数后，导出可能沿用加载时的尾音长度。
+修复：在停止处理的导出准备阶段刷新当前参数、latency 和 tail；启动探测后再刷新并
+计算导出长度。保留同一插件实例、PDC 和 30 秒截断提示，实时处理不增加尾音属性轮询。
+夹具覆盖首次处理后才报告尾音、仅尾音变化而延迟不变、无限尾音截断。
+
+3. 第七轮验证证据与复现（后续增量见第 6、7 节）
+
+基线 a1fd4e9 的实际重跑结果：
+  前端：1071 通过、3 跳过；pnpm build 通过。
+  Native：95 单测通过；Tauri 桥接默认及 vst-lab 各 38 通过。
+  该结果未覆盖上面的四处流程缺陷；不能用单测总数替代需求验收。
+  记录：E:/pymss-vst-lab-artifacts/requirements-v7-20261024T021346Z/source.json
+
+新增回归的旧代码反证：
+  前端新增用例在旧代码下有 5 项失败；修复后聚焦 102 项通过。
+  stdout 回归在旧协议下退出 101；恢复修复后通过。
+  尾音夹具验证 128 帧、参数修改后的 256 帧及 30 秒上限/tailLimited。
+  记录：E:/pymss-vst-lab-artifacts/requirements-v7-fixes
+        E:/pymss-vst-lab-artifacts/requirements-v7-stdout-before.log
+        E:/pymss-vst-lab-artifacts/requirements-v7-native-regressions.log
+
+最终复核日志及源文件指纹：
+  E:/pymss-vst-lab-artifacts/requirements-v7-final-20261024T022413Z/source.json
+  501 个源文件验证前后指纹一致；源码聚合 SHA-256：
+  a0d4a35ffebf5110730b952bc43b9721299379f2a0437ab5ef5b5275f8e83e6d
+  前端：1078 通过、3 跳过，类型检查和构建通过。
+  Native：96 单测通过（audio 41、VST2 20、AU 14、VST3 21）。
+  Audio host：41 单元及 stdout/尾音两个原生夹具回归通过。
+  VST3 完整测试：21 单元、11 集成、5 个独立线程/生命周期程序通过。
+  Tauri 桥接：默认及 vst-lab 各 38 通过。
+  E:/pymss-vst-lab-artifacts/requirements-v7-macos-final.log
+  E:/pymss-vst-lab-artifacts/requirements-v7-linux-final.log
+  Linux x64、macOS ARM64/x64 完整原生音频宿主含新增测试代码交叉检查通过。
+  pnpm vst:build 通过，已链接最新 Windows Debug 实验版，未启动应用：
+  E:/pymss-vst-lab-target/debug/pymss-studio.exe
+  构建日志及可执行文件 SHA-256：
+  E:/pymss-vst-lab-artifacts/requirements-v7-lab-build.log
+  E:/pymss-vst-lab-artifacts/requirements-v7-build-artifact.json
+
+复现命令（工作目录为实验 worktree；目标目录可按本机空间配置）：
+  pnpm test
+  pnpm build
+  cargo test --locked --manifest-path native/Cargo.toml --workspace --lib
+  cargo test --locked --manifest-path native/Cargo.toml -p pymss-audio-host --tests
+  cargo test --locked --manifest-path native/Cargo.toml -p soundcraft-vst3-host
+  cargo test --locked --manifest-path src-tauri/Cargo.toml --features vst-lab commands::plugin_host::tests
+  CARGO_TARGET_DIR=E:/pymss-vst-lab-target pnpm vst:build
+
+Windows 本机的 Rust 目标目录需使用 E:/pymss-vst-lab-native-target 和 E:/pymss-vst-lab-target。
+Linux 交叉检查使用真实 ALSA headers、ELF 与 pkg-config：
+  python E:/pymss-vst-lab-artifacts/cross-sdk/check-linux.py
+它只做类型/元数据检查，不链接或运行 Linux 程序。macOS 两个架构同样仅做交叉检查。
+三平台 CI 定义为 .github/workflows/vst-lab-native.yml；本轮没有远程触发该工作流。
+
+4. 实机验收遗漏清单（留待统一测试，以下不标记为已执行）
+
+每个平台、每个适用格式至少选一款真实效果器，覆盖：
+  - 扫描标准/自定义路径、扫描失败与重试、插件缺失与同类重新定位。
+  - 单/双声道、轨道及主输出混合格式链、旁路、顺序、音量/声像、原生和通用参数。
+  - 原生窗口打开/重开/缩放/关闭，快速预设变化，保存后重启及 Undo/Redo。
+  - 从无插件切入，删除最后插件后恢复播放，普通无插件项目回归。
+  - WAV/FLAC 编码结果、尾音和 PDC、导出准备期间编辑及取消。
+  - 插件崩溃/卡住/重载、退出后的 helper/解码子进程及临时文件清理。
+  - 实验版与正式版同时使用时的数据、运行环境、输出目录和单实例标识隔离。
+
+平台补充：macOS 验证签名包的第三方库加载、Cocoa 事件和 AppKit 退出；Linux 验证
+X11 与 Wayland+XWayland、音频后端及发行版依赖；Windows 验证正式签名/便携布局。
+当前三平台安装包、macOS 签名/公证、发布工作流均未作为完成项。
+
+5. AAX 的明确剩余条件
+
+目前核验的 Avid 公开 SDK 页面描述插件开发，未提供足以实现当前桌面程序独立宿主的
+已确认加载契约。后续需要确认可用的宿主接口、适用条件和分发方式；没有用未验证 ABI
+编写假宿主，也未代用户登录、接受 SDK 协议或联系厂商。
+参考：https://developer.avid.com/aax/
+      https://developer.avid.com/audio/
+
+6. 第八轮实现与验证（6e95a33，起点 04cde28）
+
+本轮补齐两项格式范围遗漏：
+  - VST2 shell：最多 4096 个子插件有界枚举，不批量创建子实例；保留 child ID 与
+    原始二进制路径。未实例化时分类为 null，实际加载再严格校验效果器、ID 和总线。
+    CurrentId 在 entry、参数、状态恢复、DSP、GUI 和销毁调用中按实例/线程隔离。
+  - AUv3：使用 AudioComponentInstantiate 和 RequestViewController 正式桥接接口；
+    单操作等待上限 10 秒，持续服务主线程。超时/迟到视图主线程释放后才退休 AU。
+    au:/au3: 身份分离；不使用私有 getter 或截断 64 位参数地址。
+
+桥接和测试工具同步补齐：
+  - 扫描元数据 auVersion/isShellChild、nullable isInstrument，库标签区分变体。
+  - 扫描缓存 version 2 使旧“不支持 shell”结果失效。
+  - 项目 load/update 和导出预加载按 AU 数量分配 20..120 秒预算，包含仍初始化的旁路槽。
+  - 真实插件手动脚本支持三种格式、au3: ID 与 shell 精确选择；原生窗口和参数测试需
+    显式启用，未执行的检查记录 skipped。比较覆盖双声道与恢复后的完整帧数。
+
+独立审查修复：VST2 参数状态恢复的 TLS 上下文、AUv3 初始零尺寸、异步与旁路 AU 的
+外层加载预算。复核了 completion 竞态、block 及 view/unit 退休顺序。
+
+验证结果：
+  前端全量 1085 通过、3 跳过；pnpm build 通过。
+  Native 113 单测通过（audio 44、VST2 27、AU 21、VST3 21）。
+  Audio host stdout/尾音两个原生夹具集成回归通过。
+  Tauri 桥接默认及 vst-lab 各 42 通过；手动脚本可移植逻辑 4 项通过。
+  Linux x64、macOS ARM64/x64 完整原生宿主及测试代码交叉检查通过。
+  日志：E:/pymss-vst-lab-artifacts/native-v8-*。
+
+本轮未运行真实插件、原生窗口或 macOS/Linux 程序，没有触发远程 CI。
+AUv3 具体插件的 DSP、ClassInfo、参数事件和原生视图仍需统一实机验收。
+AAX 的加载接口和条件仍未得到可实施核验，保持未支持，不把文件识别算作完成。
+AUv3 官方依据：
+https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api
+
+7. 第九轮：实时旁路与陈旧控制隔离（起点 6e95a33）
+
+已加载且健康的插件可以原地切换旁路，保留 processor、参数和原生编辑器。
+干声延迟线持续推进；旁路期间停止湿声处理，重新启用时清除冻结的 DSP 历史，
+延迟预热阶段使用已对齐干声前缀。PDC 保持不变，处理线程更新 tail 与截断标记。
+故障或正在恢复的图仍走重建；缺失实例重新启用仍执行实际加载并明确返回失败。
+
+参数读写在排队前绑定目标身份；Undo、重新定位和会话替换不会让旧操作落到新实例。
+正常捕获同一控制器的 state blob 不会错误地判为新状态意图。旁路、移除和排序在
+捕获完成后按 slot ID 查找，不再使用过期数组下标；目标消失不写保存或历史。
+
+验证：
+  - 前端旧代码有 15 项新回归失败；修复后聚焦 61 项、全量 1102 项通过，3 项跳过。
+  - 旧 helper 的旁路切换会改变 sessionId；修复后重复切换保留 ID、参数和 state。
+  - Native audio 46 单测及 4 项原生 helper 集成回归通过。
+  - 本地原生夹具子进程验证双声道、3 样本延迟、跨块预热前缀及恢复后的湿声增益，
+    不打开原生窗口或声卡，不修改进程全局环境变量。
+  - Linux x64、macOS ARM64/x64 完整原生宿主及测试代码交叉检查通过。
+  - 日志：E:/pymss-vst-lab-artifacts/native-v9-*
+          E:/pymss-vst-lab-artifacts/parameter-target-v8/{before,focused}.log
+
+原生旁路与参数队列改动均已独立只读审查。未进行真实插件、桌面界面或跨平台运行测试；
+具体插件的 reset 行为及实时听感仍留待实机验证。AAX 尚无加载实现，未扩大已有支持声明。

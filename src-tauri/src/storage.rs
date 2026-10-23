@@ -204,11 +204,11 @@ fn bundled_runtime_envs_from(resource: Option<&Path>, exe_dir: &Path) -> Option<
 }
 
 pub fn runtime_envs_dir(app: &AppHandle) -> AppResult<PathBuf> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(feature = "vst-lab", target_os = "macos", target_os = "linux"))]
     {
         Ok(data_root_dir(app)?.join("runtime-envs"))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(feature = "vst-lab", target_os = "macos", target_os = "linux")))]
     {
         Ok(runtime_root_dir(app)?.join("runtime-envs"))
     }

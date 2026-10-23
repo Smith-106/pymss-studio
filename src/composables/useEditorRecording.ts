@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
+import { hasEditorPlugins } from '@/utils/editorPlugins'
 import type { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
@@ -227,6 +228,10 @@ export function useEditorRecording(options: RecordingOptions) {
 
   async function startRecording() {
     if (state.value !== 'idle' || !editor.session) return false
+    if (hasEditorPlugins(editor.session)) {
+      error.value = message('editor.plugins.recordingBlocked')
+      return false
+    }
     if (!navigator.mediaDevices?.getUserMedia) {
       error.value = message('editor.recordingUnsupported')
       return false

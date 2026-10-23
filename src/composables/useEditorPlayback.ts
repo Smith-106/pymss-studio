@@ -8,6 +8,7 @@ import { createEditorAudioElement, createPreviewChunkReader, EditorTimelinePlayb
 import type { EditorClip, EditorSource, EditorTrack } from '@/types/editor'
 import type { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
+import { useEditorNativePlayback } from '@/composables/useEditorNativePlayback'
 
 type EditorStore = ReturnType<typeof useEditorStore>
 
@@ -95,6 +96,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   } = storeToRefs(playback)
   const shouldFollowPlayhead = isActuallyPlaying
 
+  const nativePlayback = useEditorNativePlayback(editor, () => followPlayhead())
   const audioEntries = new Map<string, ManagedAudio>()
 
   let rafId: number | null = null
@@ -668,7 +670,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   }
 
   async function preloadActiveTracks() {
-    if (disposed) return
+    if (disposed || nativePlayback.required.value) return
     const projectId = editor.session?.id
     const entries = activeClips().map(({ track, clip, source }) => ensureAudioEntry(track, clip, source))
     await Promise.allSettled(entries.map((entry) => entry.metadataPromise))
@@ -993,6 +995,11 @@ export function useEditorPlayback(options: PlaybackOptions) {
   }
 
   async function requestPlay(offset = currentTime.value) {
+    if (nativePlayback.required.value) {
+      stopRaf()
+      releaseAudios()
+      return nativePlayback.play(offset)
+    }
     playback.clearError()
 
     if (!editor.session) {
@@ -1042,6 +1049,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   }
 
   function requestPause(reset = false) {
+    if (nativePlayback.required.value) return nativePlayback.pause(reset)
     const nextTime = reset ? 0 : clampTime(sampleCurrentTime())
     const id = playback.beginRequest('pause', 'pausing')
     activeRequestId = id
@@ -1110,6 +1118,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
 
   function seek(time: number) {
     const next = clampTime(time)
+    if (nativePlayback.required.value) return nativePlayback.seek(next)
     const playing = intent.value === 'play'
     const id = playback.beginRequest(playing ? 'play' : 'pause', playing ? 'starting' : 'paused')
     activeRequestId = id
@@ -1134,6 +1143,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   }
 
   function applyMasterVolume() {
+    if (nativePlayback.required.value) return
     applyMasterAudioSettings()
     for (const { track, clip, source } of activeClips()) {
       const entry = ensureAudioEntry(track, clip, source)
@@ -1149,6 +1159,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   watch(trackMixSignature, applyMasterVolume)
 
   watch(() => editor.masterPan, () => {
+    if (nativePlayback.required.value) return
     applyMasterAudioSettings()
   })
 
@@ -1164,6 +1175,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
   watch(
     () => trackSignature(),
     () => {
+      if (nativePlayback.required.value) return
       if (intent.value === 'play') {
         const id = playback.beginRequest('play', 'starting')
         activeRequestId = id
@@ -1186,6 +1198,17 @@ export function useEditorPlayback(options: PlaybackOptions) {
     },
     { immediate: true },
   )
+
+  watch(nativePlayback.required, (required) => {
+    stopRaf()
+    releaseAudios()
+    if (required) {
+      activeRequestId = playback.nextRequest()
+      playback.finishPause(activeRequestId)
+    }
+    // Leaving the native graph already starts its asynchronous pause. Keep that
+    // request current so its response can settle the transport before Web Audio resumes.
+  })
 
   onBeforeUnmount(() => {
     disposed = true
