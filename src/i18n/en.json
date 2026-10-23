@@ -1038,6 +1038,7 @@
     "inspectorClipTuning": "Clip Fades",
     "inspectorSourceContext": "Source Info",
     "inspectorFieldName": "Name",
+    "renameTrack": "Rename track: {name}",
     "trackSourcePath": "Source Path",
     "assetMissing": "Missing asset",
     "assetMissingHint": "This file is offline or moved. Please relink it to continue.",

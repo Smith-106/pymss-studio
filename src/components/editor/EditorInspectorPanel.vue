@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import type { InputInst } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
@@ -49,20 +50,46 @@ const selectedClip = computed(() => (
   selectedTrack.value?.clips?.find((clip) => clip.id === props.selectedClipId) || null
 ))
 const renameDraft = ref('')
+const editingTrackId = ref<string | null>(null)
+const renameInput = ref<InputInst | null>(null)
+const nameButton = ref<HTMLButtonElement | null>(null)
 const effectPreset = ref('custom')
 
 watch(
   selectedTrack,
   (track) => {
+    editingTrackId.value = null
     renameDraft.value = track?.name || ''
     effectPreset.value = 'custom'
   },
   { immediate: true },
 )
 
+async function beginRename() {
+  const track = selectedTrack.value
+  if (!track) return
+  renameDraft.value = track.name
+  editingTrackId.value = track.id
+  await nextTick()
+  if (editingTrackId.value !== track.id) return
+  renameInput.value?.focus()
+  renameInput.value?.select()
+}
+
 function commitRename() {
-  if (!selectedTrack.value) return
-  emit('renameTrack', selectedTrack.value.id, renameDraft.value, true)
+  const track = props.session.tracks.find(track => track.id === editingTrackId.value)
+  const name = renameDraft.value.trim()
+  editingTrackId.value = null
+  if (track && name && name !== track.name) emit('renameTrack', track.id, name, true)
+}
+
+function onRenameKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  if (event.key !== 'Enter' && event.key !== 'Escape') return
+  event.preventDefault()
+  if (event.key === 'Enter') commitRename()
+  else editingTrackId.value = null
+  void nextTick(() => nameButton.value?.focus({ preventScroll: true }))
 }
 
 function shortPath(path: string) {
@@ -169,7 +196,22 @@ function applyEffectPreset(value: string) {
     <div class="editor-inspector__titlebar">
       <div class="editor-inspector__eyebrow">{{ selectedTrack ? t('editor.trackParams') : t('editor.inspectorTitle') }}</div>
       <div class="editor-inspector__title">
-        <strong>{{ selectedTrack ? selectedTrack.name : t('editor.projectInfo') }}</strong>
+        <n-input
+          v-if="selectedTrack && editingTrackId === selectedTrack.id"
+          ref="renameInput"
+          v-model:value="renameDraft"
+          class="editor-inspector__name-input"
+          size="small"
+          :input-props="{ 'aria-label': t('editor.inspectorFieldName') }"
+          @blur="commitRename()"
+          @keydown.stop="onRenameKeydown"
+        />
+        <button v-else-if="selectedTrack" ref="nameButton" type="button" class="editor-inspector__name"
+          :title="selectedTrack.name" :aria-label="t('editor.renameTrack', { name: selectedTrack.name })"
+          @click="beginRename" @keydown.stop>
+          <strong>{{ selectedTrack.name }}</strong>
+        </button>
+        <strong v-else>{{ t('editor.projectInfo') }}</strong>
         <span>{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : t('editor.clipParamsIdle') }}</span>
       </div>
     </div>
@@ -182,16 +224,6 @@ function applyEffectPreset(value: string) {
         </div>
 
         <div class="inspector-group__body inspector-group__body--dense">
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.inspectorFieldName') }}</span>
-            <n-input
-              v-model:value="renameDraft"
-              size="small"
-              @blur="commitRename"
-              @keydown.enter.prevent="commitRename"
-            />
-          </label>
-
           <div class="dual-fields dual-fields--stacked">
             <div class="panel-field panel-field--compact">
               <div class="panel-field__split panel-field__split--compact">
@@ -520,7 +552,7 @@ function applyEffectPreset(value: string) {
 }
 
 .editor-inspector__title strong,
-.editor-inspector__title span {
+.editor-inspector__title > span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -531,10 +563,30 @@ function applyEffectPreset(value: string) {
   line-height: 1.15;
 }
 
-.editor-inspector__title span {
+.editor-inspector__title > span {
   color: var(--on-surface-muted);
   font-size: 10px;
 }
+
+.editor-inspector__name {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: text;
+}
+
+.editor-inspector__name:hover { background: var(--primary-softer); }
+.editor-inspector__name:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.editor-inspector__name-input :deep(input) { font-size: 14px; font-weight: 600; }
 
 .editor-inspector__scroll {
   min-height: 0;

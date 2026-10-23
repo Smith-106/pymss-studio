@@ -1038,6 +1038,7 @@
     "inspectorClipTuning": "片段淡入淡出",
     "inspectorSourceContext": "素材信息",
     "inspectorFieldName": "名称",
+    "renameTrack": "重命名音轨：{name}",
     "trackSourcePath": "素材路径",
     "assetMissing": "素材缺失",
     "assetMissingHint": "当前文件已离线或被移动，请重新定位后继续使用。",
