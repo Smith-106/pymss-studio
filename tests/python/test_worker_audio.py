@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import builtins
 import math
+import shutil
+import subprocess
 import sys
 import unittest
 import tempfile
@@ -372,6 +374,93 @@ class EditorEffectTests(unittest.TestCase):
             project['tracks'][2]['solo'] = True
             with mock.patch('worker_audio.emit'), mock.patch('worker_audio.emit_error', return_value=1):
                 self.assertEqual(cmd_export_editor_mix(payload), 1)
+
+    def test_inaudible_multichannel_tracks_do_not_change_export_channels_or_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "mono.wav"
+            sf.write(source, np.full(200, .1, dtype=np.float32), 1000, subtype="FLOAT")
+            payload = self._export_payload(root, source, name="mono")
+            payload["audioParams"] = {"wavBitDepth": "FLOAT"}
+            project = payload["project"]
+            project["tracks"][0]["effects"] = {}
+            # An offline excluded source must never be decoded, even when its
+            # metadata advertises more channels and a higher sample rate.
+            project["assets"].append({"id": "surround", "path": str(root / "offline.wav"),
+                                      "sampleRate": 96000, "channels": 6, "duration": 1})
+            for index, state in enumerate(({"muted": True}, {"volume": 0}, {"solo": False})):
+                with self.subTest(state=state):
+                    project["tracks"][0]["solo"] = index == 2
+                    project["tracks"] = project["tracks"][:1] + [{
+                        "id": "excluded", "sourceId": "surround", "volume": 1,
+                        "muted": False, "solo": False, **state,
+                    }]
+                    payload["fileName"] = f"excluded_{index}"
+                    with mock.patch("worker_audio.emit"):
+                        self.assertEqual(cmd_export_editor_mix(payload), 0)
+                    actual, rate = sf.read(root / "output" / f"excluded_{index}.wav", dtype="float32", always_2d=True)
+                    self.assertEqual(rate, 1000)
+                    self.assertEqual(actual.shape, (200, 1))
+                    np.testing.assert_array_equal(actual[:, 0], np.full(200, .1, dtype=np.float32))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for preview downmix parity")
+    def test_multichannel_export_matches_preview_downmix_and_pan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "surround.wav"
+            samples = np.zeros((9600, 6), dtype=np.float32)
+            time = np.arange(len(samples)) / 48000
+            # Center and surround content must remain audible after the stereo downmix.
+            samples[:, 2] = .1 * np.sin(2 * np.pi * 440 * time)
+            samples[:, 4] = .05 * np.sin(2 * np.pi * 880 * time)
+            samples[:, 5] = .03 * np.sin(2 * np.pi * 660 * time)
+            sf.write(source, samples, 48000, subtype="FLOAT")
+            reference = subprocess.run([
+                shutil.which("ffmpeg"), "-nostdin", "-v", "error", "-threads", "1",
+                "-i", str(source), "-map", "0:a:0", "-vn", "-ar", "48000", "-ac", "2",
+                "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+            ], check=True, capture_output=True)
+            expected = np.frombuffer(reference.stdout, dtype="<f4").reshape(-1, 2)
+            self.assertGreater(float(np.max(np.abs(expected))), .01)
+            for pan in (0, -1, 1):
+                with self.subTest(pan=pan):
+                    payload = self._export_payload(root, source)
+                    payload["project"]["assets"][0].update(sampleRate=48000, channels=6)
+                    payload["project"]["tracks"][0].update(effects={}, pan=pan)
+                    payload["audioParams"] = {"wavBitDepth": "FLOAT"}
+                    payload["fileName"] = f"surround_{pan}"
+                    events = []
+                    with mock.patch("worker_audio.emit", side_effect=lambda kind, value, **_: events.append(value) if kind == "editor_mix_exported" else None):
+                        self.assertEqual(cmd_export_editor_mix(payload), 0)
+                    actual, rate = sf.read(root / "output" / f"surround_{pan}.wav", dtype="float32", always_2d=True)
+                    self.assertEqual(rate, 48000)
+                    self.assertEqual(actual.shape, expected.shape)
+                    gains = [1 if pan <= 0 else 1 - pan, 1 if pan >= 0 else 1 + pan]
+                    np.testing.assert_allclose(actual, expected * gains, atol=1e-7)
+                    self.assertEqual(events[-1]["channels"], 2)
+
+    def test_multichannel_decode_failure_never_falls_back_to_surround_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "surround.wav"
+            sf.write(source, np.zeros((100, 6), dtype=np.float32), 48000, subtype="FLOAT")
+            for executable, status, data, message in (
+                (None, 0, b"", "FFmpeg is required"),
+                ("ffmpeg", 1, b"", "decoder failed"),
+                ("ffmpeg", 0, b"bad", "invalid stereo PCM"),
+            ):
+                with self.subTest(message=message):
+                    payload = self._export_payload(root, source)
+                    payload["project"]["assets"][0].update(sampleRate=48000, channels=6)
+                    payload["project"]["tracks"][0]["effects"] = {}
+                    result = subprocess.CompletedProcess([], status, data, b"decoder failed")
+                    with mock.patch("worker_audio.shutil.which", return_value=executable), \
+                            mock.patch("worker_audio.subprocess.run", return_value=result), \
+                            mock.patch("worker_audio.emit"), \
+                            mock.patch("worker_audio.emit_error", return_value=1) as error:
+                        self.assertEqual(cmd_export_editor_mix(payload), 1)
+                    self.assertIn(message, error.call_args.args[1])
+                    self.assertEqual(list((root / "output").iterdir()), [])
 
     def test_export_fades_match_the_linear_preview_curve(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

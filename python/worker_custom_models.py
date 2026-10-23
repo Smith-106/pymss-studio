@@ -422,13 +422,10 @@ def _replace_managed_dir(staging_dir: Path, managed_dir: Path) -> Path | None:
 
 
 def _restore_managed_dir(managed_dir: Path, backup_dir: Path | None) -> None:
-    try:
-        if managed_dir.exists():
-            shutil.rmtree(managed_dir, ignore_errors=True)
-        if backup_dir is not None and backup_dir.exists():
-            backup_dir.replace(managed_dir)
-    except Exception:
-        pass
+    if managed_dir.exists():
+        shutil.rmtree(managed_dir)
+    if backup_dir is not None:
+        backup_dir.replace(managed_dir)
 
 
 def _verify_model_loads(model_type: str, model_path: Path, config_path: Path | None, task_id: str | None) -> None:
@@ -556,11 +553,18 @@ def cmd_import_custom_model(payload: dict[str, Any]) -> int:
                 force=force,
                 require_exists=True,
             )
-        except Exception:
+        except Exception as registration_error:
             if managed_dir is not None:
-                _restore_managed_dir(managed_dir, backup_dir)
+                try:
+                    _restore_managed_dir(managed_dir, backup_dir)
+                except Exception as restore_error:
+                    recovery = f" Previous model files are preserved at {backup_dir}." if backup_dir is not None and backup_dir.exists() else ""
+                    raise RuntimeError(
+                        f"Model registration failed: {registration_error}. "
+                        f"Unable to restore the model directory: {restore_error}.{recovery}"
+                    ) from restore_error
             raise
-        finally:
+        else:
             if backup_dir is not None:
                 shutil.rmtree(backup_dir, ignore_errors=True)
 

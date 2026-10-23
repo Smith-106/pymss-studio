@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -281,6 +283,34 @@ def _read_audio(path: Path, target_rate: int | None = None) -> tuple[Any, int]:
         audio = _resample_audio(audio, int(sr), target_rate)
         sr = target_rate
     return audio, int(sr)
+
+
+def _read_editor_audio(path: Path, target_rate: int | None = None) -> tuple[Any, int]:
+    metadata = _audio_metadata(path)
+    if int(metadata.get("channels") or 0) <= 2:
+        return _read_audio(path, target_rate)
+
+    # Use the preview decoder's layout-aware stereo downmix before applying
+    # track gain and pan. Keeping six source channels here bypasses those controls.
+    import numpy as np  # type: ignore
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to export multichannel audio")
+    rate = int(target_rate or metadata.get("sampleRate") or 0)
+    if rate <= 0:
+        raise RuntimeError("The audio source has an invalid sample rate")
+    result = subprocess.run([
+        ffmpeg, "-nostdin", "-v", "error", "-threads", "1", "-i", str(path),
+        "-map", "0:a:0", "-vn", "-ar", str(rate), "-ac", "2",
+        "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+    ], capture_output=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[-2000:]
+        raise RuntimeError(f"Unable to decode multichannel audio: {detail or result.returncode}")
+    if len(result.stdout) % 8:
+        raise RuntimeError("The audio decoder returned invalid stereo PCM data")
+    return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 2).T.copy(), rate
 
 
 def _equal_power_fade(length: int, fade_in: bool) -> Any:
@@ -578,7 +608,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             if not path.is_file():
                 raise FileNotFoundError(str(path))
 
-            audio, sr = _read_audio(path, target_rate)
+            audio, sr = _read_editor_audio(path, target_rate)
             if target_rate is None:
                 target_rate = sr
             elif sr != target_rate:
@@ -647,7 +677,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             planned_channels = 1
             planned_samples = 0
             for track, clip, source in render_items:
-                source_channels = max(1, int(source.get("channels") or 1))
+                source_channels = min(2, max(1, int(source.get("channels") or 1)))
                 if source_channels == 1 and abs(float(track.get("pan", 0.0) or 0.0)) > 1e-6:
                     source_channels = 2
                 planned_channels = max(planned_channels, source_channels)

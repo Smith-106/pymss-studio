@@ -73,9 +73,9 @@ function clamp(value: number, min: number, max: number) {
 export function useEditorPlayback(options: PlaybackOptions) {
   const { editor, scrollEl } = options
   const trackHeaderWidth = options.trackHeaderWidth ?? 0
-  // Keep Windows and macOS previews on one output clock. Independent media
-  // clocks require correction seeks that restart decoding while scrubbing.
-  const useScheduledAudio = typeof window !== 'undefined' && /Mac|Win/i.test(window.navigator?.platform || '')
+  // Desktop previews share the FFmpeg downmix and one output clock. Independent
+  // media clocks require correction seeks that restart decoding while scrubbing.
+  const useScheduledAudio = typeof window !== 'undefined' && /Mac|Win|Linux/i.test(window.navigator?.platform || '')
   const playback = useEditorPlaybackStore()
   const {
     intent,

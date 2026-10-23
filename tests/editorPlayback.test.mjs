@@ -627,7 +627,7 @@ test('buffering intentionally cancels a pending clip start without failing the m
 })
 
 
-for (const platform of ['MacIntel', 'Win32']) {
+for (const platform of ['MacIntel', 'Win32', 'Linux x86_64']) {
 test(`${platform} transport schedules later clips with one clock instead of separate media players`, async t => {
   const env = environment(t, { platform, clips: [
     { start: 0, offset: 0, duration: 20 }, { start: 2, offset: 4, duration: 10 },

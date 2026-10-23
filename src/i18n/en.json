@@ -1173,7 +1173,7 @@
     "installUpdate": "Download and Install",
     "updateRemindLater": "Remind Me Later",
     "updateInstallOverlayHint": "Keep the app running. It will restart automatically after installation.",
-    "updateInstallFailedHint": "The update could not be installed. Review the error message and try again.",
+    "updateInstallFailedHint": "The update could not be completed. Download and install the new version manually from GitHub Releases.",
     "updateDownloadProgress": "Download progress: {percent}%",
     "updateDownloadSpeed": "Speed: {speed}",
     "updateDownloadEta": "Estimated remaining: {eta}",

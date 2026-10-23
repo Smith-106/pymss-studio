@@ -459,6 +459,56 @@ class ImportPipelineTests(unittest.TestCase):
         self.assertEqual(events[-1]["payload"]["code"], "CUSTOM_MODEL_IMPORT_FAILED")
         self.assertEqual(old_weights.read_bytes(), b"old")
 
+    def test_failed_registration_keeps_backup_when_new_files_cannot_be_removed(self):
+        managed = (self.models_dir / "custom" / "my_model").resolve()
+        managed.mkdir(parents=True)
+        (managed / "my_model.ckpt").write_bytes(b"old")
+        original_rmtree = shutil.rmtree
+
+        def remove_tree(path, *args, **kwargs):
+            if Path(path) == managed:
+                raise PermissionError("model file is in use")
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(ccm.shutil, "rmtree", side_effect=remove_tree):
+            code, events, _ = self._run(
+                self._base_payload(importMode="copy", force=True),
+                register_error=ValueError("name conflict"),
+            )
+
+        self.assertEqual(code, 1)
+        backups = list(managed.parent.glob(".my_model.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "my_model.ckpt").read_bytes(), b"old")
+        message = events[-1]["payload"]["message"]
+        self.assertIn(str(backups[0]), message)
+        self.assertIn("name conflict", message)
+        self.assertIn("model file is in use", message)
+
+    def test_failed_registration_keeps_backup_when_restoring_it_fails(self):
+        managed = (self.models_dir / "custom" / "my_model").resolve()
+        managed.mkdir(parents=True)
+        (managed / "my_model.ckpt").write_bytes(b"old")
+        original_replace = Path.replace
+
+        def replace(path, target):
+            if path.name.startswith(".my_model.backup-"):
+                raise PermissionError("restore denied")
+            return original_replace(path, target)
+
+        with mock.patch.object(Path, "replace", replace):
+            code, events, _ = self._run(
+                self._base_payload(importMode="copy", force=True),
+                register_error=ValueError("name conflict"),
+            )
+
+        self.assertEqual(code, 1)
+        backups = list(managed.parent.glob(".my_model.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "my_model.ckpt").read_bytes(), b"old")
+        self.assertIn(str(backups[0]), events[-1]["payload"]["message"])
+        self.assertIn("restore denied", events[-1]["payload"]["message"])
+
     def test_verification_runs_before_registration(self):
         # Ordering is the whole guarantee; assert it rather than trusting the call sites.
         order = []

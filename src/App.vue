@@ -185,6 +185,7 @@ function showManualUpdatePrompt() {
 
 async function openManualUpdate() {
   const url = updates.manualInstallUrl || 'https://github.com/pymss-project/pymss-studio/releases/latest'
+  manualUpdateError.value = ''
   try {
     await open(url)
     manualUpdateModalVisible.value = false
@@ -462,6 +463,9 @@ const themeOverrides = computed(() => {
             <n-alert v-if="(updates.status === 'failed' || updates.status === 'restart-required') && updates.error" type="error" :bordered="false">
               {{ updates.error }}
             </n-alert>
+            <n-alert v-if="updates.status === 'failed' && manualUpdateError" type="error" :bordered="false">
+              {{ manualUpdateError }}
+            </n-alert>
             <section v-if="updates.downloadLogs.length" class="update-install-panel__logs" aria-live="polite">
               <div class="update-install-panel__logs-head">
                 <strong>{{ t('settings.updateDownloadLogs') }}</strong>
@@ -476,6 +480,7 @@ const themeOverrides = computed(() => {
             </section>
             <div v-if="updates.status === 'failed'" class="update-install-panel__actions">
               <n-button secondary @click="updates.dismissInstallError()">{{ t('common.close') }}</n-button>
+              <n-button type="primary" @click="openManualUpdate">{{ t('settings.updateOpenGitHub') }}</n-button>
             </div>
             <div v-else-if="updates.status === 'restart-required'" class="update-install-panel__actions">
               <n-button secondary @click="updates.closeForUpdate()">{{ t('settings.updateCloseApplication') }}</n-button>
