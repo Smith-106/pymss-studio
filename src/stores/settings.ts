@@ -28,6 +28,7 @@ import {
   normalizeConcurrentSeparations,
 } from '@/features/tasks/concurrency'
 import type { EnvInfo } from '@/stores/app'
+import { normalizeBeginnerGuideProgress, type BeginnerGuideProgress } from '@/features/onboarding/guide'
 
 const studioLog = createLogger('ui.stores.settings')
 
@@ -108,6 +109,7 @@ type StoredSettings = {
   m4aCodec?: string
   startupOnboardingSeen?: boolean
   startupOnboardingSeenVersion?: string
+  beginnerGuideProgress?: BeginnerGuideProgress
   proxyMode?: ProxyMode
   proxyUrl?: string
   proxyBypass?: string
@@ -262,6 +264,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const updateSource = ref<UpdateSource>('auto')
   const updateEndpointOverride = ref('')
   const startupOnboardingSeen = ref(false)
+  const beginnerGuideProgress = ref(normalizeBeginnerGuideProgress(null))
   const modelDirMigrationState = ref<ModelDirMigrationState>(createEmptyModelDirMigrationState())
 
   const dataRoot = computed(() => appPaths.value?.dataRoot || '')
@@ -293,6 +296,7 @@ export const useSettingsStore = defineStore('settings', () => {
     m4aBitRate: m4aBitRate.value,
     m4aCodec: m4aCodec.value,
     startupOnboardingSeen: startupOnboardingSeen.value,
+    beginnerGuideProgress: beginnerGuideProgress.value,
     proxyMode: proxyMode.value,
     proxyUrl: proxyUrl.value,
     proxyBypass: proxyBypass.value,
@@ -367,6 +371,7 @@ export const useSettingsStore = defineStore('settings', () => {
     updateEndpointOverride.value = String(stored?.updateEndpointOverride || '').trim()
     startupOnboardingSeen.value = stored?.startupOnboardingSeen === true
       || String(stored?.startupOnboardingSeenVersion || '').trim().length > 0
+    beginnerGuideProgress.value = normalizeBeginnerGuideProgress(stored?.beginnerGuideProgress)
     const shouldPersistNormalizedOnboarding =
       !stored
       || typeof stored.startupOnboardingSeen !== 'boolean'
@@ -430,6 +435,7 @@ export const useSettingsStore = defineStore('settings', () => {
       updateChannel,
       updateSource,
       updateEndpointOverride,
+      beginnerGuideProgress,
     ],
     () => queuePersist(),
     { deep: true },
@@ -868,6 +874,7 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function markStartupOnboardingCompleted() {
+    if (beginnerGuideProgress.value.status === 'unseen') beginnerGuideProgress.value = { status: 'pending', step: 0 }
     startupOnboardingSeen.value = true
     if (isMainTaskOwner()) await saveAppStore('app-settings', persistable.value)
   }
@@ -931,6 +938,7 @@ export const useSettingsStore = defineStore('settings', () => {
     updateSource,
     updateEndpointOverride,
     startupOnboardingSeen,
+    beginnerGuideProgress,
     modelDirMigrationState,
     initialize,
     markStartupOnboardingCompleted,

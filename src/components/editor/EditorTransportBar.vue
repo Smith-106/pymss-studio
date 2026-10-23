@@ -351,7 +351,7 @@ function clearTransportPressed() {
             <template #icon><n-icon :component="SaveOutline" /></template>
             {{ t('editor.save') }}
           </n-button>
-          <n-button type="primary" size="small" :loading="exporting" :disabled="disabled || recordingActive || recordingPending" @click="emit('export')">
+          <n-button class="transport-export" type="primary" size="small" :loading="exporting" :disabled="disabled || recordingActive || recordingPending" @click="emit('export')">
             <template #icon><n-icon :component="DownloadOutline" /></template>
             {{ t('editor.export') }}
           </n-button>

@@ -185,7 +185,7 @@ function levelLabel(value: string) {
   <AudioToolPanel tool="loudness" :status-title="t('tools.processingStatus')" :status-hint="t('tools.loudnessHint')">
     <AudioToolHeader :icon="VolumeHighOutline" :title="t('tools.loudnessTitle')" :description="t('tools.loudnessDescription')" />
 
-    <div class="audio-tool-field">
+    <div data-guide="tool-input" class="audio-tool-field">
       <div class="audio-tool-field-heading"><label>{{ t('tools.inputFiles') }}</label><span>{{ t('tools.selectedCount', { count: inputs.length }) }}</span></div>
       <div class="audio-tool-picker-grid">
         <button class="audio-tool-picker" :disabled="state.anyBusy" @click="pickFiles"><n-icon :component="DocumentOutline" size="20" />{{ inputs.length ? t('tools.addFiles') : t('tools.chooseFiles') }}</button>

@@ -93,7 +93,7 @@ function run() {
     <AudioToolHeader :icon="GitMergeOutline" :title="t('tools.mergeTitle')" :description="t('tools.mergeDescription')" />
 
     <div class="audio-tool-grid">
-      <div class="audio-tool-field">
+      <div data-guide="tool-input" class="audio-tool-field">
         <label>{{ t('tools.inputDirectory') }}</label>
         <div class="audio-tool-path">
           <n-input :value="inputDir" readonly :placeholder="t('tools.chooseInputDirectory')" />

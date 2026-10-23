@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isTutorialFrame } from '@/features/onboarding/demoContext'
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
@@ -428,7 +429,7 @@ watch(
       :style="shellStyle"
       @contextmenu.prevent
     >
-      <EditorTransportBar
+      <EditorTransportBar data-guide="demo-editor-transport"
         :session-name="sessionName"
         :track-count="session?.tracks.length || 0"
         :current-time="playbackCurrentTime"
@@ -448,7 +449,7 @@ watch(
         :missing-asset-preview="missingAssetPreview"
         :relinking-missing-assets="relinkingMissingAssets"
         :recording-state="recordingState"
-        :recording-start-disabled="isImportingExternal"
+        :recording-start-disabled="isImportingExternal || isTutorialFrame()"
         :recording-devices="recordingDevices"
         :recording-device-id="recordingDeviceId"
         :recording-input-level="recordingInputLevel"
@@ -534,7 +535,7 @@ watch(
         </div>
 
         <div class="editor-shell__center">
-          <EditorMixer
+          <EditorMixer data-guide="demo-editor-mixer"
             ref="mixerRef"
             :tracks="session.tracks"
             :source-map="editor.sourceMap"

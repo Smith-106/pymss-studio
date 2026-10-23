@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { createLogger } from '@/utils/logger'
+import { isTutorialFrame } from '@/features/onboarding/demoContext'
 
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -1013,7 +1014,7 @@ onMounted(() => {
         </div>
         <p>{{ t('models.subtitle') }}</p>
       </div>
-      <div class="header-actions">
+      <div class="header-actions" data-guide="model-management">
         <n-tooltip v-if="!customModelsSupported" trigger="hover">
           <template #trigger>
             <n-button secondary disabled>
@@ -1031,7 +1032,7 @@ onMounted(() => {
           <template #icon><n-icon :component="ServerOutline" /></template>
           {{ t('models.storageManage') }}
         </n-button>
-        <n-button secondary :loading="isLoading" @click="loadModels">
+        <n-button secondary :loading="isLoading" data-guide="model-library-fallback" @click="loadModels">
           <template #icon><n-icon :component="RefreshOutline" /></template>
           {{ t('models.load') }}
         </n-button>
@@ -1039,7 +1040,7 @@ onMounted(() => {
     </div>
 
     <!-- Filter Toolbar -->
-    <div class="toolbar">
+    <div class="toolbar" data-guide="model-filters">
       <div class="toolbar-row">
         <n-input
           v-model:value="search"
@@ -1137,6 +1138,7 @@ onMounted(() => {
           <div
             v-for="model in pagedModels"
             :key="model.name"
+            :data-guide="model.supported ? 'model-library' : undefined"
             :class="['model-card', {
               'model-card--selected': selectedModel === model.name,
               'model-card--unsupported': !model.supported,
@@ -1594,7 +1596,7 @@ onMounted(() => {
       </n-card>
     </n-modal>
 
-    <n-drawer v-model:show="showStorage" :width="760" placement="right">
+    <n-drawer v-model:show="showStorage" :width="760" placement="right" :z-index="isTutorialFrame() ? 3500 : undefined" :trap-focus="!isTutorialFrame()">
       <n-drawer-content :title="t('models.storageTitle')" closable>
         <div class="storage-panel">
           <div class="storage-summary">

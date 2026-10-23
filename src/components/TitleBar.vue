@@ -27,7 +27,7 @@ const closeInProgress = ref(false)
 const allowForcedClose = ref(false)
 const closeDialogOpen = ref(false)
 
-const pageTitle = computed(() => t(`nav.${String(route.name || 'home')}`))
+const pageTitle = computed(() => t(`nav.${String(route.name || 'home').startsWith('workflow-') ? 'workflows' : String(route.name || 'home')}`))
 const isMainWindow = computed(() => !appWindow || appWindow.label === 'main')
 const runningTaskCount = computed(() => task.runningTasks.length)
 const closeDisabled = computed(() => settings.isModelDirMigrating || closeInProgress.value)

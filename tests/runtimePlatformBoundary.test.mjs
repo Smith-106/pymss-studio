@@ -122,12 +122,29 @@ for (const backend of ['mlx', 'cpu']) {
       runtimeCorePromptBlocked: { value: false },
       activeRuntime: { value: { backend, pythonPath: '/runtime/bin/python3' } },
       runtimeCorePromptVisible: { value: false },
+      beginnerGuide: { visible: false },
+      settings: { beginnerGuideProgress: { status: 'unseen' } },
     }
     componentFunction('../src/App.vue', 'showRuntimeCorePrompt', scope)()
     assert.equal(actions.length, 0)
     assert.equal(scope.runtimeCorePromptVisible.value, true)
   })
 }
+
+test('runtime update prompts wait until the beginner guide is dismissed', () => {
+  for (const [visible, status] of [[true, 'active'], [false, 'pending']]) {
+    const scope = {
+      app: { runtimeCoreUpdateSupported: true },
+      runtimeCorePromptShown: { value: false }, runtimeCorePromptVisible: { value: false },
+      runtimeCorePromptBlocked: { value: false }, runtimeCoreUpdateAvailable: { value: true },
+      bootReady: { value: true }, showStartupOnboarding: { value: false }, isStandaloneRoute: { value: false },
+      beginnerGuide: { visible }, settings: { beginnerGuideProgress: { status } },
+    }
+    componentFunction('../src/App.vue', 'showRuntimeCorePrompt', scope)()
+    assert.equal(scope.runtimeCorePromptVisible.value, false)
+    assert.equal(scope.runtimeCorePromptShown.value, false)
+  }
+})
 
 test('runtime notices wait for updates and reads, and close once the installed core is current', () => {
   for (const status of ['preparing', 'prepared', 'updating']) {

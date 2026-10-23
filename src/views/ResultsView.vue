@@ -789,13 +789,13 @@ function formatDurationMs(value: number | undefined) {
       <span class="results-toolbar__count">{{ filteredResults.length }} / {{ resultGroups.length }}</span>
     </div>
 
-    <div v-if="!task.resultTasks.length" class="results-empty">
+    <div v-if="!task.resultTasks.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="FolderOutline" size="46" />
       <strong>{{ t('results.empty') }}</strong>
       <span>{{ t('results.emptyHint') }}</span>
     </div>
 
-    <div v-else-if="!filteredResults.length" class="results-empty">
+    <div v-else-if="!filteredResults.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="SearchOutline" size="42" />
       <strong>{{ t('results.noMatchTitle') }}</strong>
       <span>{{ t('results.noMatchHint') }}</span>
@@ -806,7 +806,7 @@ function formatDurationMs(value: number | undefined) {
         v-for="item in pagedResults"
         :id="resultCardId(item)"
         :key="item.id"
-        class="result-row"
+        class="result-row" data-guide="result-item"
         :class="{ 'result-row--selected': selectedResultSet.has(item.id) }"
       >
         <button
@@ -854,7 +854,7 @@ function formatDurationMs(value: number | undefined) {
           </span>
         </button>
 
-        <div v-if="!selecting" class="result-row__actions">
+        <div v-if="!selecting" class="result-row__actions" data-guide="result-actions">
           <n-button v-if="item.inputCount === 1" size="small" type="primary" @click.stop="openInEditor(item.primary)">
             <template #icon><n-icon :component="ColorWandOutline" /></template>
             {{ t('results.openInEditor') }}

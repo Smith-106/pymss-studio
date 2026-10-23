@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import InferenceParameterHelp from '@/components/InferenceParameterHelp.vue'
+import { useBeginnerGuideStore } from '@/stores/beginnerGuide'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
@@ -62,13 +64,18 @@ import {
   CloudDownloadOutline,
   RefreshOutline,
   ChevronForwardOutline,
+  CompassOutline,
+  OptionsOutline,
 } from '@vicons/ionicons5'
 
 const { t, locale: currentLocale } = useI18n()
 const message = useMessage()
 const dialog = useDialog()
 const route = useRoute()
+const router = useRouter()
 const settings = useSettingsStore()
+const beginnerGuide = useBeginnerGuideStore()
+const showParameterHelp = ref(false)
 const app = useAppStore()
 const updates = useUpdateStore()
 const modelStore = useModelStore()
@@ -91,8 +98,17 @@ type BuildInfo = {
 }
 const activeSection = ref<SettingsSection>('appearance')
 watch(() => route.query.section, (section) => {
-  if (section === 'runtime') activeSection.value = 'runtime'
+  if (typeof section === 'string' && ['about', 'appearance', 'runtime', 'paths', 'defaults'].includes(section)) {
+    if (beginnerGuide.phase === 'running' && beginnerGuide.currentStep.section && beginnerGuide.currentStep.section !== section) beginnerGuide.pause()
+    activeSection.value = section as SettingsSection
+  }
 }, { immediate: true })
+function selectSettingsSection(section: SettingsSection) {
+  if (activeSection.value === section) return
+  beginnerGuide.pause()
+  activeSection.value = section
+  if (typeof route.query.section === 'string') void router.replace({ query: { ...route.query, section } })
+}
 const buildInfo = ref<BuildInfo | null>(null)
 const updateChecking = ref(false)
 const updateInstalling = ref(false)
@@ -1195,7 +1211,7 @@ onMounted(async () => {
           type="button"
           class="settings-nav-item"
           :class="{ active: activeSection === section.key }"
-          @click="activeSection = section.key"
+          @click="selectSettingsSection(section.key)"
         >
           <span class="settings-nav-item__icon"><n-icon :component="section.icon" size="18" /></span>
           <span class="settings-nav-item__copy">
@@ -1393,6 +1409,23 @@ onMounted(async () => {
             </div>
           </article>
 
+          <article class="about-info-card about-guide-card" data-guide="guide-help">
+            <div class="section-title section-title--plain">
+              <span class="section-title__icon"><n-icon :component="CompassOutline" size="18" /></span>
+              <span>{{ t('beginnerGuide.label') }}</span>
+            </div>
+            <div class="about-guide-card__actions">
+              <n-button type="primary" secondary @click="beginnerGuide.start(true)">
+                <template #icon><n-icon :component="RefreshOutline" /></template>
+                {{ t('beginnerGuide.restart') }}
+              </n-button>
+              <n-button secondary @click="showParameterHelp = true">
+                <template #icon><n-icon :component="OptionsOutline" /></template>
+                {{ t('parameterHelp.label') }}
+              </n-button>
+            </div>
+          </article>
+
           <div class="about-detail-grid">
             <article class="about-info-card about-info-card--license">
               <div class="section-title section-title--plain">
@@ -1570,7 +1603,7 @@ onMounted(async () => {
 
         <!-- Runtime -->
         <section v-else-if="activeSection === 'runtime'" class="settings-section-panel runtime-section">
-          <article class="about-hero runtime-hero">
+          <article class="about-hero runtime-hero" data-guide="runtime-overview">
             <div class="about-hero__main">
               <div class="section-title__icon runtime-hero__icon">
                 <n-icon :component="TerminalOutline" size="18" />
@@ -1934,7 +1967,7 @@ onMounted(async () => {
               </div>
             </div>
 
-            <div class="path-primary-grid">
+            <div class="path-primary-grid" data-guide="settings-paths">
               <div class="path-item path-item--primary">
                 <div class="path-item__head">
                   <div class="path-item__head-copy">
@@ -2000,7 +2033,7 @@ onMounted(async () => {
 
           <div class="settings-merged-layout">
             <section class="settings-group">
-              <div class="setting-field">
+              <div class="setting-field" data-guide="settings-device">
                 <label class="text-muted text-sm">{{ t('settings.defaultDevice') }}</label>
                 <n-select
                   v-model:value="defaultDevice"
@@ -2009,7 +2042,7 @@ onMounted(async () => {
               </div>
             </section>
 
-            <section class="settings-group">
+            <section class="settings-group" data-guide="settings-downloads">
               <div class="setting-field">
                 <label class="text-muted text-sm">{{ t('settings.downloadSource') }}</label>
                 <n-select
@@ -2334,6 +2367,7 @@ onMounted(async () => {
         </p>
       </div>
     </n-modal>
+    <InferenceParameterHelp v-model:show="showParameterHelp" :model-type="modelStore.models.find(entry => entry.name === modelStore.selectedModel)?.modelType" />
   </div>
 </template>
 
@@ -2961,6 +2995,21 @@ onMounted(async () => {
   display: grid;
   gap: 10px;
   flex: 1;
+}
+
+.about-guide-card {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.about-guide-card__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .about-info-card__body p {

@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { appRoutes } from './routes'
 import { invoke } from '@tauri-apps/api/core'
 import { createWorkflowEditorRouteGuard } from '@/workflows/editorWindow'
 import { isMainTaskOwner } from '@/utils/taskOwner'
@@ -10,21 +11,7 @@ import i18n from '@/i18n'
 
 const router = createRouter({
   history: createWebHashHistory(),
-  routes: [
-    { path: '/', name: 'separate', component: () => import('@/views/SeparateView.vue') },
-    { path: '/separate', redirect: { name: 'separate' } },
-    { path: '/tasks', redirect: { name: 'results' } },
-    { path: '/models', name: 'models', component: () => import('@/views/ModelsView.vue') },
-    { path: '/workflows', name: 'workflows', component: () => import('@/views/WorkflowsView.vue') },
-    { path: '/workflow-node-editor', name: 'workflow-node-editor', component: () => import('@/views/WorkflowNodeEditorView.vue') },
-    { path: '/workflow-simple-editor', name: 'workflow-simple-editor', component: () => import('@/views/WorkflowSimpleEditorView.vue') },
-    { path: '/results', name: 'results', component: () => import('@/views/ResultsView.vue') },
-    { path: '/tools', name: 'tools', component: () => import('@/views/ToolsView.vue') },
-    { path: '/debug', name: 'debug', component: () => import('@/views/DebugView.vue') },
-    { path: '/projects', redirect: { name: 'results' } },
-    { path: '/editor', name: 'editor', component: () => import('@/views/EditorView.vue') },
-    { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
-  ],
+  routes: appRoutes,
 })
 
 router.beforeEach(createWorkflowEditorRouteGuard({

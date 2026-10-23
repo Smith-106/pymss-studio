@@ -358,7 +358,7 @@ watch(() => settings.outputDir, (value) => {
 
     <section
       v-if="!funAsrInstalled"
-      class="audio-tool-dependency"
+      class="audio-tool-dependency" data-guide="tool-input"
       :class="{ 'audio-tool-dependency--error': dependencyError }"
     >
       <div>
@@ -458,7 +458,7 @@ watch(() => settings.outputDir, (value) => {
     </section>
 
     <template v-if="funAsrInstalled">
-      <div class="audio-tool-field">
+      <div data-guide="tool-input" class="audio-tool-field">
         <label>{{ t('tools.inputFile') }}</label>
         <div class="audio-tool-path">
           <n-input :value="inputPath" readonly :placeholder="t('tools.chooseAudio')" />

@@ -50,7 +50,7 @@ async function copyItems(items: TempoKeyItem[]) {
   <AudioToolPanel tool="tempo_key" :status-title="t('tools.analysisResult')" :status-hint="t('tools.tempo_keyHint')">
     <AudioToolHeader :icon="PulseOutline" :title="t('tools.tempo_keyTitle')" :description="t('tools.tempo_keyDescription')" />
 
-    <div class="audio-tool-field">
+    <div data-guide="tool-input" class="audio-tool-field">
       <div class="audio-tool-field-heading"><label>{{ t('tools.inputFiles') }}</label><span>{{ t('tools.selectedCount', { count: inputs.length }) }}</span></div>
       <div class="audio-tool-picker-grid">
         <button class="audio-tool-picker" :disabled="state.anyBusy" @click="pickFiles"><n-icon :component="DocumentOutline" size="20" />{{ inputs.length ? t('tools.addFiles') : t('tools.chooseFiles') }}</button>

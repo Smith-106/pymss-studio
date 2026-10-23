@@ -741,7 +741,7 @@ watch([workflows, selectedWorkflowId], () => {
         <h1>{{ t('workflows.title') }}</h1>
         <p>{{ t('workflows.subtitle') }}</p>
       </div>
-      <div class="workflows-page__header-actions">
+      <div class="workflows-page__header-actions" data-guide="workflow-actions">
         <n-button secondary @click="triggerImportWorkflow">
           <template #icon><n-icon :component="OpenOutline" /></template>
           {{ t('workflows.importWorkflow') }}
@@ -829,7 +829,7 @@ watch([workflows, selectedWorkflowId], () => {
         </div>
       </aside>
 
-      <main class="console__stage">
+      <main class="console__stage" data-guide="workflow-overview">
         <div v-if="!selectedWorkflow" class="wf-overview-empty">
           <n-icon :component="GitNetworkOutline" />
           <strong>{{ t('workflows.overviewEmptyTitle') }}</strong>

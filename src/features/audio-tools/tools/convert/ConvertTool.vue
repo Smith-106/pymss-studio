@@ -50,7 +50,7 @@ function run() { void runtime.execute('convert', { inputs: inputs.value, outputD
 <template>
   <AudioToolPanel tool="convert" :status-title="t('tools.processingStatus')" :status-hint="t('tools.convertHint')">
     <AudioToolHeader :icon="SwapHorizontalOutline" :title="t('tools.convertTitle')" :description="t('tools.convertDescription')" />
-    <div class="audio-tool-field"><div class="audio-tool-field-heading"><label>{{ t('tools.inputFiles') }}</label><span>{{ t('tools.selectedCount', { count: inputs.length }) }}</span></div>
+    <div data-guide="tool-input" class="audio-tool-field"><div class="audio-tool-field-heading"><label>{{ t('tools.inputFiles') }}</label><span>{{ t('tools.selectedCount', { count: inputs.length }) }}</span></div>
       <div class="audio-tool-picker-grid"><button class="audio-tool-picker" :disabled="state.anyBusy" @click="pickFiles"><n-icon :component="DocumentOutline" size="20" />{{ inputs.length ? t('tools.addFiles') : t('tools.chooseFiles') }}</button><button class="audio-tool-picker" :disabled="state.anyBusy" @click="pickFolder"><n-icon :component="FolderOpenOutline" size="20" />{{ t('tools.addInputFolder') }}</button></div>
       <div v-if="inputs.length" class="audio-tool-files"><div v-for="path in inputs" :key="path"><span :title="path">{{ fileName(path) }}</span><button :title="t('tools.removeFile')" :disabled="state.anyBusy" @click="inputs = inputs.filter(item => item !== path)"><n-icon :component="CloseCircleOutline" /></button></div></div>
     </div>

@@ -15,6 +15,7 @@ import { useAppStore, type RuntimeBackend } from '@/stores/app'
 import { useUpdateStore } from '@/stores/update'
 import { activeRuntimeEnvironment, runtimeCoreSyncAvailable, runtimeToActivate } from '@/utils/runtime'
 import './styles/global.scss'
+import { isTutorialFrame } from './features/onboarding/demoContext'
 
 const studioLog = createLogger('ui.main')
 
@@ -132,6 +133,10 @@ async function bootstrap() {
   })
 }
 
-bootstrap().catch((error) => {
+;(isTutorialFrame() ? import('./features/onboarding/demoBootstrap').then(module => module.bootstrapTutorial()) : bootstrap()).catch((error) => {
+  if (isTutorialFrame()) {
+    ;(window as any).__pymssTutorialDispose?.()
+    window.parent.postMessage({ type: 'pymss-tutorial-error', message: error instanceof Error ? error.message : String(error) }, '*')
+  }
   studioLog.error('Failed to bootstrap application', error)
 })
