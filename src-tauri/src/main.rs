@@ -91,6 +91,7 @@ fn main() {
     builder
         .setup(|app| {
             let _ = session_log::init_session_log(app.handle());
+            python::worker::recover_audio_output_temps(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -149,6 +150,7 @@ fn main() {
             commands::app_cmd::check_managed_update,
             commands::app_cmd::start_managed_update,
             commands::app_cmd::confirm_managed_update_startup,
+            commands::app_cmd::get_managed_update_state,
             commands::app_cmd::debug_runtime_override_active,
             commands::app_cmd::debug_runtime_pointers,
             commands::app_cmd::debug_runtime_restore_file,

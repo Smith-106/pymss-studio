@@ -404,7 +404,8 @@
     "phaseDetailWritingSegments": "Cut points are ready; exporting audio segments from the source file.",
     "phaseDetailLoadingAsrModel": "Loading ASR, VAD, and punctuation models. The initial download may take some time.",
     "phaseDetailRecognizingSpeech": "The models are ready; detecting speech and generating the transcript.",
-    "phaseDetailWritingTranscript": "Recognition is complete; writing text, timeline, and subtitle files."
+    "phaseDetailWritingTranscript": "Recognition is complete; writing text, timeline, and subtitle files.",
+    "mergeSameDirectory": "Input and output directories must be different. Choose another output directory."
   },
   "separate": {
     "title": "Separation Home",
@@ -845,7 +846,8 @@
     "viewMode": "View mode",
     "viewList": "List",
     "viewCard": "Cards",
-    "downloadLogsFollow": "Follow latest"
+    "downloadLogsFollow": "Follow latest",
+    "customNamePathUnsafe": "Model names cannot contain paths, reserved characters, or device names."
   },
   "results": {
     "typeAll": "All types",
@@ -1394,7 +1396,13 @@
     "themeAccentBlue": "Default Blue",
     "themeAccentPink": "Soft Pink",
     "themeAccentSky": "Soft Blue",
-    "themeAccentTeal": "Teal Green"
+    "themeAccentTeal": "Teal Green",
+    "updateTasksBusy": "Wait for running tasks and model directory migrations to finish before installing the update.",
+    "updateCloseEditors": "Close additional editor windows before installing the update.",
+    "updateRestartRequiredTitle": "Application exit required",
+    "updateRestartRequiredHint": "The update is ready, but the application could not exit automatically. Close and reopen it; if the version is unchanged, check for updates again.",
+    "updateRetryExit": "Retry exit",
+    "updateCloseApplication": "Close application"
   },
   "debug": {
     "title": "Runtime Diagnostics",

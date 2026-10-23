@@ -291,3 +291,12 @@ test('true peak limit warnings remain visible when loudness is within tolerance'
   assert.deepEqual(messages, [{ level: 'warning', text: locale.tools.loudnessTruePeakExceeded }])
   assert.equal(runtime.stateFor('loudness').value.logs.at(-1).detail, locale.tools.loudnessTruePeakExceeded)
 })
+
+test('merge directory alias rejections show the localized error', async t => {
+  const { runtime, emit } = await createRuntime(t)
+  const work = runtime.execute('merge', { inputDir: 'input', outputDir: 'alias' })
+  await flush()
+  emit('error', { code: 'MERGE_SAME_DIRECTORY', message: 'Input and output directories must be different' })
+  assert.equal(await work, null)
+  assert.equal(runtime.stateFor('merge').value.error, locale.tools.mergeSameDirectory)
+})

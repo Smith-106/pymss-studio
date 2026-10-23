@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 import traceback
@@ -95,6 +96,34 @@ class _DiskMixBuffer:
         self.path.unlink(missing_ok=True)
 
 
+def _rename_export_path(temporary: Path, path: Path) -> None:
+    """Move a completed file without replacing a concurrent output."""
+    if os.name == 'nt':
+        os.rename(temporary, path)
+        return
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        rename = getattr(library, 'renamex_np', None)
+        arguments = (os.fsencode(temporary), os.fsencode(path), 0x4)  # RENAME_EXCL
+        signature = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    elif sys.platform.startswith('linux'):
+        rename = getattr(library, 'renameat2', None)
+        arguments = (-100, os.fsencode(temporary), -100, os.fsencode(path), 1)  # AT_FDCWD, RENAME_NOREPLACE
+        signature = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    else:
+        rename = None
+    if rename is None:
+        raise OSError(errno.ENOTSUP, 'Atomic output publishing is unavailable', str(path))
+    rename.argtypes = signature
+    rename.restype = ctypes.c_int
+    if rename(*arguments) != 0:
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, os.strerror(code), str(path))
+
+
 def _publish_export_path(temporary: Path, path: Path) -> Path:
     """Atomically publish a completed export without overwriting an earlier mix."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,17 +134,12 @@ def _publish_export_path(temporary: Path, path: Path) -> Path:
         except FileExistsError:
             continue
         except OSError:
-            # Hard links may be unavailable on some network/removable filesystems.
-            # Keep the same no-overwrite behavior, then replace only our own placeholder.
+            # Filesystems without hard links use the platform's exclusive
+            # rename operation; never expose an empty final placeholder.
             try:
-                candidate.touch(exist_ok=False)
+                _rename_export_path(temporary, candidate)
             except FileExistsError:
                 continue
-            try:
-                os.replace(temporary, candidate)
-            except Exception:
-                candidate.unlink(missing_ok=True)
-                raise
             return candidate
         try:
             temporary.unlink(missing_ok=True)

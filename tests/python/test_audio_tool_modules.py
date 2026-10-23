@@ -528,7 +528,7 @@ class AudioToolModuleTests(unittest.TestCase):
             output.mkdir()
             with (
                 mock.patch.object(slicer, "_slice_intervals", return_value=[(0.5, 1.5), (2.0, 3.0)]),
-                mock.patch.object(slicer, "_render_segment") as render,
+                mock.patch.object(slicer, "_render_segment", side_effect=lambda source, target, *args: target.write_bytes(b'audio')) as render,
                 mock.patch.object(slicer, "emit"),
             ):
                 result = slicer._slice_audio({"inputs": [str(source)], "outputDir": str(output)})
@@ -556,7 +556,7 @@ class AudioToolModuleTests(unittest.TestCase):
             output.mkdir()
             with (
                 mock.patch.object(slicer, "_slice_intervals", side_effect=analyze),
-                mock.patch.object(slicer, "_render_segment"),
+                mock.patch.object(slicer, "_render_segment", side_effect=lambda source, target, *args: target.write_bytes(b'audio')),
                 mock.patch.object(slicer, "emit"),
             ):
                 result = slicer._slice_audio({

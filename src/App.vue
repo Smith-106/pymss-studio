@@ -211,6 +211,10 @@ function openRuntimeSettings() {
 
 async function installDeferredUpdate() {
   if (deferredUpdateInstalling.value) return
+  if (updates.installationBlockedReason) {
+    deferredUpdateError.value = updates.installationBlockedReason
+    return
+  }
   deferredUpdateInstalling.value = true
   deferredUpdateError.value = ''
   deferredUpdateModalVisible.value = false
@@ -218,6 +222,7 @@ async function installDeferredUpdate() {
     await updates.downloadAndInstall()
   } catch (error) {
     deferredUpdateError.value = error instanceof Error ? error.message : String(error)
+    if (!updates.isInstallOverlayVisible) deferredUpdateModalVisible.value = true
   } finally {
     deferredUpdateInstalling.value = false
   }
@@ -376,14 +381,17 @@ const themeOverrides = computed(() => {
             {{ t('settings.updateDeferred') }}
           </template>
           <div>{{ deferredUpdatePrompt }}</div>
-          <n-alert v-if="deferredUpdateError" type="error" :bordered="false" style="margin-top: 12px">
+          <n-alert v-if="updates.installationBlockedReason" type="info" :bordered="false" style="margin-top: 12px">
+            {{ updates.installationBlockedReason }}
+          </n-alert>
+          <n-alert v-if="deferredUpdateError && deferredUpdateError !== updates.installationBlockedReason" type="error" :bordered="false" style="margin-top: 12px">
             {{ deferredUpdateError }}
           </n-alert>
           <template #action>
             <n-button secondary :disabled="deferredUpdateInstalling" @click="keepDeferredUpdateForNextLaunch">
               {{ t('settings.updateRemindLater') }}
             </n-button>
-            <n-button type="primary" :loading="deferredUpdateInstalling" @click="installDeferredUpdate">
+            <n-button type="primary" :loading="deferredUpdateInstalling" :disabled="Boolean(updates.installationBlockedReason)" @click="installDeferredUpdate">
               {{ t('settings.installUpdate') }}
             </n-button>
           </template>
@@ -430,12 +438,12 @@ const themeOverrides = computed(() => {
           <div class="update-install-panel">
             <div class="update-install-panel__head">
               <strong>
-                {{ updates.status === 'failed' ? t('settings.updateInstallFailed') : updates.status === 'installing' ? t('settings.updateInstalling') : t('settings.updateDownloading') }}
+                {{ updates.status === 'restart-required' ? t('settings.updateRestartRequiredTitle') : updates.status === 'failed' ? t('settings.updateInstallFailed') : updates.status === 'installing' ? t('settings.updateInstalling') : t('settings.updateDownloading') }}
               </strong>
-              <span>{{ updates.status === 'failed' ? t('settings.updateInstallFailedHint') : t('settings.updateInstallOverlayHint') }}</span>
+              <span>{{ updates.status === 'restart-required' ? t('settings.updateRestartRequiredHint') : updates.status === 'failed' ? t('settings.updateInstallFailedHint') : t('settings.updateInstallOverlayHint') }}</span>
             </div>
             <n-progress
-              v-if="updates.status !== 'failed'"
+              v-if="updates.status !== 'failed' && updates.status !== 'restart-required'"
               type="line"
               :percentage="updates.downloadProgressPercent"
               :processing="updates.status === 'downloading'"
@@ -451,7 +459,7 @@ const themeOverrides = computed(() => {
             <p v-else-if="updates.status === 'installing'" class="update-install-panel__meta">
               {{ t('settings.updateInstallRestarting') }}
             </p>
-            <n-alert v-if="updates.status === 'failed' && updates.error" type="error" :bordered="false">
+            <n-alert v-if="(updates.status === 'failed' || updates.status === 'restart-required') && updates.error" type="error" :bordered="false">
               {{ updates.error }}
             </n-alert>
             <section v-if="updates.downloadLogs.length" class="update-install-panel__logs" aria-live="polite">
@@ -468,6 +476,10 @@ const themeOverrides = computed(() => {
             </section>
             <div v-if="updates.status === 'failed'" class="update-install-panel__actions">
               <n-button secondary @click="updates.dismissInstallError()">{{ t('common.close') }}</n-button>
+            </div>
+            <div v-else-if="updates.status === 'restart-required'" class="update-install-panel__actions">
+              <n-button secondary @click="updates.closeForUpdate()">{{ t('settings.updateCloseApplication') }}</n-button>
+              <n-button type="primary" @click="updates.retryUpdateExit()">{{ t('settings.updateRetryExit') }}</n-button>
             </div>
           </div>
         </n-modal>

@@ -826,6 +826,7 @@ const aboutVersionItems = computed(() => [
   { label: t('settings.workerVersion'), value: workerVersion.value, meta: t('settings.pythonWorker') },
 ])
 const updateStatusLabel = computed(() => {
+  if (updates.restartRequired) return t('settings.updateRestartRequiredTitle')
   if (!updateSupported.value) return t('settings.updateUnsupported')
   if (updates.requiresManualInstall) return t('settings.updateManualInstallTitle')
   if (updates.status === 'failed' && updates.installFailed) return t('settings.updateInstallFailed')
@@ -838,6 +839,7 @@ const updateStatusLabel = computed(() => {
   return t('settings.updateIdle')
 })
 const updateBadgeTone = computed(() => {
+  if (updates.restartRequired) return 'warning'
   if (!updateSupported.value) return 'default'
   if (updates.status === 'failed') return 'error'
   if (updates.shouldShowDeferred) return 'warning'
@@ -941,8 +943,8 @@ async function installUpdate() {
     if (!confirmed) return
     try {
       updateInstalling.value = true
-      await updates.downloadAndInstall()
-      message.success(t('settings.updateDeferredSaved'))
+      const exiting = await updates.downloadAndInstall()
+      if (exiting) message.success(t('settings.updateDeferredSaved'))
       return
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
@@ -1379,7 +1381,8 @@ onMounted(async () => {
                       v-else-if="updates.hasUpdate"
                       type="primary"
                       :loading="updateInstalling || updates.isInstallingUpdate"
-                      :disabled="updates.isBusy"
+                      :disabled="updates.isBusy || Boolean(updates.installationBlockedReason)"
+                      :title="updates.installationBlockedReason"
                       @click="installUpdate"
                     >
                       <template #icon><n-icon :component="CloudDownloadOutline" /></template>

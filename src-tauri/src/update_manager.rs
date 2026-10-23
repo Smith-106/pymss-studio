@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterBuilder, UpdaterExt};
@@ -40,6 +41,11 @@ use windows_sys::Win32::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const UPDATE_EVENT: &str = "pymss://managed-update-event";
+static UPDATE_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+pub fn restart_required() -> bool {
+    UPDATE_RESTART_REQUIRED.load(Ordering::SeqCst)
+}
 const UPDATE_ROOT: &str = "https://github.com/pymss-project/pymss-studio/releases/download/updater";
 const UPDATE_GENERATION: &str = "v1";
 const DEFAULT_UPDATE_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NzUyREY2NjAyNDVDQjAKUldTd1hDUmc5aTExcVFtUGM3ajB4R09ueU9xM3B6RG9xRDVKaUM0di9Qc1BpSGhYMXRFNUJvSWQK";
@@ -248,6 +254,19 @@ pub async fn check(
     }))
 }
 
+fn ensure_update_idle(state: &AppState, additional_windows: bool) -> AppResult<()> {
+    if additional_windows {
+        return Err(AppError::Worker("APPLICATION_UPDATE_WINDOWS: Close additional editor windows before installing the application update".into()));
+    }
+    if !state.tasks.lock().map_err(|_| AppError::Worker("Task registry lock poisoned".into()))?.is_empty()
+        || !state.native_tasks.lock().map_err(|_| AppError::Worker("Task registry lock poisoned".into()))?.is_empty()
+        || !state.migrations.lock().map_err(|_| AppError::Worker("Migration registry lock poisoned".into()))?.is_empty()
+    {
+        return Err(AppError::Worker("APPLICATION_UPDATE_BUSY: Wait for running tasks and model migrations to finish before updating".into()));
+    }
+    Ok(())
+}
+
 pub async fn start(
     app: &AppHandle,
     channel: UpdateChannel,
@@ -257,6 +276,13 @@ pub async fn start(
 ) -> AppResult<()> {
     let Some(_) = current_distribution() else {
         return Err(AppError::Worker("This application directory is not managed by an installer or portable package".into()));
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let application_guard = {
+        let guard = crate::python::worker::acquire_application_update()
+            .map_err(|error| AppError::Worker(format!("APPLICATION_UPDATE_BUSY: {error}")))?;
+        ensure_update_idle(&app.state::<AppState>(), app.webview_windows().keys().any(|label| label != "main"))?;
+        guard
     };
     let Some(checked) = check_sources(app, channel, endpoint_override, source).await?
     else {
@@ -294,7 +320,13 @@ pub async fn start(
             match download_archive(app, &candidate).await {
                 Ok(bytes) => {
                     let root = current_app_root()?;
-                    return stage_update(&root, &update.version, &update.signature, &bytes);
+                    stage_update(&root, &update.version, &update.signature, &bytes)?;
+                    UPDATE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+                    let _ = app.emit(UPDATE_EVENT, serde_json::json!({ "event": "RestartRequired" }));
+                    // The helper is now waiting for this process to exit. Keep
+                    // workers excluded through frontend persistence and exit.
+                    std::mem::forget(application_guard);
+                    return Ok(());
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -1678,6 +1710,17 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_update_rejects_native_tasks_and_additional_windows() {
+        let state = crate::state::AppState::new();
+        assert!(super::ensure_update_idle(&state, false).is_ok());
+        assert!(super::ensure_update_idle(&state, true).unwrap_err().to_string().contains("APPLICATION_UPDATE_WINDOWS"));
+        state.native_tasks.lock().unwrap().insert("audio-task".into(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        assert!(super::ensure_update_idle(&state, false).unwrap_err().to_string().contains("APPLICATION_UPDATE_BUSY"));
+        state.native_tasks.lock().unwrap().clear();
+        assert!(super::ensure_update_idle(&state, false).is_ok());
+    }
+
     use super::{
         distribution_at, elevated_helper_args, is_elevation_required, managed_endpoint,
         pending_archive_path, read_update_transaction, restore_portable_backup,

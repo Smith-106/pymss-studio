@@ -1579,8 +1579,9 @@ export const useModelStore = defineStore('model', () => {
   }
 
   async function removeCustomModel(name: string, deleteFiles = false) {
+    const settings = useSettingsStore()
     const result = await invoke<CustomModelRemoval>('unregister_custom_model', {
-      payload: { name, deleteFiles },
+      payload: { name, deleteFiles, modelDir: settings.modelDir || null },
     })
     await loadModels()
     return result

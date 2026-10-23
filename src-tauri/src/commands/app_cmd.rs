@@ -6,7 +6,7 @@ use crate::model_dir_migration::{
 };
 use crate::python::worker::{
     bundled_bin_dirs, cleanup_editor_export_temp_files, editor_export_task_token, run_worker_once,
-    run_worker_with_payload, spawn_worker_background,
+    run_worker_with_payload, spawn_worker_background, kill_process_tree,
 };
 use crate::session_log::{self, DebugLogContent, DebugLogInfo, DebugLogReport};
 use crate::state::{AppState, ProxySettings};
@@ -93,24 +93,6 @@ struct DebugRuntimeBackup {
 
 const DEBUG_RUNTIME_MAX_FILE_BYTES: usize = 256 * 1024;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .creation_flags(0x08000000)
-        .status();
-}
-
-#[cfg(not(windows))]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("pkill")
-        .args(["-TERM", "-P", &pid.to_string()])
-        .status();
-}
-
 #[tauri::command]
 pub fn get_build_info() -> BuildInfo {
     BuildInfo {
@@ -151,6 +133,11 @@ pub async fn start_managed_update(
     source: Option<update_manager::UpdateSource>,
 ) -> AppResult<()> {
     update_manager::start(&app, channel, endpoint_override, expected_version, source.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub fn get_managed_update_state() -> Value {
+    serde_json::json!({ "restartRequired": update_manager::restart_required() })
 }
 
 #[tauri::command]
@@ -1484,6 +1471,7 @@ async fn open_workflow_editor_window(
     payload: Value,
     kind: WorkflowEditorKind,
 ) -> AppResult<Value> {
+    let _application_access = crate::python::worker::acquire_application_operation()?;
     let _creation_guard = editors.creation_gate.lock().await;
     let workflow_id = payload
         .get("workflowId")
@@ -1633,6 +1621,7 @@ pub async fn open_editor_window(
         .ok_or_else(|| AppError::Worker("missing projectId".into()))?
         .to_string();
     validate_editor_project_id(&project_id)?;
+    let _application_access = crate::python::worker::acquire_application_operation()?;
     let _creation_guard = editors.creation_gate.lock().await;
     let label = format!("editor-{project_id}");
     if let Some(window) = app.get_webview_window(&label) {

@@ -15,11 +15,36 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[path = "audio_output.rs"]
+mod audio_output;
+
+pub(crate) fn recover_audio_output_temps(app: &AppHandle) {
+    if let Ok(directory) = storage::temp_dir(app) {
+        std::thread::spawn(move || audio_output::recover(&directory.join("audio-output-cleanup")));
+    }
+}
+
+fn needs_audio_output_scope(command: &str, payload: &Value) -> bool {
+    command == "audio_tools" && payload.get("operation").and_then(Value::as_str).is_some_and(|operation| {
+        ["convert", "merge", "slicer"].iter().any(|name| operation.trim().eq_ignore_ascii_case(name))
+    })
+}
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    #[cfg(not(windows))]
+    let _ = Command::new("pkill").args(["-TERM", "-P", &pid.to_string()]).status();
+}
 
 const PYTHON_TERMINAL_LOG_PREFIX: &str = "__PYMSS_STUDIO_TERMINAL_LOG__";
 static PROGRESS_LOG_TIMES: OnceLock<Mutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
@@ -57,7 +82,6 @@ static APPLICATION_ACCESS: Mutex<RuntimeAccess> = Mutex::new(RuntimeAccess {
     updating: false,
 });
 
-#[cfg(target_os = "macos")]
 pub(crate) fn acquire_application_update() -> AppResult<impl Drop> {
     acquire_runtime_access(&APPLICATION_ACCESS, "update_runtime_core")
         .map_err(|error| match error {
@@ -69,9 +93,10 @@ pub(crate) fn acquire_application_update() -> AppResult<impl Drop> {
         .ok_or_else(|| AppError::Worker("Unable to reserve the application for updating".into()))
 }
 
-fn acquire_application_operation() -> AppResult<Option<RuntimeAccessGuard<'static>>> {
+pub(crate) fn acquire_application_operation() -> AppResult<impl Drop + Send> {
     acquire_runtime_access(&APPLICATION_ACCESS, "application_operation")
-        .map_err(|_| AppError::Worker("An application update is in progress. Wait for it to finish before starting another operation.".into()))
+        .map_err(|_| AppError::Worker("An application update is in progress. Wait for it to finish before starting another operation.".into()))?
+        .ok_or_else(|| AppError::Worker("Unable to reserve the application for this operation".into()))
 }
 
 #[derive(Default)]
@@ -710,7 +735,9 @@ fn build_worker_command(
         cmd.env("PYTHONPATH", overlay.to_string_lossy().to_string());
     }
     // The collector owns persistence and terminal output. Never inherit legacy file writers.
-    cmd.env_remove("PYMSS_STUDIO_SESSION_LOG")
+    cmd.env_remove("PYMSS_STUDIO_AUDIO_TEMP_TOKEN")
+        .env_remove("PYMSS_STUDIO_AUDIO_TEMP_STATE")
+        .env_remove("PYMSS_STUDIO_SESSION_LOG")
         .env_remove("PYMSS_STUDIO_PERSISTENT_LOG")
         .env_remove("PYMSS_STUDIO_TERMINAL_LOG");
     if let Ok(dir) = storage::runtime_envs_dir(app) {
@@ -1525,7 +1552,7 @@ fn spawn_worker_background_inner(
     payload: Value,
     operation_id: String,
 ) -> AppResult<()> {
-    let mut application_access = acquire_application_operation()?;
+    let mut application_access = Some(acquire_application_operation()?);
     let mut runtime_access = acquire_runtime_access(&RUNTIME_ACCESS, command)?;
     let mut registered_task_ids = vec![task_id.clone()];
     if let Some(tasks) = payload.get("tasks").and_then(Value::as_array) {
@@ -1554,6 +1581,16 @@ fn spawn_worker_background_inner(
     }
 
     let command_name = command.to_string();
+    let mut audio_scope = if needs_audio_output_scope(command, &payload) {
+        let raw = payload.get("outputDir").and_then(Value::as_str).unwrap_or("").trim();
+        if raw.is_empty() { None } else {
+            let path = if raw == "~" { storage::home_dir(&app)? }
+                else if raw.starts_with("~/") || raw.starts_with("~\\") { storage::home_dir(&app)?.join(&raw[2..]) }
+                else { PathBuf::from(raw) };
+            let directory = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+            Some(audio_output::AudioOutputScope::create(&storage::temp_dir(&app)?.join("audio-output-cleanup"), directory)?)
+        }
+    } else { None };
     let editor_export_directory = (command == "export_editor_mix")
         .then(|| {
             payload
@@ -1570,6 +1607,7 @@ fn spawn_worker_background_inner(
             return Err(error);
         }
     };
+    if let Some(scope) = &audio_scope { scope.configure(&mut cmd); }
     let started_at = std::time::Instant::now();
     session_log::append(
         &app,
@@ -1587,6 +1625,15 @@ fn spawn_worker_background_inner(
             return Err(error.into());
         }
     };
+    if let Some(scope) = &mut audio_scope {
+        if let Err(error) = scope.attach(child.id()) {
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&payload_file);
+            return Err(error.into());
+        }
+    }
     let stdout = child
         .stdout
         .take()
@@ -1703,6 +1750,10 @@ fn spawn_worker_background_inner(
         if let Some(directory) = editor_export_directory.as_deref() {
             cleanup_editor_export_temp_files(directory, &task_id);
         }
+        if let Some(mut scope) = audio_scope.take() {
+            // Dropping here also handles a failed wait while both leases are held.
+            if exit_status.is_some() { scope.finish(); }
+        }
         drop(runtime_access.take());
         drop(application_access.take());
         // Finish Python cleanup before the terminal event starts the UI's environment refresh.
@@ -1813,6 +1864,16 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn audio_output_scopes_match_python_operation_normalization() {
+        for operation in ["convert", "Convert", " MERGE ", "\tsLiCeR\n"] {
+            assert!(super::needs_audio_output_scope("audio_tools", &json!({"operation": operation})));
+        }
+        assert!(!super::needs_audio_output_scope("audio_tools", &json!({"operation": "scan"})));
+        assert!(!super::needs_audio_output_scope("infer", &json!({"operation": "convert"})));
+        assert!(!super::needs_audio_output_scope("audio_tools", &json!({})));
+    }
+
+    #[test]
     fn core_update_excludes_parallel_runtime_users_in_both_directions() {
         let access = std::sync::Mutex::new(super::RuntimeAccess::default());
         let inference = super::acquire_runtime_access(&access, "infer").unwrap();
@@ -1865,6 +1926,47 @@ mod tests {
         };
         assert!(fail_start().is_err());
         assert!(super::acquire_runtime_access(&access, "update_runtime_core").is_ok());
+    }
+
+    #[test]
+    fn application_update_excludes_native_operations_for_their_thread_lifetime() {
+        let access = std::sync::Mutex::new(super::RuntimeAccess::default());
+        let operation = super::acquire_runtime_access(&access, "application_operation").unwrap();
+        assert!(super::acquire_runtime_access(&access, "update_runtime_core").is_err());
+        std::thread::scope(|scope| scope.spawn(move || drop(operation)).join().unwrap());
+        let update = super::acquire_runtime_access(&access, "update_runtime_core").unwrap();
+        assert!(super::acquire_runtime_access(&access, "application_operation").is_err());
+        drop(update);
+        assert!(super::acquire_runtime_access(&access, "application_operation").is_ok());
+    }
+
+    #[test]
+    fn editor_creation_and_update_reservations_exclude_each_other() {
+        let update = super::acquire_application_update().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // A delayed open request arriving after update reservation must fail.
+                assert!(super::acquire_application_operation().is_err());
+            }).join().unwrap();
+        });
+        drop(update);
+
+        std::thread::scope(|scope| {
+            let (started, pending) = std::sync::mpsc::channel();
+            let (resume, wait) = std::sync::mpsc::channel();
+            let opening = scope.spawn(move || {
+                let _creation_access = super::acquire_application_operation().unwrap();
+                started.send(()).unwrap();
+                // Cover an open request awaiting the shared window-creation gate.
+                wait.recv().unwrap();
+            });
+            pending.recv().unwrap();
+            let blocked = super::acquire_application_update().is_err();
+            resume.send(()).unwrap();
+            opening.join().unwrap();
+            assert!(blocked);
+        });
+        assert!(super::acquire_application_update().is_ok());
     }
 
     #[test]

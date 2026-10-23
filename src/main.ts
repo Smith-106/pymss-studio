@@ -86,7 +86,7 @@ async function bootstrap() {
   } catch (error: unknown) {
     studioLog.warn('Failed to load build info version', error)
   }
-  if (appState.buildInfoVersion && updates.hasPendingDeferredVersion(appState.buildInfoVersion)) {
+  if (!updates.restartRequired && appState.buildInfoVersion && updates.hasPendingDeferredVersion(appState.buildInfoVersion)) {
     updates.status = 'ready'
   }
   if (isTauriRuntime() && isMainTaskOwner()) {

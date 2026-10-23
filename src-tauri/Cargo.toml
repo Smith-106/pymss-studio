@@ -18,6 +18,7 @@ reqwest = { version = "0.13", default-features = false, features = ["socks", "sy
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 trash = "5"
 url = "2"
@@ -39,13 +40,11 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
-tempfile = "3"
 sha2 = "0.10"
 
 [dev-dependencies]
 flate2 = "1"
 tar = "0.4"
-tempfile = "3"
 sha2 = "0.10"
 
 # Keep line-level debugging for application code while avoiding oversized MSVC

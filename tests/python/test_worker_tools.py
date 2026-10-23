@@ -133,7 +133,7 @@ class WorkerToolsTests(unittest.TestCase):
                 (input_dir / name).write_bytes(b"")
 
             with (
-                mock.patch.object(tool_merge, "_run_ffmpeg") as run_ffmpeg,
+                mock.patch.object(tool_merge, "_run_ffmpeg", side_effect=lambda arguments: Path(arguments[-1]).write_bytes(b'audio')) as run_ffmpeg,
                 mock.patch.object(tool_merge, "emit"),
             ):
                 result = tool_merge._merge_audio({

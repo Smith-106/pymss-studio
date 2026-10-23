@@ -147,6 +147,7 @@ pub async fn start_tempo_key_analysis(
 }
 
 fn start_native_analysis(app: &AppHandle, state: &AppState, payload: Value) -> AppResult<Value> {
+    let application_access = crate::python::worker::acquire_application_operation()?;
     let request_id = payload
         .get("requestId")
         .and_then(Value::as_str)
@@ -180,6 +181,7 @@ fn start_native_analysis(app: &AppHandle, state: &AppState, payload: Value) -> A
     let handle = app.clone();
     let task_id = request_id.clone();
     std::thread::spawn(move || {
+        let _application_access = application_access;
         let result = run(&handle, &task_id, &inputs, &cancelled, bpm_only);
         let state = handle.state::<AppState>();
         let Ok(mut tasks) = state.native_tasks.lock() else {

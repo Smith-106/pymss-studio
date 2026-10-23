@@ -404,7 +404,8 @@
     "phaseDetailWritingSegments": "切点分析完成，正在从源文件导出音频片段。",
     "phaseDetailLoadingAsrModel": "正在加载识别、VAD 与标点模型；首次下载可能需要较长时间。",
     "phaseDetailRecognizingSpeech": "模型已就绪，正在检测有效语音并生成识别结果。",
-    "phaseDetailWritingTranscript": "识别完成，正在写入文本、时间轴与字幕文件。"
+    "phaseDetailWritingTranscript": "识别完成，正在写入文本、时间轴与字幕文件。",
+    "mergeSameDirectory": "输入目录与输出目录不能相同，请选择其他输出目录。"
   },
   "separate": {
     "title": "分离主页",
@@ -845,7 +846,8 @@
     "viewMode": "显示方式",
     "viewList": "列表",
     "viewCard": "卡片",
-    "downloadLogsFollow": "回到最新"
+    "downloadLogsFollow": "回到最新",
+    "customNamePathUnsafe": "模型名称不能包含路径、保留字符或设备名称。"
   },
   "results": {
     "typeAll": "全部类型",
@@ -1394,7 +1396,13 @@
     "themeAccentBlue": "默认蓝",
     "themeAccentPink": "淡粉色",
     "themeAccentSky": "淡蓝色",
-    "themeAccentTeal": "青绿色"
+    "themeAccentTeal": "青绿色",
+    "updateTasksBusy": "请等待正在运行的任务和模型目录迁移完成后再安装更新。",
+    "updateCloseEditors": "请关闭其他编辑器窗口后再安装更新。",
+    "updateRestartRequiredTitle": "需要退出应用",
+    "updateRestartRequiredHint": "更新已准备就绪，应用未能自动退出。请退出并重新打开应用；若版本未变化，请重新检查更新。",
+    "updateRetryExit": "重试退出",
+    "updateCloseApplication": "关闭应用"
   },
   "debug": {
     "title": "运行诊断",

@@ -384,7 +384,9 @@ export function createAudioToolRuntime(): AudioToolRuntime {
               errors[pending.tool] = t('tools.asrModelIncompleteError')
             }
             pendingRequest = undefined
-            pending.reject(new Error(String(workerEvent.payload?.message || 'Audio tool failed')))
+            const failure = workerEvent.payload?.code === 'MERGE_SAME_DIRECTORY'
+              ? t('tools.mergeSameDirectory') : String(workerEvent.payload?.message || 'Audio tool failed')
+            pending.reject(new Error(failure))
           }
           return
         }

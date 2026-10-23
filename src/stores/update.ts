@@ -4,15 +4,17 @@ import { computed, onScopeDispose, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { exit } from '@tauri-apps/plugin-process'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useAppStore } from '@/stores/app'
 import { useSettingsStore } from '@/stores/settings'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
 import { isMainTaskOwner } from '@/utils/taskOwner'
 import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
+import i18n from '@/i18n'
 
 const studioLog = createLogger('ui.stores.update')
 
-export type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'installing' | 'failed'
+export type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'installing' | 'restart-required' | 'failed'
 
 type UpdateStorePayload = {
   deferredVersion?: string
@@ -39,6 +41,7 @@ type UpdateDownloadEvent =
   | { event: 'Started'; data: { contentLength?: number | null } }
   | { event: 'Progress'; data: { chunkLength?: number; downloadedBytes?: number; contentLength?: number | null; speedBytesPerSecond?: number } }
   | { event: 'Finished'; data?: null }
+  | { event: 'RestartRequired'; data?: null }
 
 export type UpdateLogEntry = {
   at: string
@@ -70,6 +73,7 @@ export const useUpdateStore = defineStore('update', () => {
   const downloadLogs = ref<UpdateLogEntry[]>([])
   const installErrorVisible = ref(false)
   const installFailed = ref(false)
+  const restartRequired = ref(false)
   const initialized = ref(false)
   const autoCheckCompleted = ref(false)
   let updateCheckInFlight: Promise<ManagedUpdate | null> | null = null
@@ -77,14 +81,24 @@ export const useUpdateStore = defineStore('update', () => {
   let unlistenProgress: UnlistenFn | undefined
   let lastProgressLogAt = 0
   let lastProgressLogPercent = -1
+  let installInFlight = false
+  let exitInFlight: Promise<boolean> | null = null
 
   const hasUpdate = computed(() => availableUpdate.value !== null)
-  const isBusy = computed(() => ['checking', 'downloading', 'installing'].includes(status.value))
-  const isInstallingUpdate = computed(() => ['downloading', 'installing'].includes(status.value))
+  const isBusy = computed(() => restartRequired.value || ['checking', 'downloading', 'installing'].includes(status.value))
+  const isInstallingUpdate = computed(() => restartRequired.value || ['downloading', 'installing'].includes(status.value))
   const isInstallOverlayVisible = computed(() => isInstallingUpdate.value || installErrorVisible.value)
+  const installationBlockedReason = computed(() => {
+    const app = useAppStore()
+    const settings = useSettingsStore()
+    return app.runtimeInstallStatus === 'installing'
+      || app.runtimeCoreUpdateStatus === 'preparing' || app.runtimeCoreUpdateStatus === 'updating'
+      || settings.isModelDirMigrating
+      ? String(i18n.global.t('settings.updateTasksBusy')) : ''
+  })
   if (isMainTaskOwner()) {
     const removeCloseGuard = registerWindowCloseGuard(() => {
-      if (isInstallingUpdate.value) throw new Error('An application update is in progress. Wait for it to finish before closing.')
+      if (isInstallingUpdate.value && status.value !== 'restart-required') throw new Error('An application update is in progress. Wait for it to finish before closing.')
     }, 100)
     onScopeDispose(removeCloseGuard)
   }
@@ -140,6 +154,17 @@ export const useUpdateStore = defineStore('update', () => {
         lastAcceptedVersion.value = String(payload?.lastAcceptedVersion || '')
         if (isTauriRuntime()) {
           const nextUnlisten = await listen<UpdateDownloadEvent>('pymss://managed-update-event', (event) => {
+            if (event.payload.event === 'RestartRequired') {
+              restartRequired.value = true
+              // Progress events survive a renderer reload; only a local request
+              // can still own persistence and the automatic exit sequence.
+              if (!installInFlight && !exitInFlight) {
+                status.value = 'restart-required'
+                error.value = String(i18n.global.t('settings.updateRestartRequiredHint'))
+              }
+              return
+            }
+            if (restartRequired.value) return
             if (event.payload.event === 'SourceSelected') {
               selectedSource.value = event.payload.data.source
               downloadDownloadedBytes.value = 0
@@ -188,6 +213,16 @@ export const useUpdateStore = defineStore('update', () => {
           })
           unlistenProgress?.()
           unlistenProgress = nextUnlisten
+          try {
+            const pending = await invoke<{ restartRequired: boolean }>('get_managed_update_state')
+            if (pending?.restartRequired) {
+              restartRequired.value = true
+              status.value = 'restart-required'
+              error.value = String(i18n.global.t('settings.updateRestartRequiredHint'))
+            }
+          } catch (stateError) {
+            studioLog.warn('Failed to read application update state', stateError)
+          }
         }
         initialized.value = true
       })().finally(() => {
@@ -241,6 +276,7 @@ export const useUpdateStore = defineStore('update', () => {
 
   async function checkForUpdates(manual = false) {
     if (!isMainTaskOwner()) return null
+    if (restartRequired.value) return availableUpdate.value
     const app = useAppStore()
     const settings = useSettingsStore()
     if (!manual && autoCheckCompleted.value) return availableUpdate.value
@@ -263,6 +299,7 @@ export const useUpdateStore = defineStore('update', () => {
             endpointOverride: endpointOverride || null,
             source: settings.updateSource || 'auto',
           })
+          if (restartRequired.value) return availableUpdate.value
           currentVersion.value = update?.currentVersion || app.buildInfoVersion || ''
           lastCheckedAt.value = new Date().toISOString()
           if (!update) {
@@ -280,6 +317,7 @@ export const useUpdateStore = defineStore('update', () => {
           status.value = deferredVersion.value === update.version ? 'ready' : 'available'
           return update
         } catch (err) {
+          if (restartRequired.value) return availableUpdate.value
           error.value = err instanceof Error ? err.message : String(err)
           status.value = 'failed'
           throw err
@@ -294,7 +332,57 @@ export const useUpdateStore = defineStore('update', () => {
     })
   }
 
+  function requestUpdateExit(closeWindow: boolean): Promise<boolean> {
+    if (!restartRequired.value) return Promise.resolve(false)
+    if (exitInFlight) return exitInFlight
+    status.value = 'installing'
+    error.value = ''
+    exitInFlight = (async () => {
+      const bounded = async (request: Promise<unknown>) => {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([request, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Application exit request timed out')), 3000)
+          })])
+        } finally {
+          if (timer) clearTimeout(timer)
+        }
+      }
+      try {
+        if (closeWindow) {
+          await bounded(invoke('close_current_window'))
+        } else {
+          try {
+            await bounded(exit(0))
+          } catch (exitError) {
+            appendDownloadLog(`Application exit failed; closing the main window: ${exitError}`)
+            await bounded(getCurrentWindow().destroy())
+          }
+        }
+        return true
+      } catch (exitError) {
+        appendDownloadLog(`Application exit requires manual intervention: ${exitError}`)
+        error.value = String(i18n.global.t('settings.updateRestartRequiredHint'))
+        status.value = 'restart-required'
+        return false
+      } finally {
+        exitInFlight = null
+      }
+    })()
+    return exitInFlight
+  }
+
+  function retryUpdateExit() {
+    return requestUpdateExit(false)
+  }
+
+  function closeForUpdate() {
+    return requestUpdateExit(true)
+  }
+
   async function downloadAndInstall() {
+    if (restartRequired.value) return retryUpdateExit()
+    if (installationBlockedReason.value) throw new Error(installationBlockedReason.value)
     const update = availableUpdate.value
     if (!update) throw new Error('Update package is not available. Check for updates again.')
     if (!update.autoUpdateSupported || update.requiresManualInstall) {
@@ -306,6 +394,7 @@ export const useUpdateStore = defineStore('update', () => {
     error.value = ''
     installErrorVisible.value = false
     installFailed.value = false
+    installInFlight = true
     try {
       const settings = useSettingsStore()
       const endpointOverride = settings.developerMode ? settings.updateEndpointOverride.trim() : ''
@@ -321,6 +410,7 @@ export const useUpdateStore = defineStore('update', () => {
         return true
       }
       appendDownloadLog('Update package staged; restarting application')
+      restartRequired.value = true
       lastAcceptedVersion.value = update.version
       deferredVersion.value = ''
       deferredAt.value = ''
@@ -334,23 +424,28 @@ export const useUpdateStore = defineStore('update', () => {
         appendDownloadLog('Update state could not be saved; continuing with restart')
         studioLog.warn('Failed to persist update state after staging update', persistError)
       }
-      await exit(0)
-      return true
+      return await retryUpdateExit()
     } catch (err) {
-      error.value = err instanceof Error ? err.message : String(err)
-      appendDownloadLog(`Update failed: ${error.value}`)
+      const detail = err instanceof Error ? err.message : String(err)
+      error.value = detail.includes('APPLICATION_UPDATE_BUSY:') ? String(i18n.global.t('settings.updateTasksBusy'))
+        : detail.includes('APPLICATION_UPDATE_WINDOWS:') ? String(i18n.global.t('settings.updateCloseEditors')) : detail
+      appendDownloadLog(`Update failed: ${detail}`)
       status.value = 'failed'
       installErrorVisible.value = true
       installFailed.value = true
       throw err
+    } finally {
+      installInFlight = false
     }
   }
 
   function dismissInstallError() {
+    if (restartRequired.value) return
     installErrorVisible.value = false
   }
 
   async function deferUntilNextLaunch() {
+    if (restartRequired.value) return false
     const update = availableUpdate.value
     if (!update) return false
     deferredVersion.value = update.version
@@ -377,6 +472,7 @@ export const useUpdateStore = defineStore('update', () => {
   })
 
   function dismiss() {
+    if (restartRequired.value) return
     resetResult()
     status.value = 'idle'
   }
@@ -400,6 +496,7 @@ export const useUpdateStore = defineStore('update', () => {
     downloadProgressPercent,
     installErrorVisible,
     installFailed,
+    restartRequired,
     availableUpdate,
     deferredVersion,
     deferredAt,
@@ -412,9 +509,12 @@ export const useUpdateStore = defineStore('update', () => {
     isBusy,
     isInstallingUpdate,
     isInstallOverlayVisible,
+    installationBlockedReason,
     initialize,
     checkForUpdates,
     downloadAndInstall,
+    retryUpdateExit,
+    closeForUpdate,
     dismissInstallError,
     deferUntilNextLaunch,
     dismiss,

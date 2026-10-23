@@ -69,6 +69,8 @@ function environment(initial = {}) {
             return { models: [], categories: [], categoriesCn: [], modelDir: args.payload.modelDir }
           }
           if (command === 'get_model_storage_summary') return { models: [], modelDir: args.payload.modelDir }
+          if (command === 'get_managed_update_state') return { restartRequired: false }
+          if (command === 'unregister_custom_model') return { name: args.payload.name, deletedFiles: false, fileDeletionSupported: false, filesDeleted: [], errors: [] }
           if (command === 'confirm_model_dir_migration_switch') {
             if (++confirmCalls > 1) throw new Error('migration task not found')
             return { accepted: true }
@@ -106,6 +108,15 @@ const activeDownload = {
   taskId: 'download_a', model: 'Model', status: 'downloading', progress: 20,
   message: 'Downloading', completedFiles: 0, totalFiles: 1, updatedAt: 1, logs: [], seen: true,
 }
+
+test('custom model removal sends the configured model directory to the worker', async () => {
+  const env = environment()
+  const main = env.instance('main')
+  await main.settings.initialize()
+  await main.models.removeCustomModel('my_model', true)
+  const removal = env.calls.find(call => call.command === 'unregister_custom_model')
+  assert.deepEqual(removal.args.payload, { name: 'my_model', deleteFiles: true, modelDir: 'D:/old-models' })
+})
 
 test('secondary workflow and audio windows preserve active downloads without persisting cache', async () => {
   for (const label of ['workflow-simple-editor-a', 'workflow-node-editor-a', 'editor-a']) {
