@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia'
+import { createLogger } from '@/utils/logger'
+import { hasEditorEffects, prepareEditorExportEffects } from '@/utils/editorRender'
 import { computed, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -23,6 +25,8 @@ import type {
   EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
+
+const studioLog = createLogger('ui.stores.editor')
 
 export type {
   EditorExportFormat,
@@ -135,6 +139,7 @@ type PendingEditorExport = {
   id: string
   projectId: string
   exportDir?: string
+  progressOffset?: number
   resolve: (result: ExportResult) => void
   reject: (error: Error) => void
 }
@@ -592,6 +597,7 @@ export const useEditorStore = defineStore('editor', () => {
   let exportListenerPromise: Promise<void> | null = null
   let exportStartPromise: Promise<void> | null = null
   let exportCancelRequested = false
+  let exportRenderController: AbortController | null = null
   let exportRequestSequence = 0
 
   const canUndo = computed(() => undoStack.value.length > 0)
@@ -1755,10 +1761,13 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (workerEvent.type === 'editor_export_progress') {
           const payload = workerEvent.payload || {}
+          const total = Math.max(1, Number(payload.total || 100))
+          const completed = Math.max(0, Number(payload.completed || 0))
+          const offset = pending.progressOffset || 0
           exportProgress.value = {
             phase: String(payload.phase || 'preparing') as EditorExportProgress['phase'],
-            completed: Math.max(0, Number(payload.completed || 0)),
-            total: Math.max(1, Number(payload.total || 100)),
+            completed: offset ? offset + Math.min(1, completed / total) * (100 - offset) : completed,
+            total: offset ? 100 : total,
             current: String(payload.current || ''),
           }
           return
@@ -1778,7 +1787,10 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (workerEvent.type === 'error') {
           pendingExport = null
-          pending.reject(new Error(String(workerEvent.payload?.message || 'Editor export failed')))
+          const message = workerEvent.payload?.code === 'EDITOR_EXPORT_PEAK_EXCEEDED'
+            ? String(i18n.global.t('editor.exportPeakExceeded'))
+            : String(workerEvent.payload?.message || 'Editor export failed')
+          pending.reject(new Error(message))
         }
       }).then((unlisten) => {
         exportUnlisten = unlisten
@@ -1798,6 +1810,10 @@ export const useEditorStore = defineStore('editor', () => {
       : (options || {})
     const fmt = normalized.format || exportFormat.value
     const taskId = `editor_export_${Date.now().toString(36)}_${++exportRequestSequence}_${Math.random().toString(36).slice(2, 8)}`
+    const snapshot = JSON.parse(JSON.stringify(session.value)) as EditorSession
+    const renderController = new AbortController()
+    exportRenderController = renderController
+    const renderRequired = snapshot.tracks.some(track => hasEditorEffects(track.effects))
     exporting.value = true
     exportCancelling.value = false
     exportCancelRequested = false
@@ -1806,11 +1822,18 @@ export const useEditorStore = defineStore('editor', () => {
     try {
       await ensureEditorExportListener()
       if (exportCancelRequested) throw new EditorExportCancelledError()
+      const prepared = await prepareEditorExportEffects(snapshot, taskId, renderController.signal, (ratio, current) => {
+        exportProgress.value = { phase: 'rendering', completed: Math.floor(ratio * 75), total: 100, current }
+      })
+      exportRenderController = null
+      if (exportCancelRequested) throw new EditorExportCancelledError()
+      const project = prepared.session
       const completion = new Promise<ExportResult>((resolve, reject) => {
         pendingExport = {
           id: taskId,
-          projectId: session.value!.id,
+          projectId: snapshot.id,
           exportDir: normalized.exportDir,
+          progressOffset: prepared.session !== snapshot ? 75 : 0,
           resolve,
           reject,
         }
@@ -1823,12 +1846,13 @@ export const useEditorStore = defineStore('editor', () => {
           fileName: normalized.fileName,
           audioParams: normalized.audioParams || {},
           project: {
-            id: session.value.id,
-            name: session.value.name,
-            masterVolume: session.value.masterVolume,
-            masterPan: session.value.masterPan,
-            assets: session.value.sources.map(sourceToExportAsset),
-            tracks: session.value.tracks.map((track) => trackToExportTrack(track, sourceMap.value.get(track.sourceId))),
+            id: project.id,
+            name: project.name,
+            masterVolume: project.masterVolume,
+            masterPan: project.masterPan,
+            sourceSampleRate: prepared.sourceSampleRate,
+            assets: project.sources.map(sourceToExportAsset),
+            tracks: project.tracks.map((track) => trackToExportTrack(track, project.sources.find(source => source.id === track.sourceId))),
           },
         },
       }).then(() => undefined)
@@ -1839,16 +1863,23 @@ export const useEditorStore = defineStore('editor', () => {
       return result
     } catch (error) {
       if (pendingExport?.id === taskId) pendingExport = null
-      lastError.value = error instanceof EditorExportCancelledError
+      const failure = renderController.signal.aborted ? new EditorExportCancelledError() : error
+      lastError.value = failure instanceof EditorExportCancelledError
         ? null
-        : error instanceof Error ? error.message : String(error)
-      throw error
+        : failure instanceof Error ? failure.message : String(failure)
+      throw failure
     } finally {
+      if (renderRequired) {
+        await invoke('cleanup_editor_export_render', { projectId: snapshot.id, taskId }).catch(error => {
+          studioLog.warn('Failed to clean up editor render files', error)
+        })
+      }
       exporting.value = false
       exportCancelling.value = false
       exportProgress.value = null
       exportStartPromise = null
       exportCancelRequested = false
+      exportRenderController = null
     }
   }
 
@@ -1867,6 +1898,10 @@ export const useEditorStore = defineStore('editor', () => {
     exportCancelling.value = true
     exportCancelRequested = true
     try {
+      if (exportRenderController) {
+        exportRenderController.abort()
+        return true
+      }
       if (exportStartPromise) await exportStartPromise
       if (!pendingExport) return true
       return cancelPendingExportTask(pendingExport)

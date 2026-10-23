@@ -65,8 +65,6 @@ const sampleRateSummary = computed(() => props.sampleRate === 'auto'
   ? t('editor.exportSampleRateStrategyValue')
   : `${props.sampleRate} Hz`)
 
-const peakProtectionRequired = computed(() => props.format !== 'wav' || props.wavBitDepth !== 'FLOAT')
-
 const exportSummaryRows = computed(() => [
   { label: t('editor.totalDuration'), value: props.duration ? `${Math.round(props.duration * 10) / 10}s` : '0s' },
   { label: t('editor.tracks'), value: String(props.trackCount) },
@@ -152,13 +150,12 @@ const exportSummaryRows = computed(() => [
             </label>
 
             <label class="export-dialog__field export-dialog__field--switch">
-              <span>
+              <span :title="t('editor.exportPeakProtectionHint')">
                 {{ t('editor.exportPeakProtection') }}
-                <small v-if="peakProtectionRequired">{{ t('editor.exportPeakProtectionRequired') }}</small>
               </span>
               <n-switch
-                :value="peakProtectionRequired || peakProtection"
-                :disabled="exporting || peakProtectionRequired"
+                :value="peakProtection"
+                :disabled="exporting"
                 @update:value="(value: boolean) => emit('update:peak-protection', value)"
               />
             </label>

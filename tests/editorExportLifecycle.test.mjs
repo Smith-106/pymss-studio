@@ -51,6 +51,7 @@ function environment({ startGate, cancelAccepted = true } = {}) {
           return null
         }
         calls.push({ command, args })
+        if (command === 'cleanup_editor_export_render') return null
         if (command === 'start_editor_mix_export') {
           if (startGate) await startGate.promise
           return { taskId: args.payload.taskId, started: true }
@@ -168,4 +169,60 @@ test('a late cancellation cannot replace an already accepted completion event', 
   const result = await exporting
   assert.equal(result.path, 'D:/mix.wav')
   assert.equal(env.store.lastError, null)
+})
+
+test('cancelling effect rendering does not start a worker and cleans its private files', async t => {
+  const gate = deferred()
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
+  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
+    sampleRate = 48000
+    close() { return gate.promise }
+  } })
+  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
+  const env = environment()
+  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: 0, delay: 0, delayTime: .24 }
+  const original = JSON.stringify(env.store.session)
+  const exporting = env.store.exportMix({ format: 'wav' })
+  const rejected = assert.rejects(exporting, EditorExportCancelledError)
+  await flush()
+  assert.equal(await env.store.cancelExport(), true)
+  gate.resolve()
+  await rejected
+  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'cleanup_editor_export_render').length, 1)
+  assert.equal(env.store.exporting, false)
+  assert.equal(env.store.lastError, null)
+  assert.equal(JSON.stringify(env.store.session), original)
+})
+
+test('a renderer failure reports its cause and never falls back to different audio effects', async t => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
+  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
+    constructor() { throw new Error('Audio renderer unavailable') }
+  } })
+  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
+  const env = environment()
+  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: 0, delay: 0, delayTime: .24 }
+  await assert.rejects(env.store.exportMix(), /Audio renderer unavailable/)
+  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'cleanup_editor_export_render').length, 1)
+  assert.equal(env.store.exporting, false)
+  assert.equal(env.store.lastError, 'Audio renderer unavailable')
+})
+
+test('long effect clips are rejected before native audio allocation or cache writes', async t => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
+  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
+    sampleRate = 48000
+    async close() {}
+  } })
+  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
+  const env = environment()
+  env.store.session.sources[0].duration = 3600
+  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: .35, delay: 0, delayTime: .24 }
+  await assert.rejects(env.store.exportMix(), /memory limit|内存限制/)
+  assert.equal(env.calls.filter(call => call.command === 'editor_preview_chunk').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'append_editor_export_render_chunk').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
+  assert.equal(env.store.exporting, false)
 })

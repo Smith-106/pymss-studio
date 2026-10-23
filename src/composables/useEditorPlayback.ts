@@ -2,6 +2,7 @@ import { onBeforeUnmount, type Ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
+import { applyEditorTrackEffects } from '@/utils/editorEffects'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '@/utils/editorClips'
 import { createEditorAudioElement, createPreviewChunkReader, EditorTimelinePlayback, type TimelineAudioClip } from '@/utils/editorAudio'
 import type { EditorClip, EditorSource, EditorTrack } from '@/types/editor'
@@ -113,7 +114,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
   let masterMeterSplitter: ChannelSplitterNode | null = null
   let masterMeterAnalyserLeft: AnalyserNode | null = null
   let masterMeterAnalyserRight: AnalyserNode | null = null
-  let reverbImpulseBuffer: AudioBuffer | null = null
   const analyserBufferCache = new WeakMap<AnalyserNode, Uint8Array<ArrayBuffer>>()
   const audioParamValueCache = new WeakMap<AudioParam, number>()
 
@@ -206,84 +206,8 @@ export function useEditorPlayback(options: PlaybackOptions) {
     }
   }
 
-  function getReverbImpulseBuffer(ctx: AudioContext) {
-    if (reverbImpulseBuffer && reverbImpulseBuffer.sampleRate === ctx.sampleRate) return reverbImpulseBuffer
-    const length = Math.max(1, Math.floor(ctx.sampleRate * 1.35))
-    const buffer = ctx.createBuffer(2, length, ctx.sampleRate)
-    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-      const data = buffer.getChannelData(channel)
-      for (let index = 0; index < data.length; index += 1) {
-        const decay = Math.pow(1 - index / data.length, 2.4)
-        const stereoDelay = channel === 1 && index < Math.floor(ctx.sampleRate * 0.013)
-        const noise = Math.sin((index + 1) * 12.9898 + channel * 78.233) * 43758.5453
-        const unitNoise = (noise - Math.floor(noise)) * 2 - 1
-        data[index] = stereoDelay ? 0 : unitNoise * decay * (index === 0 ? 0.7 : 0.22)
-      }
-    }
-    reverbImpulseBuffer = buffer
-    return buffer
-  }
-
   function applyTrackEffects(entry: ManagedAudio, track: EditorTrack) {
-    if (!entry.clarityFilter || !entry.compressorNode || !entry.effectDryGain || !entry.reverbWetGain || !entry.delayWetGain || !entry.delayNode || !entry.delayFeedbackGain) return
-    const effects = track.effects
-    const reverb = clamp(Number(effects?.reverb ?? 0), 0, 1)
-    const delay = clamp(Number(effects?.delay ?? 0), 0, 1)
-    const delayTime = clamp(Number(effects?.delayTime ?? 0.24), 0.05, 1.2)
-    const clarity = clamp(Number(effects?.clarity ?? 0), 0, 1)
-    const compressor = clamp(Number(effects?.compressor ?? 0), 0, 1)
-    const signature = [reverb, delay, delayTime, clarity, compressor].join(':')
-    if (entry.effectsSignature === signature) return
-    entry.effectsSignature = signature
-    entry.clarityFilter.type = 'highpass'
-    entry.clarityFilter.frequency.value = 20 + clarity * 180
-    entry.clarityFilter.Q.value = 0.7
-    entry.compressorNode.threshold.value = compressor > 0 ? -36 + compressor * 14 : -100
-    entry.compressorNode.ratio.value = compressor > 0 ? 1 + compressor * 7 : 1
-    entry.compressorNode.knee.value = compressor > 0 ? 18 : 0
-    entry.compressorNode.attack.value = 0.003
-    entry.compressorNode.release.value = 0.25
-    entry.effectDryGain.gain.value = 1
-    entry.reverbWetGain.gain.value = reverb * 0.45
-    entry.delayWetGain.gain.value = delay * 0.38
-    entry.delayNode.delayTime.value = delayTime
-    entry.delayFeedbackGain.gain.value = delay * 0.52
-
-    // A zero wet gain does not stop upstream DSP. Keep disabled effects out
-    // of the render graph, and only rebuild this routing when settings change.
-    if (!entry.balanceMerger || !entry.effectOutputGain) return
-    const routingSignature = [clarity > 0, compressor > 0, reverb > 0, delay > 0].join(':')
-    if (entry.effectsRoutingSignature === routingSignature) return
-    entry.effectsRoutingSignature = routingSignature
-    entry.balanceMerger.disconnect()
-    entry.clarityFilter.disconnect()
-    entry.compressorNode.disconnect()
-    entry.reverbNode?.disconnect()
-    entry.delayNode.disconnect()
-    entry.delayFeedbackGain.disconnect()
-    let input: AudioNode = entry.balanceMerger
-    if (clarity > 0) {
-      input.connect(entry.clarityFilter)
-      input = entry.clarityFilter
-    }
-    if (compressor > 0) {
-      input.connect(entry.compressorNode)
-      input = entry.compressorNode
-    }
-    input.connect(entry.effectDryGain)
-    if (reverb > 0 && entry.reverbNode) {
-      if (!entry.reverbNode.buffer && audioContext) {
-        entry.reverbNode.buffer = getReverbImpulseBuffer(audioContext)
-      }
-      input.connect(entry.reverbNode)
-      entry.reverbNode.connect(entry.reverbWetGain)
-    }
-    if (delay > 0) {
-      input.connect(entry.delayNode)
-      entry.delayNode.connect(entry.delayFeedbackGain)
-      entry.delayFeedbackGain.connect(entry.delayNode)
-      entry.delayNode.connect(entry.delayWetGain)
-    }
+    if (audioContext) applyEditorTrackEffects(entry, track.effects, audioContext)
   }
 
   function applyMasterAudioSettings() {

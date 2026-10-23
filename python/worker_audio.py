@@ -213,20 +213,49 @@ def _waveform_peaks_soundfile(path: Path, resolution: int) -> tuple[list[float],
 def _resample_audio(audio: Any, source_rate: int, target_rate: int) -> Any:
     if source_rate == target_rate:
         return audio
-    import librosa  # type: ignore
+    import numpy as np  # type: ignore
 
-    return librosa.resample(audio, orig_sr=source_rate, target_sr=target_rate)
+    try:
+        import soxr  # type: ignore
+    except ImportError:
+        import librosa  # type: ignore
+
+        return librosa.resample(audio, orig_sr=source_rate, target_sr=target_rate)
+
+    # Use the same HQ resampler as librosa without initializing its analysis/JIT
+    # modules. SoXR expects frame-first arrays; the editor uses channel-first.
+    samples = np.asarray(audio)
+    if samples.shape[-1] == 0:
+        return samples.copy()
+    resampled = soxr.resample(samples.T, source_rate, target_rate, quality="HQ").T
+    expected_frames = math.ceil(samples.shape[-1] * target_rate / source_rate)
+    if resampled.shape[-1] < expected_frames:
+        padding = [(0, 0)] * resampled.ndim
+        padding[-1] = (0, expected_frames - resampled.shape[-1])
+        resampled = np.pad(resampled, padding)
+    return resampled[..., :expected_frames]
 
 
 def _read_audio(path: Path, target_rate: int | None = None) -> tuple[Any, int]:
-    import librosa  # type: ignore
+    import soundfile as sf  # type: ignore
 
-    audio, sr = librosa.load(str(path), sr=target_rate, mono=False)
-    import numpy as np  # type: ignore
+    try:
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError):
+        # Keep librosa's decoder fallback for formats not supported by libsndfile.
+        import librosa  # type: ignore
+        import numpy as np  # type: ignore
 
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.ndim == 1:
-        audio = audio.reshape(1, -1)
+        audio, sr = librosa.load(str(path), sr=target_rate, mono=False)
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim == 1:
+            audio = audio.reshape(1, -1)
+        return audio, int(sr)
+
+    audio = audio.T
+    if target_rate is not None and sr != target_rate:
+        audio = _resample_audio(audio, int(sr), target_rate)
+        sr = target_rate
     return audio, int(sr)
 
 
@@ -482,7 +511,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             track for track in tracks
             if not track.get("muted") and (track.get("sourceId") or track.get("clips"))
         ]
-        has_solo = any(bool(track.get("solo")) for track in active_tracks)
+        has_solo = any(bool(track.get("solo")) for track in tracks)
         audio_cache: dict[str, tuple[Any, int]] = {}
         target_rate: int | None = None
         rendered_clip_count = 0
@@ -575,6 +604,11 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
                 for _, _, source in render_items
                 if int(source.get("sampleRate") or 0) > 0
             }
+            # Native effects use the preview clock; keep the original sources'
+            # sample-rate selection for the final automatic export encoding.
+            original_rate = int(project.get("sourceSampleRate") or 0)
+            if 8000 <= original_rate <= 48000:
+                source_rates = {original_rate}
             if not source_rates:
                 for source in {str(item[2].get("id") or item[2].get("path")): item[2] for item in render_items}.values():
                     metadata = _audio_metadata(Path(source.get("path") or ""))
@@ -716,7 +750,12 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             audio_params.get("wav_bit_depth") or audio_params.get("wavBitDepth") or "PCM_24"
         ).upper()
         float_output = output_format == "wav" and requested_wav_subtype == "FLOAT"
-        peak_protection = True if not float_output or peak_protection_value is None else bool(peak_protection_value)
+        peak_protection = bool(peak_protection_value)
+        if not float_output and peak > 1.0 and not peak_protection:
+            return fail(
+                "EDITOR_EXPORT_PEAK_EXCEEDED",
+                "Mix peaks exceed the output format's range. Lower the master volume, use WAV FLOAT, or enable peak protection.",
+            )
         peak_adjustment_db = 0.0
         peak_protection_applied = peak_protection and peak > 1.0
         output_gain = 1.0

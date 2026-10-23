@@ -8,6 +8,7 @@ import { createPinia, setActivePinia, storeToRefs } from 'pinia'
 import { useEditorPlaybackStore } from '../src/stores/editorPlayback.ts'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '../src/utils/editorClips.ts'
 import { EditorTimelinePlayback } from '../src/utils/editorAudio.ts'
+import { applyEditorTrackEffects } from '../src/utils/editorEffects.ts'
 
 const source = ts.createSourceFile('playback.ts', readFileSync(new URL('../src/composables/useEditorPlayback.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
 const code = ts.transpileModule(source.statements.filter(item => !ts.isImportDeclaration(item)).map(item => item.getText(source)).join('\n').replace('export function useEditorPlayback', 'function useEditorPlayback'), {
@@ -133,6 +134,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
     masterVolume: 1, masterPan: 0,
   })
   const create = vm.runInNewContext(`${code}\nuseEditorPlayback`, {
+    applyEditorTrackEffects,
     watch, storeToRefs, useEditorPlaybackStore, clipIsActive, clipMediaTime, clipsForTrack, EditorTimelinePlayback,
     createPreviewChunkReader: () => async () => {
       chunkReads++

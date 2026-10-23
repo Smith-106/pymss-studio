@@ -29,7 +29,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
   const exportWavBitDepthDraft = ref('PCM_24')
   const exportFlacBitDepthDraft = ref('PCM_24')
   const exportSampleRateDraft = ref<EditorExportSampleRate>('auto')
-  const exportPeakProtectionDraft = ref(true)
+  const exportPeakProtectionDraft = ref(false)
   const exportFileNameDraft = ref('')
   const exportDirDraft = ref('')
   const exportDirPicking = ref(false)
@@ -124,9 +124,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
       const format = exportFormatDraft.value
       const wavBitDepth = exportWavBitDepthDraft.value
       const flacBitDepth = exportFlacBitDepthDraft.value
-      const peakProtection = format !== 'wav'
-        || wavBitDepth !== 'FLOAT'
-        || exportPeakProtectionDraft.value
+      const peakProtection = exportPeakProtectionDraft.value
       const result = await editor.exportMix({
         format,
         exportDir: exportDirDraft.value.trim() || undefined,

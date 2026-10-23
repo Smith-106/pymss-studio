@@ -18,7 +18,7 @@ export function createEditorAudioElement(url: string): HTMLAudioElement {
 }
 
 /** Limit native decoders so prefetching six stems cannot flood the machine. */
-export function createPreviewChunkReader(context: AudioContext) {
+export function createPreviewChunkReader(context: BaseAudioContext) {
   let active = 0
   const pending: Array<() => void> = []
   const cancelled = () => new DOMException('Preview decoding cancelled', 'AbortError')
@@ -393,46 +393,7 @@ export class EditorTimelinePlayback {
     const start = Math.max(slice.start, this.currentTime)
     const end = slice.end
     if (end <= start) return
-    const fadeIn = Math.min(clip.duration, Math.max(0, clip.fadeIn || 0))
-    const fadeOut = Math.min(clip.duration, Math.max(0, clip.fadeOut || 0))
-    const clipEnd = clip.start + clip.duration
-    const gainAt = (time: number) => Math.max(0, clip.volume)
-      * (fadeIn > 0 ? Math.min(1, Math.max(0, (time - clip.start) / fadeIn)) : 1)
-      * (fadeOut > 0 ? Math.min(1, Math.max(0, (clipEnd - time) / fadeOut)) : 1)
-    const points = [start, end]
-    for (const point of [clip.start + fadeIn, clipEnd - fadeOut]) {
-      if (point > start && point < end) points.push(point)
-    }
-    const param = slice.gain.gain
-    const when = this.origin + start - this.offset
-    // Cancel the previous curve from its start too, so a live edit cannot
-    // overlap an in-flight setValueCurveAtTime event.
-    param.cancelScheduledValues(0)
-    points.sort((a, b) => a - b)
-    if (fadeIn > 0 && fadeOut > 0 && fadeIn + fadeOut > clip.duration) {
-      // Export and the original preview multiply the two fades. Their overlap
-      // is curved. Keep the fade corners exact, even when one fade is much
-      // shorter than the whole chunk. Adjacent curves share an endpoint.
-      let curveStart = when
-      for (let index = 1; index < points.length; index++) {
-        const left = points[index - 1], right = points[index]
-        const middle = (left + right) / 2
-        const curved = middle < clip.start + fadeIn && middle > clipEnd - fadeOut
-        const length = curved ? 257 : 2
-        const values = Float32Array.from({ length }, (_, sample) => gainAt(left + (right - left) * sample / (length - 1)))
-        const duration = this.origin + right - this.offset - curveStart
-        if (duration <= 0) continue
-        param.setValueCurveAtTime(values, curveStart, duration)
-        // Use the same addition as the native event's end, preventing tiny
-        // floating-point overlaps between otherwise adjacent curve events.
-        curveStart += duration
-      }
-      return
-    }
-    param.setValueAtTime(gainAt(start), when)
-    for (const point of points.slice(1)) {
-      param.linearRampToValueAtTime(gainAt(point), this.origin + point - this.offset)
-    }
+    scheduleEditorClipGain(slice.gain.gain, clip, start, end, this.origin, this.offset)
   }
 
   private clearSlices() {
@@ -443,5 +404,47 @@ export class EditorTimelinePlayback {
       gain.disconnect()
     }
     this.slices.clear()
+  }
+}
+
+export function scheduleEditorClipGain(param: AudioParam, clip: EditorClip, start: number, end: number, origin: number, offset = 0) {
+  const when = origin + start - offset
+  const fadeIn = Math.min(clip.duration, Math.max(0, clip.fadeIn || 0))
+  const fadeOut = Math.min(clip.duration, Math.max(0, clip.fadeOut || 0))
+  const clipEnd = clip.start + clip.duration
+  const gainAt = (time: number) => Math.max(0, clip.volume)
+    * (fadeIn > 0 ? Math.min(1, Math.max(0, (time - clip.start) / fadeIn)) : 1)
+    * (fadeOut > 0 ? Math.min(1, Math.max(0, (clipEnd - time) / fadeOut)) : 1)
+  const points = [start, end]
+  for (const point of [clip.start + fadeIn, clipEnd - fadeOut]) {
+    if (point > start && point < end) points.push(point)
+  }
+  // Cancel the previous curve from its start too, so a live edit cannot
+  // overlap an in-flight setValueCurveAtTime event.
+  param.cancelScheduledValues(0)
+  points.sort((a, b) => a - b)
+  if (fadeIn > 0 && fadeOut > 0 && fadeIn + fadeOut > clip.duration) {
+    // Export and the original preview multiply the two fades. Their overlap
+    // is curved. Keep the fade corners exact, even when one fade is much
+    // shorter than the whole chunk. Adjacent curves share an endpoint.
+    let curveStart = when
+    for (let index = 1; index < points.length; index++) {
+      const left = points[index - 1], right = points[index]
+      const middle = (left + right) / 2
+      const curved = middle < clip.start + fadeIn && middle > clipEnd - fadeOut
+      const length = curved ? 257 : 2
+      const values = Float32Array.from({ length }, (_, sample) => gainAt(left + (right - left) * sample / (length - 1)))
+      const duration = origin + right - offset - curveStart
+      if (duration <= 0) continue
+      param.setValueCurveAtTime(values, curveStart, duration)
+      // Use the same addition as the native event's end, preventing tiny
+      // floating-point overlaps between otherwise adjacent curve events.
+      curveStart += duration
+    }
+    return
+  }
+  param.setValueAtTime(gainAt(start), when)
+  for (const point of points.slice(1)) {
+    param.linearRampToValueAtTime(gainAt(point), origin + point - offset)
   }
 }
