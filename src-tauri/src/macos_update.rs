@@ -24,7 +24,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn previous_bundle(target: &Path) -> PathBuf {
+fn legacy_previous_bundle(target: &Path) -> PathBuf {
     let identity = sha256_hex(target.as_os_str().as_encoded_bytes());
     target
         .parent()
@@ -142,25 +142,69 @@ fn extract_bundle(archive: &Path, destination: &Path) -> AppResult<PathBuf> {
     Ok(bundle)
 }
 
-// Keep the old bundle outside temporary directories: failed restoration must never let
-// a TempDir destructor delete the user's only remaining application.
+// Filesystems without directory exchange support still install the validated
+// staged bundle directly. No application backup or rollback is created.
 fn replace_bundle_with(
     target: &Path,
     staged: &Path,
-    backup: &Path,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> AppResult<()> {
-    rename(target, backup)?;
-    if let Err(error) = rename(staged, target) {
-        return match rename(backup, target) {
-            Ok(()) => Err(error.into()),
-            Err(restore) => Err(failure(format!(
-                "Application replacement failed: {error}. Restoration failed: {restore}. The previous application is preserved at {}",
-                backup.display()
-            ))),
-        };
+    if !staged.is_dir() {
+        return Err(failure("The staged application is unavailable"));
     }
+    fs::remove_dir_all(target)?;
+    rename(staged, target)?;
     Ok(())
+}
+
+fn cleanup_legacy_stages_with(
+    parent: &Path,
+    current: Option<&Path>,
+    mut process_active: impl FnMut(u32) -> bool,
+    mut validate: impl FnMut(&Path) -> AppResult<()>,
+) -> usize {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to inspect previous macOS update directories: {error}"));
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(".pymss-studio-update-")) else { continue };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) { continue; }
+        let directory = entry.path();
+        if current == Some(directory.as_path())
+            || !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()) {
+            continue;
+        }
+        let contents = match fs::read_dir(&directory).and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>()) {
+            Ok(contents) if !contents.is_empty() => contents,
+            _ => continue,
+        };
+        if contents.iter().any(|item| !matches!(item.file_name().to_str(), Some(BUNDLE_NAME | "obsolete.app" | ".pymss-update-active"))) {
+            continue;
+        }
+        let marker = directory.join(".pymss-update-active");
+        if let Ok(metadata) = fs::symlink_metadata(&marker) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() { continue; }
+            let expired = metadata.modified().ok().and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
+            let mut value = String::new();
+            use std::io::Read;
+            if fs::File::open(&marker).and_then(|file| file.take(64).read_to_string(&mut value)).is_err() { continue; }
+            if !expired && value.trim().parse::<u32>().ok().is_some_and(&mut process_active) { continue; }
+        }
+        let bundles: Vec<_> = contents.iter().filter(|item| item.file_name() != ".pymss-update-active").collect();
+        if bundles.is_empty() || bundles.iter().any(|item| validate(&item.path()).is_err()) { continue; }
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => removed += 1,
+            Err(error) => crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clean a previous macOS update directory: {error}")),
+        }
+    }
+    removed
 }
 
 fn shell_quote(value: &str) -> String {
@@ -427,84 +471,47 @@ mod platform {
         source: &Path,
         version: &str,
         size: u64,
-    ) -> AppResult<PathBuf> {
+    ) -> AppResult<()> {
         let parent = target.parent().unwrap();
         require_space(parent, size)?;
+        // Check ownership before exchanging: deleting a root-owned old bundle
+        // requires the same administrator authorization as installing the new one.
+        // SAFETY: geteuid takes no arguments and has no preconditions.
+        let user_id = unsafe { libc::geteuid() };
+        let legacy = legacy_previous_bundle(target);
+        for path in [target, legacy.as_path()] {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.uid() != user_id => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                        "Administrator authorization is required to replace the installed application").into());
+                }
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && path == legacy.as_path() => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if legacy.exists() {
+            validate_bundle(&legacy, None)?;
+            fs::remove_dir_all(&legacy)?;
+        }
         let stage = tempfile::Builder::new()
             .prefix(".pymss-studio-update-")
             .tempdir_in(parent)?;
+        fs::write(stage.path().join(".pymss-update-active"), std::process::id().to_string())?;
         let staged = stage.path().join(BUNDLE_NAME);
-        let status = Command::new("/usr/bin/ditto")
-            .arg(source)
-            .arg(&staged)
-            .status()?;
+        let status = Command::new("/usr/bin/ditto").arg(source).arg(&staged).status()?;
         if !status.success() {
             return Err(failure("Unable to stage the updated application"));
         }
         validate_bundle(&staged, Some(version))?;
-        let backup = previous_bundle(target);
-        match fs::symlink_metadata(&backup) {
-            Ok(metadata) => {
-                validate_bundle(&backup, None)?;
-                // A user-writable parent does not imply that a root-owned app's
-                // contents can be cleaned up without authorization.
-                // SAFETY: geteuid takes no arguments and has no preconditions.
-                let user_id = unsafe { libc::geteuid() };
-                if metadata.uid() != user_id {
-                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                        "Administrator authorization is required to replace the previous application backup").into());
-                }
-                // Retire the older backup by renaming it. Deleting it in place could
-                // leave a half-deleted backup if permissions change during cleanup.
-                fs::rename(&backup, stage.path().join("obsolete.app"))?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
         match atomic_exchange(target, &staged) {
-            Ok(()) => {
-                if let Err(error) = fs::rename(&staged, &backup) {
-                    // After a successful exchange the staged directory contains the old app.
-                    // Preserve it if it cannot be moved to the normal backup location.
-                    let kept = stage.keep();
-                    crate::session_log::early("WARN", "update.diagnostic", &format!(
-                        "Previous macOS application retained at {}: {error}",
-                        kept.display()
-                    ));
-                    return Ok(kept.join(BUNDLE_NAME));
-                }
-                Ok(backup)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(error.into()),
-            Err(_) => {
-                replace_bundle_with(target, &staged, &backup, |from, to| fs::rename(from, to))?;
-                Ok(backup)
-            }
+            Ok(()) => fs::remove_dir_all(&staged).map_err(|error| failure(format!(
+                "The application was replaced, but the old bundle could not be removed: {error}"
+            )))?,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Err(error.into()),
+            Err(_) => replace_bundle_with(target, &staged, |from, to| fs::rename(from, to))?,
         }
-    }
-
-    fn restore_previous(target: &Path, backup: &Path, version: &str) -> AppResult<()> {
-        validate_bundle(backup, Some(version))?;
-        match atomic_exchange(target, backup) {
-            Ok(()) => {
-                validate_bundle(target, Some(version))?;
-                if let Err(error) = fs::remove_dir_all(backup) {
-                    crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to remove the failed macOS update: {error}"));
-                }
-            }
-            Err(_) => {
-                let failed = tempfile::Builder::new()
-                    .prefix(".pymss-studio-failed-")
-                    .tempdir_in(target.parent().unwrap())?;
-                replace_bundle_with(
-                    target,
-                    backup,
-                    &failed.path().join(BUNDLE_NAME),
-                    |from, to| fs::rename(from, to),
-                )?;
-                validate_bundle(target, Some(version))?;
-            }
-        }
+        stage.close().map_err(|error| failure(format!("Unable to clean the macOS update staging directory: {error}")))?;
         Ok(())
     }
 
@@ -648,18 +655,16 @@ mod platform {
                 token: startup_directory.path().file_name().unwrap().to_str().unwrap().into(),
                 target: target.clone(), version: version.clone(), privileged: false,
             };
-            let old_version = plist(&target, "CFBundleShortVersionString")?;
             let log_directory = storage::logs_dir(&app)?;
             fs::create_dir_all(&log_directory)?;
             let log_path = log_directory.join("macos-update.log");
             let mut authorization = None;
-            let backup = match install_writable(&target, &bundle, &version, size) {
-                Ok(backup) => backup,
+            match install_writable(&target, &bundle, &version, size) {
+                Ok(()) => (),
                 Err(AppError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     request.privileged = true;
                     authorization = Some(authorized::Session::begin(
                         &target, &archive, &archive_digest, &version, &request.token, &log_path)?);
-                    previous_bundle(&target)
                 }
                 Err(error) => return Err(error),
             };
@@ -671,17 +676,25 @@ mod platform {
             })();
             if let Err(error) = started {
                 if let Some(child) = child.as_mut() { startup::stop_child(child)?; }
-                let restored = if let Some(session) = authorization.as_mut() { session.complete(false) }
-                    else { restore_previous(&target, &backup, &old_version) };
+                if let Some(session) = authorization.as_mut() { session.complete(false)?; }
                 crate::session_log::append(&app, "ERROR", "update.restart", vec![("version", version.clone()), ("reason", error.to_string())]);
-                restored.map_err(|recovery| failure(format!("Application startup failed: {error}. Previous-version recovery failed: {recovery}")))?;
-                return Err(failure(format!("Application startup failed: {error}. The previous version has been restored. See {} for details.", log_path.display())));
+                return Err(failure(format!("The updated application could not start: {error}. The installed update has not been reverted. See {} for details.", log_path.display())));
             }
             if let Some(session) = authorization.as_mut() {
                 if let Err(error) = session.complete(true) {
                     startup::stop_child(child.as_mut().unwrap())?;
                     return Err(error);
                 }
+            } else {
+                cleanup_legacy_stages_with(target.parent().unwrap(), None, |pid| {
+                    // The single-update guard excludes other transactions in this
+                    // process; a different live updater retains its own stage.
+                    if pid == 0 || pid == std::process::id() { return false; }
+                    let Ok(pid) = i32::try_from(pid) else { return false };
+                    // SAFETY: signal zero only checks whether this process exists.
+                    let alive = unsafe { libc::kill(pid, 0) };
+                    alive == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+                }, |bundle| validate_bundle(bundle, None));
             }
             crate::session_log::append(&app, "INFO", "update.restart", vec![("version", version)]);
             if let Err(error) = staging.close() { crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clean the macOS update download directory: {error}")); }
@@ -754,41 +767,34 @@ mod platform {
         }
 
         #[test]
-        fn replaces_signed_bundles_and_keeps_one_previous_version() {
+        fn replacement_removes_previous_bundles_and_staging_directories() {
             let root = tempfile::tempdir().unwrap();
             let target = signed_bundle(root.path(), "Installed.app", "1.0.0");
             let source = signed_bundle(root.path(), "New.app", "1.1.0");
+            let previous = signed_bundle(root.path(), "Legacy.app", "0.9.0");
+            fs::rename(previous, legacy_previous_bundle(&target)).unwrap();
             install_writable(&target, &source, "1.1.0", 1024).unwrap();
-            assert_eq!(
-                plist(&target, "CFBundleShortVersionString").unwrap(),
-                "1.1.0"
-            );
-            assert_eq!(
-                plist(&previous_bundle(&target), "CFBundleShortVersionString").unwrap(),
-                "1.0.0"
-            );
+            validate_bundle(&target, Some("1.1.0")).unwrap();
+            assert!(!legacy_previous_bundle(&target).exists());
+            assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".pymss-studio-update-")));
             let next = signed_bundle(root.path(), "Next.app", "1.2.0");
             install_writable(&target, &next, "1.2.0", 1024).unwrap();
-            assert_eq!(
-                plist(&previous_bundle(&target), "CFBundleShortVersionString").unwrap(),
-                "1.1.0"
-            );
             validate_bundle(&target, Some("1.2.0")).unwrap();
+            assert!(!legacy_previous_bundle(&target).exists());
         }
 
         #[test]
-        fn failed_startup_restores_the_old_signed_bundle_and_isolates_other_backups() {
+        fn direct_replacement_leaves_other_installations_untouched() {
             let root = tempfile::tempdir().unwrap();
             let target = signed_bundle(root.path(), "Installed.app", "1.0.0");
             let beta = signed_bundle(root.path(), "Beta.app", "2.0.0");
             let source = signed_bundle(root.path(), "New.app", "1.1.0");
-            let next_beta = signed_bundle(root.path(), "New Beta.app", "2.1.0");
-            let backup = install_writable(&target, &source, "1.1.0", 1024).unwrap();
-            install_writable(&beta, &next_beta, "2.1.0", 1024).unwrap();
-            restore_previous(&target, &backup, "1.0.0").unwrap();
-            validate_bundle(&target, Some("1.0.0")).unwrap();
-            validate_bundle(&beta, Some("2.1.0")).unwrap();
-            validate_bundle(&previous_bundle(&beta), Some("2.0.0")).unwrap();
+            let previous_beta = signed_bundle(root.path(), "Legacy Beta.app", "1.9.0");
+            fs::rename(previous_beta, legacy_previous_bundle(&beta)).unwrap();
+            install_writable(&target, &source, "1.1.0", 1024).unwrap();
+            validate_bundle(&target, Some("1.1.0")).unwrap();
+            validate_bundle(&beta, Some("2.0.0")).unwrap();
+            validate_bundle(&legacy_previous_bundle(&beta), Some("1.9.0")).unwrap();
         }
 
         fn archive_bundle(root: &Path, source: &Path) -> PathBuf {
@@ -827,7 +833,7 @@ mod platform {
             let mut requested = false;
             let expected = match commit {
                 Some(true) => "committed",
-                Some(false) => "rolledback",
+                Some(false) => "aborted",
                 None => "failed",
             };
             let observed = loop {
@@ -836,12 +842,12 @@ mod platform {
                     let value = if commit == Some(true) {
                         "commit"
                     } else {
-                        "rollback"
+                        "abort"
                     };
                     fs::write(control.join("outcome"), format!("{value:<64}")).unwrap();
                     requested = true;
                 }
-                if matches!(status.as_str(), "committed" | "rolledback" | "failed") {
+                if matches!(status.as_str(), "committed" | "aborted" | "failed") {
                     fs::write(control.join("outcome"), format!("{:<64}", "observed")).unwrap();
                     break status;
                 }
@@ -884,25 +890,26 @@ mod platform {
                 fs::read_to_string(target.join("Contents/Resources/version")).unwrap(),
                 "1.1.0"
             );
-            validate_bundle(&previous_bundle(&target), Some("1.0.0")).unwrap();
+            assert!(!legacy_previous_bundle(&target).exists());
         }
 
         #[test]
-        fn authorization_rejects_changed_archives_and_can_restore_without_another_prompt() {
+        fn authorization_rejects_changed_archives_and_aborts_without_restoring() {
             let root = tempfile::tempdir().unwrap();
             let target = signed_bundle(root.path(), "Installed.app", "1.0.0");
             let source = signed_bundle(root.path(), "New.app", "1.1.0");
             let archive = archive_bundle(root.path(), &source);
             run_authorization_script(&target, &archive, &sha256_hex(b"different archive"), None);
             validate_bundle(&target, Some("1.0.0")).unwrap();
-            assert!(!previous_bundle(&target).exists());
+            assert!(!legacy_previous_bundle(&target).exists());
             run_authorization_script(
                 &target,
                 &archive,
                 &sha256_hex(&fs::read(&archive).unwrap()),
                 Some(false),
             );
-            validate_bundle(&target, Some("1.0.0")).unwrap();
+            validate_bundle(&target, Some("1.1.0")).unwrap();
+            assert!(!legacy_previous_bundle(&target).exists());
         }
     }
 }
@@ -917,14 +924,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn previous_versions_are_scoped_to_the_full_installation_path() {
+    fn legacy_backup_cleanup_is_scoped_to_the_full_installation_path() {
         let first = Path::new("/Applications/Pymss Studio.app");
         let beta = Path::new("/Applications/Pymss Studio Beta.app");
         let user = Path::new("/Users/me/Applications/Pymss Studio.app");
-        assert_eq!(previous_bundle(first), previous_bundle(first));
-        assert_ne!(previous_bundle(first), previous_bundle(beta));
-        assert_ne!(previous_bundle(first), previous_bundle(user));
-        assert_eq!(previous_bundle(first).parent(), first.parent());
+        assert_eq!(legacy_previous_bundle(first), legacy_previous_bundle(first));
+        assert_ne!(legacy_previous_bundle(first), legacy_previous_bundle(beta));
+        assert_ne!(legacy_previous_bundle(first), legacy_previous_bundle(user));
+        assert_eq!(legacy_previous_bundle(first).parent(), first.parent());
     }
 
     #[test]
@@ -986,38 +993,72 @@ mod tests {
     }
 
     #[test]
-    fn failed_replacement_restores_the_previous_application() {
+    fn missing_staged_application_never_deletes_the_installed_bundle() {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("app");
-        let staged = root.path().join("staged");
-        let backup = root.path().join("previous");
+        let staged = root.path().join("missing");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("version"), "old").unwrap();
-        let result =
-            replace_bundle_with(&target, &staged, &backup, |from, to| fs::rename(from, to));
-        assert!(result.is_err());
+        assert!(replace_bundle_with(&target, &staged, |from, to| fs::rename(from, to)).is_err());
         assert_eq!(fs::read_to_string(target.join("version")).unwrap(), "old");
-        assert!(!backup.exists());
     }
 
     #[test]
-    fn failed_restoration_keeps_a_persistent_backup() {
+    fn direct_replacement_does_not_create_a_backup_or_undo_a_failed_move() {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("app");
         let staged = root.path().join("staged");
-        let backup = root.path().join("previous");
         fs::create_dir(&target).unwrap();
-        fs::write(target.join("version"), "old").unwrap();
-        let mut moves = 0;
-        let result = replace_bundle_with(&target, &staged, &backup, |from, to| {
-            moves += 1;
-            if moves > 1 {
-                return Err(std::io::Error::other("move failed"));
-            }
-            fs::rename(from, to)
+        fs::create_dir(&staged).unwrap();
+        fs::write(target.join("old-only"), "old").unwrap();
+        fs::write(staged.join("version"), "new").unwrap();
+        let result = replace_bundle_with(&target, &staged, |_, _| Err(std::io::Error::other("move failed")));
+        assert!(result.is_err());
+        assert!(!target.exists());
+        assert!(staged.join("version").exists());
+        assert!(!legacy_previous_bundle(&target).exists());
+        fs::create_dir(&target).unwrap();
+        replace_bundle_with(&target, &staged, |from, to| fs::rename(from, to)).unwrap();
+        assert_eq!(fs::read_to_string(target.join("version")).unwrap(), "new");
+        assert!(!target.join("old-only").exists());
+    }
+
+    #[test]
+    fn legacy_stage_cleanup_rejects_unknown_contents_and_active_transactions() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".pymss-studio-update-old123");
+        let active = root.path().join(".pymss-studio-update-new123");
+        let other = root.path().join(".pymss-studio-update-other123");
+        let invalid = root.path().join(".pymss-studio-update-bad123");
+        for directory in [&legacy, &active, &other, &invalid] {
+            fs::create_dir_all(directory.join(BUNDLE_NAME)).unwrap();
+        }
+        fs::write(other.join("user.txt"), "keep").unwrap();
+        let count = cleanup_legacy_stages_with(root.path(), Some(&active), |_| false, |bundle| {
+            if bundle.starts_with(&invalid) { Err(failure("invalid signature")) } else { Ok(()) }
         });
-        assert!(result.unwrap_err().to_string().contains("preserved"));
-        assert_eq!(fs::read_to_string(backup.join("version")).unwrap(), "old");
+        assert_eq!(count, 1);
+        assert!(!legacy.exists());
+        assert!(active.exists());
+        assert!(other.join("user.txt").exists());
+        assert!(invalid.exists());
+        fs::write(active.join(".pymss-update-active"), "42").unwrap();
+        assert_eq!(cleanup_legacy_stages_with(root.path(), None, |_| true, |_| Err(failure("invalid signature"))), 0);
+        assert!(active.exists());
+        assert_eq!(cleanup_legacy_stages_with(root.path(), None, |_| false, |bundle| {
+            if bundle.starts_with(&active) { Ok(()) } else { Err(failure("invalid signature")) }
+        }), 1);
+        assert!(!active.exists());
+        let expired = root.path().join(".pymss-studio-update-expired123");
+        fs::create_dir_all(expired.join(BUNDLE_NAME)).unwrap();
+        let marker = expired.join(".pymss-update-active");
+        fs::write(&marker, "42").unwrap();
+        fs::File::options().write(true).open(&marker).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60))).unwrap();
+        assert_eq!(cleanup_legacy_stages_with(root.path(), None, |_| true, |bundle| {
+            if bundle.starts_with(&expired) { Ok(()) } else { Err(failure("invalid signature")) }
+        }), 1);
+        assert!(!expired.exists());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #!/bin/sh
-# One authorization covers installation and a possible startup-failure rollback.
+# One authorization installs the verified application and cleans temporary files.
 set -eu
+
 target=$1
 archive=$2
 expected_digest=$3
@@ -16,7 +17,7 @@ case "$caller_uid:$parent_pid" in *[!0-9:]*|:*|*:) exit 1 ;; esac
 case "$expected_digest" in *[!0-9a-f]*) exit 1 ;; esac
 parent=$(dirname "$target")
 identity=$(printf '%s' "$target" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')
-backup="$parent/.pymss-studio-previous-$identity.app"
+legacy="$parent/.pymss-studio-previous-$identity.app"
 control="/private/tmp/pymss-studio-authorized-$token"
 umask 077
 # The root-owned directory in sticky /private/tmp cannot be replaced by the caller.
@@ -29,7 +30,6 @@ printf '%64s' '' > "$control/outcome"
 /bin/chmod 600 "$control/outcome"
 stage=
 staged=
-actual_backup="$backup"
 phase=preparing
 
 validate_bundle() {
@@ -43,61 +43,55 @@ exchange() {
     /usr/bin/osascript -l JavaScript -e 'function run(argv) { ObjC.import("stdio"); return $.renamex_np(argv[0], argv[1], 2) === 0 ? "swapped" : "failed"; }' "$1" "$2"
 }
 
-rollback() {
-    phase=recovering
-    validate_bundle "$actual_backup" || return 1
-    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$actual_backup/Contents/Info.plist")" = "$old_version" ] || return 1
-    if [ -e "$target" ]; then
-        result=$(exchange "$target" "$actual_backup") || return 1
-        case "$result" in
-            swapped) ;;
-            failed)
-                /bin/mv "$target" "$control/private/failed.app" || return 1
-                if ! /bin/mv "$actual_backup" "$target"; then
-                    /bin/mv "$control/private/failed.app" "$target" || :
-                    return 1
-                fi
-                actual_backup="$control/private/failed.app"
-                ;;
-            *) return 1 ;;
-        esac
-    else
-        /bin/mv "$actual_backup" "$target" || return 1
-        actual_backup=
-    fi
-    validate_bundle "$target" || return 1
-    if [ -n "$actual_backup" ]; then /bin/rm -rf "$actual_backup" || :; fi
-    phase=rolledback
-    printf 'rolledback' > "$control/status"
+cleanup_legacy_stages() {
+    for candidate in "$parent"/.pymss-studio-update-*; do
+        [ "$candidate" != "$stage" ] || continue
+        [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue
+        # A marker protects live updaters, not directories from ended or
+        # interrupted transactions. Unknown contents are never deleted.
+        known=1
+        found=0
+        for item in "$candidate"/* "$candidate"/.[!.]* "$candidate"/..?*; do
+            [ -e "$item" ] || [ -L "$item" ] || continue
+            case "$(basename "$item")" in
+                .pymss-update-active)
+                    [ -f "$item" ] && [ ! -L "$item" ] || { known=0; continue; }
+                    marker_pid=$(/usr/bin/head -c 64 "$item" | /usr/bin/awk '{print $1}')
+                    expired=$(/usr/bin/find "$item" -mtime +0 -print)
+                    case "$marker_pid" in
+                        ''|*[!0-9]*) ;;
+                        *) if [ -z "$expired" ] && [ "$marker_pid" != "$$" ] && [ "$marker_pid" != "$parent_pid" ] && /bin/kill -0 "$marker_pid" 2>/dev/null; then known=0; fi ;;
+                    esac
+                    ;;
+                'Pymss Studio.app'|obsolete.app)
+                    found=1
+                    if ! validate_bundle "$item"; then known=0; fi
+                    ;;
+                *) known=0 ;;
+            esac
+        done
+        if [ "$known" -eq 1 ] && [ "$found" -eq 1 ]; then
+            /bin/rm -rf "$candidate" || echo "Unable to clean a previous update directory: $candidate" >&2
+        fi
+    done
 }
 
 finish() {
     status=$?
     trap - 0 HUP INT TERM
-    if [ "$phase" = installed ]; then rollback || status=1; fi
-    if [ "$phase" = preparing ]; then
-        if [ -n "$stage" ] && [ -d "$stage/obsolete.app" ] && [ ! -e "$backup" ]; then
-            /bin/mv "$stage/obsolete.app" "$backup" || :
-        fi
-        printf 'failed' > "$control/status" || :
-    fi
-    if [ "$phase" = exchanging ] || [ "$phase" = recovering ]; then
-        printf 'failed' > "$control/status" || :
-        echo "Application replacement did not complete; recovery files are preserved at $stage" >&2
-    fi
-    /bin/rm -rf "$control/private" || :
-    if [ "$phase" = preparing ] || [ "$phase" = rolledback ]; then
-        if [ -n "$stage" ]; then /bin/rm -rf "$stage" || :; fi
-    elif [ "$phase" = committed ] && [ -n "$stage" ]; then
-        /bin/rm -rf "$stage/obsolete.app" || :
-        /bin/rmdir "$stage" 2>/dev/null || :
-    fi
+    case "$phase" in
+        committed|aborted) ;;
+        *) phase=failed; printf 'failed' > "$control/status" || : ;;
+    esac
+    if [ -n "$stage" ]; then /bin/rm -rf "$stage" || status=1; fi
+    /bin/rm -rf "$control/private" || status=1
+    if [ "$status" -ne 0 ]; then printf 'failed' > "$control/status" || :; fi
     i=0
     while [ "$i" -lt 25 ]; do
         [ "$(/usr/bin/head -c 64 "$control/outcome" | /usr/bin/awk '{print $1}')" != observed ] || break
         i=$((i + 1)); /bin/sleep 0.2
     done
-    /bin/rm -rf "$control" || :
+    /bin/rm -rf "$control" || status=1
     exit "$status"
 }
 trap finish 0
@@ -113,35 +107,28 @@ source="$control/private/extracted/Pymss Studio.app"
 validate_bundle "$source"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$source/Contents/Info.plist")" = "$version" ]
 validate_bundle "$target"
-old_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$target/Contents/Info.plist")
 /bin/kill -0 "$parent_pid" 2>/dev/null || exit 1
+if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+    validate_bundle "$legacy"
+    /bin/rm -rf "$legacy"
+fi
 stage=$(/usr/bin/mktemp -d "$parent/.pymss-studio-update-XXXXXXXX")
+printf '%s' "$$" > "$stage/.pymss-update-active"
 staged="$stage/Pymss Studio.app"
 /usr/bin/ditto "$source" "$staged"
 validate_bundle "$staged"
-if [ -e "$backup" ] || [ -L "$backup" ]; then
-    validate_bundle "$backup"
-    /bin/mv "$backup" "$stage/obsolete.app"
-fi
 
 phase=exchanging
 result=$(exchange "$staged" "$target") || exit 1
 case "$result" in
-    swapped)
-        if ! /bin/mv "$staged" "$backup"; then actual_backup="$staged"; fi
-        ;;
+    swapped) /bin/rm -rf "$staged" ;;
     failed)
-        /bin/mv "$target" "$backup"
-        if ! /bin/mv "$staged" "$target"; then
-            /bin/mv "$backup" "$target" || echo "The previous application is preserved at $backup" >&2
-            exit 1
-        fi
+        /bin/rm -rf "$target"
+        /bin/mv "$staged" "$target"
         ;;
     *) exit 1 ;;
 esac
 phase=installed
-printf '%s' "$actual_backup" > "$control/backup"
-/bin/chmod 644 "$control/backup"
 printf 'installed' > "$control/status"
 
 # The caller may write this regular file but cannot replace it with a symlink/FIFO.
@@ -150,17 +137,23 @@ while [ "$i" -lt 600 ]; do
     outcome=$(/usr/bin/head -c 64 "$control/outcome" | /usr/bin/awk '{print $1}')
     case "$outcome" in
         commit)
-            printf 'committed' > "$control/status"
+            cleanup_legacy_stages
             phase=committed
+            printf 'committed' > "$control/status"
             exit 0
             ;;
-        rollback) rollback; exit 0 ;;
+        abort)
+            phase=aborted
+            printf 'aborted' > "$control/status"
+            exit 0
+            ;;
         ready:*)
             child_pid=${outcome#ready:}
             case "$child_pid" in ''|*[!0-9]*) exit 1 ;; esac
             if ! /bin/kill -0 "$parent_pid" 2>/dev/null && /bin/kill -0 "$child_pid" 2>/dev/null; then
-                printf 'committed' > "$control/status"
+                cleanup_legacy_stages
                 phase=committed
+                printf 'committed' > "$control/status"
                 exit 0
             fi
             ;;
@@ -170,5 +163,6 @@ while [ "$i" -lt 600 ]; do
     i=$((i + 1))
     /bin/sleep 0.2
 done
-echo 'Application startup confirmation timed out; restoring the previous version.' >&2
+
+echo 'The application was installed, but startup confirmation timed out.' >&2
 exit 1

@@ -31,6 +31,84 @@ MANIFEST = json.loads((ROOT / "python/runtime-manifest.json").read_text(encoding
 
 
 class MacosUpdateReleaseTests(unittest.TestCase):
+    @unittest.skipUnless(BASH_EXECUTABLE, "Bash is required for application replacement checks")
+    def test_installer_replaces_the_application_without_retaining_a_previous_bundle(self):
+        installer = (ROOT / 'scripts/install-macos-update.sh').read_text(encoding='utf-8')
+        replacement = installer.split('phase=exchanging\n', 1)[1].split('phase=installed\n', 1)[0]
+        for mode in ['swapped', 'failed']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as value:
+                root = Path(value)
+                target, staged = root / 'Installed app', root / 'Stage app'
+                target.mkdir(); staged.mkdir()
+                (target / 'version').write_text('old')
+                (target / 'removed-resource').write_text('obsolete')
+                (staged / 'version').write_text('new')
+                exchange = '''exchange() {
+                    if [ "$mode" = swapped ]; then
+                        /bin/mv "$1" "$1-swap"
+                        /bin/mv "$2" "$1"
+                        /bin/mv "$1-swap" "$2"
+                    fi
+                    printf '%s' "$mode"
+                }
+                '''
+                command = 'set -eu\ntarget=$1\nstaged=$2\nmode=$3\n' + exchange + replacement
+                result = subprocess.run([BASH_EXECUTABLE, '-c', command, 'replace-test', target.as_posix(), staged.as_posix(), mode], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((target / 'version').read_text(), 'new')
+                self.assertFalse((target / 'removed-resource').exists())
+                self.assertFalse(staged.exists())
+                self.assertEqual([p.name for p in root.iterdir()], ['Installed app'])
+
+    @unittest.skipUnless(BASH_EXECUTABLE, "Bash is required for application cleanup checks")
+    def test_legacy_stage_cleanup_preserves_active_unknown_and_invalid_directories(self):
+        installer = (ROOT / 'scripts/install-macos-update.sh').read_text(encoding='utf-8')
+        function = 'cleanup_legacy_stages() {' + installer.split('cleanup_legacy_stages() {', 1)[1].split('\nfinish() {', 1)[0]
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            valid, active, unknown, invalid, ended, expired = [parent / ('.pymss-studio-update-' + name) for name in ['old123', 'active123', 'unknown123', 'invalid123', 'ended123', 'expired123']]
+            for directory in [valid, active, unknown, invalid, ended, expired]:
+                (directory / 'Pymss Studio.app').mkdir(parents=True)
+                (directory / 'Pymss Studio.app/valid-signature').write_text('signed')
+            (active / '.pymss-update-active').write_text(str(os.getpid()))
+            (ended / '.pymss-update-active').write_text('2147483647')
+            (unknown / 'user-file').write_text('keep')
+            (invalid / 'Pymss Studio.app/valid-signature').unlink()
+            setup = '''set -eu
+parent=$1
+stage=
+parent_pid=0
+/bin/sleep 30 &
+active_pid=$!
+trap 'kill "$active_pid" 2>/dev/null || :' EXIT
+printf '%s' "$active_pid" > "$2/.pymss-update-active"
+printf '%s' "$active_pid" > "$3/.pymss-update-active"
+/usr/bin/touch -t 200001010000 "$3/.pymss-update-active"
+validate_bundle() { [ -f "$1/valid-signature" ]; }
+'''
+            command = setup + function + '\ncleanup_legacy_stages\n'
+            result = subprocess.run([BASH_EXECUTABLE, '-c', command, 'cleanup-test', parent.as_posix(), active.as_posix(), expired.as_posix()], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(valid.exists())
+            self.assertFalse(ended.exists())
+            self.assertFalse(expired.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue((unknown / 'user-file').exists())
+            self.assertTrue(invalid.exists())
+
+    def test_macos_startup_failure_aborts_without_a_rollback_protocol(self):
+        installer = (ROOT / 'scripts/install-macos-update.sh').read_text(encoding='utf-8')
+        authorized = (ROOT / 'src-tauri/src/macos_update/authorized.rs').read_text(encoding='utf-8')
+        updater = (ROOT / 'src-tauri/src/macos_update.rs').read_text(encoding='utf-8')
+        confirmation = updater.split('pub fn confirm_startup(app: &AppHandle)', 1)[1].split('\n    fn start_replacement(', 1)[0]
+        self.assertIn('authorized::report_ready(&token)?', confirmation)
+        self.assertIn('startup::acknowledge(&directory, &request, std::process::id())?', confirmation)
+        self.assertNotIn('rollback', installer)
+        self.assertNotIn('rolledback', authorized)
+        self.assertIn('"abort"', authorized)
+        self.assertIn('aborted', installer)
+        self.assertIn('/bin/rm -rf "$stage"', installer)
+
     @unittest.skipUnless(BASH_EXECUTABLE, "Bash is required for the installer snapshot check")
     def test_authorized_snapshot_rejects_changed_bytes_and_ignores_later_source_changes(self):
         installer = (ROOT / "scripts/install-macos-update.sh").read_text(encoding="utf-8")

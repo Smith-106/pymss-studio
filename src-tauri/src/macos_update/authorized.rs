@@ -153,7 +153,7 @@ impl Session {
         loop {
             match read_status(&session.directory) {
                 Ok(Some(status)) if status == "installed" => return Ok(session),
-                Ok(Some(status)) if matches!(status.as_str(), "failed" | "rolledback") => {
+                Ok(Some(status)) if matches!(status.as_str(), "failed" | "aborted") => {
                     let _ = signal(&session.directory, "observed");
                     let _ = session.child.wait();
                     session.finished = true;
@@ -186,16 +186,16 @@ impl Session {
         if self.finished {
             return Err(self.error("The authorized update transaction has already ended"));
         }
-        let expected = if commit { "committed" } else { "rolledback" };
-        signal(&self.directory, if commit { "commit" } else { "rollback" })?;
+        let expected = if commit { "committed" } else { "aborted" };
+        signal(&self.directory, if commit { "commit" } else { "abort" })?;
         let started = Instant::now();
         loop {
             if let Some(status) = read_status(&self.directory)? {
-                if matches!(status.as_str(), "committed" | "rolledback" | "failed") {
+                if matches!(status.as_str(), "committed" | "aborted" | "failed") {
                     let _ = signal(&self.directory, "observed");
-                    let _ = self.child.wait()?;
+                    let exit_status = self.child.wait()?;
                     self.finished = true;
-                    return if status == expected {
+                    return if status == expected && exit_status.success() {
                         Ok(())
                     } else {
                         Err(self.error(
@@ -222,7 +222,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.finished {
             if let Err(error) = self.complete(false) {
-                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to complete authorized macOS update recovery: {error}"));
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to finish authorized macOS update cleanup: {error}"));
             }
         }
     }
