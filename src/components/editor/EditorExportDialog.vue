@@ -84,7 +84,7 @@ const exportSummaryRows = computed(() => [
     :mask-closable="!exporting"
     :close-on-esc="!exporting"
     :closable="!exporting"
-    style="width: min(640px, calc(100vw - 32px));"
+    style="width: var(--modal-width-sm)"
     @update:show="(value: boolean) => emit('update:show', value)"
   >
     <div class="export-dialog">
@@ -227,8 +227,6 @@ const exportSummaryRows = computed(() => [
 
 <style scoped>
 .editor-export-modal :deep(.n-card) {
-  width: min(640px, calc(100vw - 32px)) !important;
-  max-width: min(640px, calc(100vw - 32px)) !important;
   background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 96%, transparent), var(--surface));
 }
 
@@ -332,7 +330,7 @@ const exportSummaryRows = computed(() => [
 
 .export-summary {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -344,8 +342,8 @@ const exportSummaryRows = computed(() => [
   background: color-mix(in srgb, var(--surface-1) 80%, transparent);
 }
 
-.export-summary__item--wide {
-  grid-column: auto;
+.export-summary__item:nth-child(n + 3) {
+  grid-column: 1 / -1;
 }
 
 .export-summary__item span {

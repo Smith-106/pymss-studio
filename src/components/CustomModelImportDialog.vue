@@ -407,7 +407,7 @@ const nextDisabled = computed(() => {
 
 <style scoped>
 .cmi-modal {
-  width: min(620px, 92vw);
+  width: var(--modal-width-sm);
 }
 
 .cmi-title {

@@ -2422,9 +2422,9 @@ onMounted(() => {
 
 
 .model-detail-modal {
-  width: min(600px, calc(100vw - 48px));
-  height: min(620px, calc(100vh - 96px));
-  max-height: calc(100vh - 96px);
+  width: var(--modal-width-sm);
+  height: min(620px, var(--modal-max-height));
+  max-height: var(--modal-max-height);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -2770,9 +2770,9 @@ onMounted(() => {
   }
 
   .model-detail-modal {
-    width: calc(100vw - 28px);
-    height: calc(100vh - 40px);
-    max-height: calc(100vh - 40px);
+    width: var(--modal-width-sm);
+    height: min(620px, var(--modal-max-height));
+    max-height: var(--modal-max-height);
   }
 
   .model-detail-modal .drawer-footer {

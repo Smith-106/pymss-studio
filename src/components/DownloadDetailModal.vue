@@ -355,8 +355,8 @@ function handleClose() {
 <style scoped>
 .download-detail-modal {
   --download-tone: var(--primary);
-  width: min(720px, calc(100vw - 48px));
-  max-height: min(640px, calc(100dvh - 64px));
+  width: var(--modal-width-md);
+  max-height: min(640px, var(--modal-max-height));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -655,7 +655,7 @@ function handleClose() {
 .ddm-footer-hint { flex: 1 1 240px; align-self: center; color: var(--on-surface-muted); font-size: 11px; line-height: 1.5; }
 
 @media (max-width: 560px) {
-  .download-detail-modal { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); border-radius: 16px; }
+  .download-detail-modal { width: var(--modal-width-md); max-height: var(--modal-max-height); border-radius: 16px; }
   .download-detail-modal :deep(.n-card-header) { padding: 16px 16px 12px; }
   .download-detail-modal :deep(.n-card-footer),
   .download-detail-modal :deep(.n-card__footer) { padding: 12px 16px 16px; }

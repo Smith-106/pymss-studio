@@ -492,6 +492,11 @@ a { color: inherit; text-decoration: none; }
   --page-max-width: 1800px;
   /* Forms and descriptions, where a long line is harder to read rather than more informative. */
   --page-max-width-reading: 1180px;
+  --modal-gutter: clamp(16px, 3vmin, 32px);
+  --modal-max-height: min(84dvh, 840px);
+  --modal-width-sm: min(calc(100vw - 2 * var(--modal-gutter)), clamp(480px, 44vw, 600px));
+  --modal-width-md: min(calc(100vw - 2 * var(--modal-gutter)), clamp(560px, 52vw, 720px));
+  --modal-width-lg: min(calc(100vw - 2 * var(--modal-gutter)), clamp(720px, 72vw, 1040px));
 }
 
 .page {
@@ -537,6 +542,45 @@ a { color: inherit; text-decoration: none; }
 }
 
 /* ===== Naive UI Overrides ===== */
+.n-card.n-modal {
+  max-width: calc(100vw - 2 * var(--modal-gutter));
+  max-height: var(--modal-max-height);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.n-card.n-modal > .n-card-header,
+.n-card.n-modal > .n-card__footer,
+.n-card.n-modal > .n-card__action {
+  flex: 0 0 auto;
+}
+
+.n-card.n-modal > .n-card-content,
+.n-card.n-modal > .n-card__content {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.n-card.n-modal > .n-card-content:has(> .log-console:only-child),
+.n-card.n-modal > .n-card__content:has(> .log-console:only-child) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.n-card.n-modal > .n-card-content > .log-console:only-child,
+.n-card.n-modal > .n-card__content > .log-console:only-child {
+  min-height: 0;
+}
+
+.n-dialog.n-modal {
+  max-width: calc(100vw - 2 * var(--modal-gutter));
+  max-height: var(--modal-max-height);
+  overflow-y: auto;
+}
+
 .dark-theme .n-card {
   --n-border: 1px solid var(--outline);
   --n-color: var(--surface-1);

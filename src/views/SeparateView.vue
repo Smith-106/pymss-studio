@@ -2791,7 +2791,7 @@ async function retryCurrentTask() {
         @close="showSettingsDrawer = false"
       >
         <div class="settings-drawer__content">
-          <div v-if="runMode === 'model'" class="settings-group">
+          <div v-if="runMode === 'model'" class="settings-group settings-group--run">
             <div class="settings-group__head">
               <strong>{{ t('separate.runOptionsTitle') }}</strong>
               <span>{{ t('separate.runOptionsHint') }}</span>
@@ -2807,7 +2807,7 @@ async function retryCurrentTask() {
               <span>{{ t(runMode === 'workflow' && effectiveFormat !== 'm4a'
                 ? 'separate.workflowAudioQualityHint' : 'separate.audioQualityEditable') }}</span>
             </div>
-            <n-grid v-if="runMode === 'model' || effectiveFormat === 'm4a'" :cols="2" :x-gap="16" :y-gap="16" responsive="screen">
+            <n-grid v-if="runMode === 'model' || effectiveFormat === 'm4a'" :cols="2" :x-gap="12" :y-gap="12" responsive="screen">
               <n-grid-item v-if="runMode === 'model' && effectiveFormat === 'wav'">
                 <div class="field-block">
                   <label>{{ t('audio.wavBitDepth') }}</label>
@@ -2854,7 +2854,7 @@ async function retryCurrentTask() {
                   <n-spin size="small" />
                   <span>{{ t('separate.advancedPanelLoading') }}</span>
                 </div>
-                <n-grid v-if="runMode === 'model'" :cols="2" :x-gap="16" :y-gap="16" responsive="screen">
+                <n-grid v-if="runMode === 'model'" :cols="2" :x-gap="12" :y-gap="12" responsive="screen">
                   <n-grid-item v-if="hasInferenceField('batch_size')">
                     <div class="field-block">
                       <label>{{ t('inference.batchSize') }}</label>
@@ -2930,7 +2930,7 @@ async function retryCurrentTask() {
         </template>
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showNamingModal" style="width:min(640px, 92vw)">
+    <n-modal v-model:show="showNamingModal" style="width:var(--modal-width-sm)">
       <n-card
         class="naming-modal"
         :title="t('separate.namingModalTitle')"
@@ -3028,7 +3028,7 @@ async function retryCurrentTask() {
         </template>
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showQueueModal" style="width:min(720px, 92vw)">
+    <n-modal v-model:show="showQueueModal" style="width:var(--modal-width-md)">
       <n-card
         class="batch-queue-modal"
         :title="t('separate.batchQueue')"
@@ -3111,7 +3111,7 @@ async function retryCurrentTask() {
         <n-empty v-else :description="t(queueScope === 'no-results' ? 'separate.queueNoResultEmpty' : 'separate.queueEmpty')" />
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showLogModal" style="width:min(900px, 92vw)">
+    <n-modal v-model:show="showLogModal" style="width:var(--modal-width-lg)">
       <n-card
         :title="currentTask ? `${currentTaskFileName} - ${t('tasks.logs')}` : t('tasks.logs')"
         :bordered="false"
@@ -4856,24 +4856,23 @@ async function retryCurrentTask() {
 
 .settings-drawer__content {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   min-height: 0;
-  padding-top: 18px;
-  padding-bottom: 8px;
+  padding-top: 16px;
 }
 
 .settings-modal {
-  width: min(760px, calc(100vw - 48px));
-  max-height: min(760px, calc(100vh - 64px));
+  width: var(--modal-width-md);
+  max-height: var(--modal-max-height);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 20px;
+  border-radius: 16px;
 }
 
 .settings-modal :deep(.n-card-header) {
   flex: 0 0 auto;
-  padding: 18px 22px 14px;
+  padding: 14px 20px;
   border-bottom: 1px solid color-mix(in srgb, var(--outline) 86%, transparent);
   background: color-mix(in srgb, var(--surface-1) 96%, transparent);
 }
@@ -4888,19 +4887,19 @@ async function retryCurrentTask() {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
-  padding: 0 22px 20px;
+  padding: 0 20px 16px;
 }
 
 .settings-modal :deep(.n-card-footer),
 .settings-modal :deep(.n-card__footer) {
   flex: 0 0 auto;
-  padding: 14px 22px 16px;
+  padding: 12px 20px;
   border-top: 1px solid color-mix(in srgb, var(--outline) 86%, transparent);
   background: color-mix(in srgb, var(--surface-1) 96%, transparent);
 }
 
 .naming-modal {
-  max-height: min(620px, calc(100vh - 72px));
+  max-height: min(620px, var(--modal-max-height));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -5154,11 +5153,17 @@ async function retryCurrentTask() {
 
 .settings-group {
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 10px;
+  padding: 12px 14px;
   border: 1px solid var(--outline);
-  border-radius: 16px;
+  border-radius: 12px;
   background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+}
+
+.settings-group--run {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
 }
 
 .settings-group__head {
@@ -5354,8 +5359,8 @@ async function retryCurrentTask() {
   .progress-ring { width: 120px; height: 120px; }
   .progress-ring__center strong { font-size: 32px; }
   .settings-modal {
-    width: calc(100vw - 28px);
-    max-height: calc(100vh - 40px);
+    width: var(--modal-width-md);
+    max-height: var(--modal-max-height);
   }
   .settings-drawer__content,
   .settings-modal :deep(.n-card-content),
