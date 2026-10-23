@@ -47,6 +47,12 @@ _LOG_EVENTS = {
     "runtime_install_log": ("third_party", "pip"),
     "runtime_core_update_log": ("third_party", "pip"),
 }
+_NOISY_THIRD_PARTY_LOGGER_PREFIXES = ("numba", "llvmlite")
+
+
+def _is_noisy_third_party_logger(name: str) -> bool:
+    """Return whether a logger belongs to a compiler-detail namespace."""
+    return any(name == prefix or name.startswith(f"{prefix}.") for prefix in _NOISY_THIRD_PARTY_LOGGER_PREFIXES)
 
 
 def normalize_log_level(value: Any) -> str | None:
@@ -161,6 +167,11 @@ class ProtocolLogHandler(logging.Handler):
         self._level = value
 
     def emit(self, record: logging.LogRecord) -> None:
+        # Numba and llvmlite can emit thousands of compiler-detail records while
+        # rendering one export. Keep warnings/errors, even if a child logger was
+        # explicitly changed to DEBUG after protocol_logging configured it.
+        if _is_noisy_third_party_logger(record.name) and record.levelno < logging.WARNING:
+            return
         if getattr(self._emitting, "active", False):
             return
         self._emitting.active = True
@@ -232,6 +243,12 @@ def protocol_logging(command: str, task_id: str | None = None, job_id: str | Non
     root.addHandler(handler)
     if previous_level > level:
         root.setLevel(level)
+    noisy_logger_levels = {
+        name: logging.getLogger(name).level
+        for name in _NOISY_THIRD_PARTY_LOGGER_PREFIXES
+    }
+    for name in _NOISY_THIRD_PARTY_LOGGER_PREFIXES:
+        logging.getLogger(name).setLevel(max(logging.WARNING, noisy_logger_levels[name]))
     previous_showwarning = warnings.showwarning
 
     def showwarning(message: Any, category: Any, filename: str, lineno: int, file: Any = None, line: Any = None) -> None:
@@ -250,6 +267,8 @@ def protocol_logging(command: str, task_id: str | None = None, job_id: str | Non
         root.removeHandler(handler)
         handler.close()
         root.setLevel(previous_level)
+        for name, previous_logger_level in noisy_logger_levels.items():
+            logging.getLogger(name).setLevel(previous_logger_level)
         for console in console_handlers:
             console.removeFilter(suppress_console)
         warnings.showwarning = previous_showwarning

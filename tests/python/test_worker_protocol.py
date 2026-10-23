@@ -177,6 +177,55 @@ class WorkerProtocolTests(unittest.TestCase):
                 self.assertTrue(all(record["context"]["command"] == "env_info" for record in records))
                 self.assertEqual(root.level, logging.WARNING)
 
+    def test_protocol_logging_suppresses_noisy_compiler_debug_and_restores_levels(self) -> None:
+        numba = logging.getLogger("numba.core.ssa")
+        llvmlite = logging.getLogger("llvmlite.binding")
+        numba_parent = logging.getLogger("numba")
+        llvmlite_parent = logging.getLogger("llvmlite")
+        previous_levels = {
+            numba_parent: numba_parent.level,
+            llvmlite_parent: llvmlite_parent.level,
+            numba: numba.level,
+            llvmlite: llvmlite.level,
+        }
+        self.addCleanup(lambda: [logger.setLevel(level) for logger, level in previous_levels.items()])
+        numba_parent.setLevel(logging.DEBUG)
+        llvmlite_parent.setLevel(logging.INFO)
+        numba.setLevel(logging.NOTSET)
+        llvmlite.setLevel(logging.NOTSET)
+        levels_at_context_entry = {
+            numba_parent: numba_parent.level,
+            llvmlite_parent: llvmlite_parent.level,
+        }
+        output = io.StringIO()
+
+        with mock.patch.dict(os.environ, {
+            "PYMSS_STUDIO_LOG_TRANSPORT": "protocol",
+            "PYMSS_STUDIO_DEBUG_LOG": "1",
+        }), redirect_stdout(output), redirect_stderr(io.StringIO()):
+            with worker_protocol.protocol_logging("export_editor_mix", task_id="export-one"):
+                self.assertEqual(numba_parent.level, logging.WARNING)
+                self.assertEqual(llvmlite_parent.level, logging.WARNING)
+                numba.debug("compiler detail")
+                llvmlite.info("compiler summary")
+                numba.warning("compiler warning")
+                # The handler remains a boundary if a dependency changes itself
+                # back to DEBUG during the active protocol context.
+                numba.setLevel(logging.DEBUG)
+                numba.debug("late compiler detail")
+                logging.getLogger("worker.export").debug("studio detail")
+
+        records = [json.loads(line)["payload"] for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [(record["logger"], record["level"], record["message"]) for record in records],
+            [
+                ("numba.core.ssa", "warn", "compiler warning"),
+                ("worker.export", "debug", "studio detail"),
+            ],
+        )
+        self.assertEqual(numba_parent.level, levels_at_context_entry[numba_parent])
+        self.assertEqual(llvmlite_parent.level, levels_at_context_entry[llvmlite_parent])
+
     def test_logging_transport_failures_and_recursive_records_do_not_escape(self) -> None:
         logger = logging.Logger("third-party-test")
         calls = []

@@ -1539,7 +1539,6 @@
     "logColumnModule": "模块 / 事件",
     "logColumnScope": "任务 / 节点",
     "logUnclassified": "未分级",
-    "logDetails": "详情",
     "logSourceExternal": "第三方",
     "logColumnTime": "时间",
     "logColumnLevel": "级别",

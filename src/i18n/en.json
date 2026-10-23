@@ -1539,7 +1539,6 @@
     "logColumnModule": "Module / event",
     "logColumnScope": "Task / node",
     "logUnclassified": "RAW",
-    "logDetails": "Details",
     "logSourceExternal": "External",
     "logColumnTime": "Time",
     "logColumnLevel": "Level",
