@@ -231,7 +231,7 @@ mod platform {
     use tauri_plugin_updater::Update;
 
     static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
-    const EVENT: &str = "pymss://managed-update-event";
+    const EVENT: &str = update_manager::UPDATE_EVENT;
 
     struct UpdateGuard;
     impl Drop for UpdateGuard {

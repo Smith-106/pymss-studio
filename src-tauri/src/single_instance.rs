@@ -208,7 +208,7 @@ mod handoff {
             drop(parent);
             assert!(acquire_lock(&path).unwrap().is_none());
             drop(adopted);
-            assert!(acquire_lock(&path).unwrap().is_some());
+            super::super::tests::assert_lock_released(&path);
         }
 
         #[test]
@@ -242,7 +242,7 @@ mod handoff {
             assert!(acquire_lock(&path).unwrap().is_none());
             child.kill().unwrap();
             child.wait().unwrap();
-            assert!(acquire_lock(&path).unwrap().is_some());
+            super::super::tests::assert_lock_released(&path);
         }
     }
 }
@@ -253,6 +253,24 @@ pub(crate) use handoff::configure_child as configure_update_child;
 #[cfg(all(test, unix))]
 mod tests {
     use super::{acquire_lock, instance_lock_path};
+
+    pub(super) fn assert_lock_released(path: &std::path::Path) {
+        // A concurrent test can fork while this test owns the lock. CLOEXEC
+        // closes that inherited FD at exec, so dropping our guard alone need
+        // not make the lock immediately available to another open file.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if acquire_lock(path).unwrap().is_some() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Instance lock was not released: {}",
+                path.display(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn unix_instance_lock_path_does_not_depend_on_process_temp_environment() {
@@ -271,8 +289,25 @@ mod tests {
         let first = acquire_lock(&path).unwrap().unwrap();
         assert!(acquire_lock(&path).unwrap().is_none());
         drop(first);
-        assert!(acquire_lock(&path).unwrap().is_some());
+        assert_lock_released(&path);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unix_lock_stays_held_until_inherited_descriptors_close() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("instance.lock");
+        let guard = acquire_lock(&path).unwrap().unwrap();
+        // A duplicate shares the same open file description as a forked child.
+        let inherited = guard.file.try_clone().unwrap();
+        drop(guard);
+        assert!(acquire_lock(&path).unwrap().is_none());
+        let closing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(inherited);
+        });
+        assert_lock_released(&path);
+        closing.join().unwrap();
     }
 }
 

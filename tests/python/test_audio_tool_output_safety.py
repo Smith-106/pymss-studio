@@ -82,7 +82,7 @@ class AudioOutputSafetyTests(unittest.TestCase):
         with mock.patch.object(convert, '_run_ffmpeg', side_effect=interrupted), mock.patch.object(convert, 'emit'):
             with self.assertRaises(RuntimeError):
                 convert._convert_audio(payload)
-        self.assertEqual(list(self.output.iterdir()), [published])
+        self.assertEqual([path.resolve() for path in self.output.iterdir()], [published.resolve()])
         self.assertEqual(published.read_bytes(), b'complete')
 
     def test_unsupported_hard_links_never_create_final_placeholders(self):

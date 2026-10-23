@@ -364,7 +364,7 @@ class ImportPipelineTests(unittest.TestCase):
     def test_copy_import_places_files_under_app_management(self):
         code, events, _ = self._run(self._base_payload(importMode="copy"))
         self.assertEqual(code, 0)
-        managed = self.models_dir / "custom" / "my_model"
+        managed = (self.models_dir / "custom" / "my_model").resolve()
         self.assertTrue((managed / "my_model.ckpt").is_file())
         self.assertTrue((managed / "my_model.yaml").is_file())
         self.assertEqual(self.registered[0]["model_path"], str(managed / "my_model.ckpt"))

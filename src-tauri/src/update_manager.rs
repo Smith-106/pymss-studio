@@ -40,7 +40,7 @@ use windows_sys::Win32::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const UPDATE_EVENT: &str = "pymss://managed-update-event";
+pub(crate) const UPDATE_EVENT: &str = "pymss://managed-update-event";
 static UPDATE_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 pub fn restart_required() -> bool {

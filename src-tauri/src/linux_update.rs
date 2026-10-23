@@ -62,7 +62,7 @@ mod platform {
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
     const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024 - 1;
-    const EVENT: &str = "pymss://managed-update-event";
+    const EVENT: &str = update_manager::UPDATE_EVENT;
     struct UpdateGuard;
     impl Drop for UpdateGuard {
         fn drop(&mut self) {
