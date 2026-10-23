@@ -17,7 +17,7 @@ with sync_playwright() as playwright:
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.add_init_script("""localStorage.setItem('pymss-studio:app-settings', JSON.stringify({
-      startupOnboardingSeen:true,locale:'zh-CN',themeMode:'light',animationsEnabled:false
+      startupOnboardingSeen:true,beginnerGuideInvitationSeen:true,locale:'zh-CN',themeMode:'light',animationsEnabled:false
     }))""")
     try:
         page.goto(args.url.rstrip("/") + "/#/tools", wait_until="domcontentloaded", timeout=60000)
@@ -125,7 +125,7 @@ with sync_playwright() as playwright:
           window.__app.runtimeInfo=structuredClone(window.__runtime);
           await document.querySelector('#app').__vue_app__.config.globalProperties.$router.push('/settings?section=runtime');
         }""")
-        expect(page.locator(".runtime-section")).to_contain_text("内核更新保存在用户目录")
+        expect(page.locator(".runtime-section")).to_contain_text("内核更新独立保存在用户数据目录中，不会修改基础运行环境。")
         expect(page.locator(".runtime-env-card--active")).to_contain_text("Apple MLX")
         page.get_by_role("button", name="稍后处理", exact=True).click()
         expect(dialog).to_have_count(0)
@@ -141,7 +141,7 @@ with sync_playwright() as playwright:
         expect(dialog).to_have_count(0)
         assert page.evaluate("window.__appliedPlan===undefined")
         page.evaluate("window.__settings.locale='en'")
-        expect(page.locator(".runtime-section")).to_contain_text("Core updates use your data directory")
+        expect(page.locator(".runtime-section")).to_contain_text("Core updates are stored separately in your user data directory")
         page.screenshot(path=str(args.output_dir / "macos-runtime-storage-en.png"))
         page.get_by_role("button", name="Update Core", exact=True).click()
         expect(dialog).to_contain_text("Base runtime unchanged")

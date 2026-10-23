@@ -199,7 +199,7 @@ function showRuntimeCorePrompt() {
     return
   }
   if (runtimeCorePromptShown.value || !bootReady.value || showStartupOnboarding.value || beginnerGuide.visible
-    || settings.beginnerGuideProgress.status === 'pending') return
+    || !settings.beginnerGuideInvitationSeen) return
   runtimeCorePromptShown.value = true
   runtimeCorePromptVisible.value = true
 }

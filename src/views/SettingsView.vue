@@ -1418,6 +1418,10 @@ onMounted(async () => {
               <span>{{ t('beginnerGuide.label') }}</span>
             </div>
             <div class="about-guide-card__actions">
+              <n-button v-if="settings.beginnerGuideProgress.status === 'active'" type="primary" @click="beginnerGuide.start()">
+                <template #icon><n-icon :component="ChevronForwardOutline" /></template>
+                {{ t('beginnerGuide.resume') }}
+              </n-button>
               <n-button type="primary" secondary @click="beginnerGuide.start(true)">
                 <template #icon><n-icon :component="RefreshOutline" /></template>
                 {{ t('beginnerGuide.restart') }}

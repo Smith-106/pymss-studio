@@ -202,6 +202,7 @@ const bitRateOptions = computed(() => [
   { label: t('audio.bitrate320'), value: '320k' },
   { label: t('audio.bitrate512'), value: '512k' },
 ])
+const mp3BitRateOptions = computed(() => bitRateOptions.value.filter(option => parseInt(option.value, 10) <= 320))
 const m4aCodecOptions = computed(() => [
   { label: t('audio.codecAac'), value: 'aac' },
 ])
@@ -2902,7 +2903,7 @@ async function retryCurrentTask() {
               <n-grid-item v-if="runMode === 'model' && effectiveFormat === 'mp3'">
                 <div class="field-block" data-parameter-guide="mp3BitRate" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'mp3BitRate' }">
                   <label>{{ t('audio.mp3BitRate') }}</label>
-                  <n-select v-model:value="settings.mp3BitRate" :options="bitRateOptions" />
+                  <n-select v-model:value="settings.mp3BitRate" :options="mp3BitRateOptions" />
                 </div>
               </n-grid-item>
               <n-grid-item v-if="effectiveFormat === 'm4a'">

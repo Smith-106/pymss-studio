@@ -16,9 +16,9 @@ const code = ts.transpileModule(parsed.statements.filter(node => !ts.isImportDec
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText
 
-function environment(progress = { status: 'pending', step: 0 }, owner = true) {
+function environment(progress = { status: 'pending', step: 0 }, owner = true, invitationSeen = false) {
   setActivePinia(createPinia())
-  const settings = reactive({ beginnerGuideProgress: { ...progress } })
+  const settings = reactive({ beginnerGuideProgress: { ...progress }, beginnerGuideInvitationSeen: invitationSeen })
   return { guide: definition(settings, owner)(), settings }
 }
 
@@ -35,16 +35,48 @@ const indexOf = id => BEGINNER_GUIDE_STEPS.findIndex(step => step.id === id)
 const active = (id, parameter) => ({ status: 'active', step: indexOf(id), stepId: id, ...(parameter ? { parameter } : {}) })
 const move = (guide, delta = 1) => { guide.navigating = false; guide.move(delta) }
 
-test('first-run invitation is explicit and dismissal is persisted', () => {
-  for (const status of ['unseen', 'skipped', 'completed']) {
-    const { guide } = environment({ status, step: 0 })
-    guide.offer(); assert.equal(guide.phase, 'closed')
+test('new and existing users receive one invitation regardless of legacy guide status', () => {
+  for (const status of ['unseen', 'pending', 'active', 'skipped', 'completed']) {
+    const progress = { ...active('toolsOverview'), status }
+    const { guide, settings } = environment(progress)
+    guide.offer()
+    assert.equal(guide.phase, 'invitation', status)
+    assert.equal(settings.beginnerGuideInvitationSeen, true)
+    assert.deepEqual(settings.beginnerGuideProgress, progress)
+  }
+})
+
+test('an invitation is not repeated after reopening, skipping, or completing the guide', () => {
+  for (const status of ['unseen', 'pending', 'active', 'skipped', 'completed']) {
+    const { guide } = environment({ status, step: 0 }, true, true)
+    guide.offer(); assert.equal(guide.phase, 'closed', status)
   }
   const { guide, settings } = environment()
   guide.offer(); assert.equal(guide.phase, 'invitation')
   guide.end('skipped'); guide.offer()
   assert.equal(settings.beginnerGuideProgress.status, 'skipped')
   assert.equal(guide.phase, 'closed')
+})
+
+test('accepting an invitation starts a new tour unless there is unfinished progress', () => {
+  for (const status of ['unseen', 'pending', 'skipped', 'completed']) {
+    const { guide, settings } = environment({ ...active('help'), status })
+    guide.offer(); guide.start()
+    assert.equal(guide.currentStep.id, 'workspace', status)
+    assert.equal(settings.beginnerGuideProgress.status, 'active')
+  }
+  const { guide, settings } = environment(active('inference', 'chunk_size'))
+  guide.offer(); guide.start()
+  assert.equal(guide.currentStep.id, 'inference')
+  assert.equal(settings.beginnerGuideProgress.parameter, 'chunk_size')
+})
+
+test('manually starting or dismissing the guide consumes the automatic invitation', () => {
+  for (const action of [guide => guide.start(true), guide => guide.end('skipped'), guide => guide.end('completed')]) {
+    const { guide, settings } = environment()
+    action(guide)
+    assert.equal(settings.beginnerGuideInvitationSeen, true)
+  }
 })
 
 test('replay starts at the workspace while saved steps resume by identity', () => {
@@ -82,6 +114,7 @@ test('secondary windows cannot offer, start, or dismiss the main guide', () => {
   guide.offer(); guide.start(true); guide.end('skipped')
   assert.equal(guide.phase, 'closed')
   assert.equal(settings.beginnerGuideProgress.status, 'pending')
+  assert.equal(settings.beginnerGuideInvitationSeen, false)
 })
 
 test('hot updates add guide state without discarding the running instance', () => {

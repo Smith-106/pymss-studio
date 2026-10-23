@@ -52,12 +52,15 @@ export const useBeginnerGuideStore = defineStore('beginnerGuide', () => {
   }
 
   function offer() {
-    if (!isMainTaskOwner() || phase.value !== 'closed') return
-    if (['pending', 'active'].includes(settings.beginnerGuideProgress.status)) phase.value = 'invitation'
+    if (!isMainTaskOwner() || phase.value !== 'closed' || settings.beginnerGuideInvitationSeen) return
+    settings.beginnerGuideInvitationSeen = true
+    phase.value = 'invitation'
   }
 
   function start(restart = false) {
     if (!isMainTaskOwner()) return
+    settings.beginnerGuideInvitationSeen = true
+    restart = restart || settings.beginnerGuideProgress.status !== 'active'
     saveStep(restart ? 0 : step.value, restart ? undefined : settings.beginnerGuideProgress.parameter)
     phase.value = 'running'
     navigating.value = true
@@ -126,6 +129,7 @@ export const useBeginnerGuideStore = defineStore('beginnerGuide', () => {
 
   function end(status: 'skipped' | 'completed') {
     if (!isMainTaskOwner()) return
+    settings.beginnerGuideInvitationSeen = true
     settings.beginnerGuideProgress = { ...settings.beginnerGuideProgress, status }
     phase.value = 'closed'
     navigating.value = false

@@ -145,7 +145,7 @@ for (const backend of ['mlx', 'cpu']) {
       activeRuntime: { value: { backend, pythonPath: '/runtime/bin/python3' } },
       runtimeCorePromptVisible: { value: false },
       beginnerGuide: { visible: false },
-      settings: { beginnerGuideProgress: { status: 'unseen' } },
+      settings: { beginnerGuideInvitationSeen: true },
     }
     componentFunction('../src/App.vue', 'showRuntimeCorePrompt', scope)()
     assert.equal(actions.length, 0)
@@ -154,13 +154,13 @@ for (const backend of ['mlx', 'cpu']) {
 }
 
 test('runtime update prompts wait until the beginner guide is dismissed', () => {
-  for (const [visible, status] of [[true, 'active'], [false, 'pending']]) {
+  for (const [visible, invitationSeen] of [[true, true], [false, false]]) {
     const scope = {
       app: { runtimeCoreUpdateSupported: true },
       runtimeCorePromptShown: { value: false }, runtimeCorePromptVisible: { value: false },
       runtimeCorePromptBlocked: { value: false }, runtimeCoreUpdateAvailable: { value: true },
       bootReady: { value: true }, showStartupOnboarding: { value: false }, isStandaloneRoute: { value: false },
-      beginnerGuide: { visible }, settings: { beginnerGuideProgress: { status } },
+      beginnerGuide: { visible }, settings: { beginnerGuideInvitationSeen: invitationSeen },
     }
     componentFunction('../src/App.vue', 'showRuntimeCorePrompt', scope)()
     assert.equal(scope.runtimeCorePromptVisible.value, false)

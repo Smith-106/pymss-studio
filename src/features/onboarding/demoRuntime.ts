@@ -5,6 +5,10 @@ export type DemoConfig = { locale: string; themeMode: string; themeAccent: strin
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 export function createDemoRuntime(config: DemoConfig) {
+  const parameter = config.progress.parameter
+  const outputFormat = parameter === 'flacBitDepth' ? 'flac'
+    : parameter === 'mp3BitRate' ? 'mp3'
+    : parameter === 'm4aBitRate' || parameter === 'm4aCodec' ? 'm4a' : 'wav'
   const prefix = config.platform === 'win32' ? 'C:/Pymss-Demo' : '/Pymss-Demo'
   const input = prefix + '/sample.wav'
   const output = prefix + '/Output'
@@ -27,7 +31,7 @@ export function createDemoRuntime(config: DemoConfig) {
     tracks: waveform.tracks, createdAt: now, updatedAt: now }
   const stores = new Map<string, any>([
     ['app-settings', { startupOnboardingSeen: true, locale: config.locale, themeMode: config.themeMode, themeAccent: config.themeAccent,
-      animationsEnabled: false, outputDir: output, modelDir: prefix + '/Models', defaultFormat: 'wav',
+      animationsEnabled: false, outputDir: output, modelDir: prefix + '/Models', defaultFormat: outputFormat,
       beginnerGuideProgress: { ...config.progress, status: 'active' } }],
     ['model-state', { models, categories: ['MSS'], categoriesCn: ['MSS'], modelDir: prefix + '/Models' }],
     ['task-history', { tasks: [task] }],

@@ -19,7 +19,7 @@ with sync_playwright() as playwright:
         page = browser.new_page(viewport={'width': width, 'height': 850})
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
-        settings = json.dumps({'startupOnboardingSeen': True, 'locale': language, 'themeMode': theme,
+        settings = json.dumps({'startupOnboardingSeen': True, 'beginnerGuideInvitationSeen': True, 'locale': language, 'themeMode': theme,
                               'animationsEnabled': False, 'beginnerGuideProgress': {'status': 'skipped', 'step': 0}})
         page.add_init_script('localStorage.setItem("pymss-studio:app-settings",' + json.dumps(settings) + ')')
         page.goto(args.url + '/#/settings?section=about')
@@ -45,10 +45,19 @@ with sync_playwright() as playwright:
                 lesson.locator('.diagram-options button').last.click()
                 expect(lesson.locator('.batch-block--active')).to_have_count(4)
             if topic == 'bitRate':
-                lesson.locator('.diagram-options button').first.click()
+                expect(lesson.locator('.bit-rate-options button[aria-pressed="true"]')).to_have_text('320 kbps')
+                expect(lesson.locator('.bit-rate-options button')).to_have_text(['128 kbps', '192 kbps', '320 kbps'])
+                lesson.locator('.bit-rate-options button').first.click()
                 expect(lesson.locator('svg[role="img"]')).to_contain_text('0.96 MB')
-                lesson.locator('.diagram-options button').last.click()
+                lesson.locator('.bit-rate-options button').last.click()
                 expect(lesson.locator('svg[role="img"]')).to_contain_text('2.40 MB')
+                lesson.locator('.bit-rate-codecs button').filter(has_text='AAC').click()
+                expect(lesson.locator('.bit-rate-options button[aria-pressed="true"]')).to_have_text('320 kbps')
+                expect(lesson.locator('.bit-rate-options button')).to_have_text(['128 kbps', '192 kbps', '320 kbps', '512 kbps'])
+                lesson.locator('.bit-rate-options button').last.click()
+                expect(lesson.locator('svg[role="img"]')).to_contain_text('3.84 MB')
+                lesson.locator('.bit-rate-codecs button').filter(has_text='MP3').click()
+                expect(lesson.locator('.bit-rate-options button[aria-pressed="true"]')).to_have_text('320 kbps')
             page.wait_for_function('''()=>{
               const svg=document.querySelector('.parameter-lesson svg[role="img"]');
               return [...svg.querySelectorAll('text')].every(text=>{

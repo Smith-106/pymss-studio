@@ -132,7 +132,7 @@ defineExpose({ syncPosition })
           <h3 :id="titleId">{{ t(parameter.title) }}</h3>
           <p aria-live="polite">{{ t(parameter.description) }}</p>
           <div v-if="parameter.diagram" class="parameter-field-guide__diagram">
-            <InferenceParameterDiagram :topic="parameter.diagram" compact v-model:preset="diagramPreset" />
+            <InferenceParameterDiagram :topic="parameter.diagram" :bit-rate-codec="parameter.id === 'mp3BitRate' ? 'mp3' : parameter.id === 'm4aBitRate' ? 'aac' : undefined" compact v-model:preset="diagramPreset" />
             <p class="parameter-field-guide__example">{{ t('parameterHelp.diagramExample') }}</p>
           </div>
         </div>

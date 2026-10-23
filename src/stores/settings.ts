@@ -109,6 +109,7 @@ type StoredSettings = {
   m4aCodec?: string
   startupOnboardingSeen?: boolean
   startupOnboardingSeenVersion?: string
+  beginnerGuideInvitationSeen?: boolean
   beginnerGuideProgress?: BeginnerGuideProgress
   proxyMode?: ProxyMode
   proxyUrl?: string
@@ -156,6 +157,11 @@ const DEFAULT_FLAC_BIT_DEPTH = 'PCM_24'
 const DEFAULT_MP3_BIT_RATE = '320k'
 const DEFAULT_M4A_BIT_RATE = '512k'
 const DEFAULT_M4A_CODEC = 'aac'
+
+function normalizeMp3BitRate(value: unknown): string {
+  const rate = String(value || '').trim().toLowerCase()
+  return ['128k', '192k', '256k', '320k'].includes(rate) ? rate : DEFAULT_MP3_BIT_RATE
+}
 
 function normalizeM4aCodec(value: unknown): string {
   return String(value || '').trim().toLowerCase() === 'aac' ? 'aac' : DEFAULT_M4A_CODEC
@@ -264,6 +270,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const updateSource = ref<UpdateSource>('auto')
   const updateEndpointOverride = ref('')
   const startupOnboardingSeen = ref(false)
+  const beginnerGuideInvitationSeen = ref(false)
   const beginnerGuideProgress = ref(normalizeBeginnerGuideProgress(null))
   const modelDirMigrationState = ref<ModelDirMigrationState>(createEmptyModelDirMigrationState())
 
@@ -292,10 +299,11 @@ export const useSettingsStore = defineStore('settings', () => {
     clearInputAfterSubmit: clearInputAfterSubmit.value,
     wavBitDepth: wavBitDepth.value,
     flacBitDepth: flacBitDepth.value,
-    mp3BitRate: mp3BitRate.value,
+    mp3BitRate: normalizeMp3BitRate(mp3BitRate.value),
     m4aBitRate: m4aBitRate.value,
     m4aCodec: m4aCodec.value,
     startupOnboardingSeen: startupOnboardingSeen.value,
+    beginnerGuideInvitationSeen: beginnerGuideInvitationSeen.value,
     beginnerGuideProgress: beginnerGuideProgress.value,
     proxyMode: proxyMode.value,
     proxyUrl: proxyUrl.value,
@@ -358,7 +366,7 @@ export const useSettingsStore = defineStore('settings', () => {
     clearInputAfterSubmit.value = stored?.clearInputAfterSubmit ?? DEFAULT_CLEAR_INPUT_AFTER_SUBMIT
     wavBitDepth.value = stored?.wavBitDepth || DEFAULT_WAV_BIT_DEPTH
     flacBitDepth.value = stored?.flacBitDepth || DEFAULT_FLAC_BIT_DEPTH
-    mp3BitRate.value = stored?.mp3BitRate || DEFAULT_MP3_BIT_RATE
+    mp3BitRate.value = normalizeMp3BitRate(stored?.mp3BitRate)
     m4aBitRate.value = stored?.m4aBitRate || DEFAULT_M4A_BIT_RATE
     m4aCodec.value = normalizeM4aCodec(stored?.m4aCodec)
     proxyMode.value = (stored?.proxyMode && ['system', 'none', 'custom'].includes(stored.proxyMode))
@@ -371,17 +379,19 @@ export const useSettingsStore = defineStore('settings', () => {
     updateEndpointOverride.value = String(stored?.updateEndpointOverride || '').trim()
     startupOnboardingSeen.value = stored?.startupOnboardingSeen === true
       || String(stored?.startupOnboardingSeenVersion || '').trim().length > 0
+    beginnerGuideInvitationSeen.value = stored?.beginnerGuideInvitationSeen === true
     beginnerGuideProgress.value = normalizeBeginnerGuideProgress(stored?.beginnerGuideProgress)
-    const shouldPersistNormalizedOnboarding =
+    const shouldPersistNormalizedSettings =
       !stored
       || typeof stored.startupOnboardingSeen !== 'boolean'
       || String(stored.startupOnboardingSeenVersion || '').trim().length > 0
+      || (stored.mp3BitRate !== undefined && stored.mp3BitRate !== mp3BitRate.value)
 
     applyTheme(themeMode.value, themeAccent.value)
     await applyScaleFactor(scaleFactor.value).catch((error) => studioLog.warn('Failed to apply scale factor', error))
     setLocale(locale.value)
     initialized.value = true
-    if (shouldPersistNormalizedOnboarding) queuePersist()
+    if (shouldPersistNormalizedSettings) queuePersist()
     await syncProxyToBackend().catch((error) => studioLog.warn('Failed to sync proxy settings', error))
   }
 
@@ -435,6 +445,7 @@ export const useSettingsStore = defineStore('settings', () => {
       updateChannel,
       updateSource,
       updateEndpointOverride,
+      beginnerGuideInvitationSeen,
       beginnerGuideProgress,
     ],
     () => queuePersist(),
@@ -520,7 +531,7 @@ export const useSettingsStore = defineStore('settings', () => {
     return {
       wav_bit_depth: wavBitDepth.value,
       flac_bit_depth: flacBitDepth.value,
-      mp3_bit_rate: mp3BitRate.value,
+      mp3_bit_rate: normalizeMp3BitRate(mp3BitRate.value),
       m4a_bit_rate: m4aBitRate.value,
       m4a_codec: m4aCodec.value,
     }
@@ -938,6 +949,7 @@ export const useSettingsStore = defineStore('settings', () => {
     updateSource,
     updateEndpointOverride,
     startupOnboardingSeen,
+    beginnerGuideInvitationSeen,
     beginnerGuideProgress,
     modelDirMigrationState,
     initialize,

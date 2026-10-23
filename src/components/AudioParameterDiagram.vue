@@ -3,11 +3,21 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { PARAMETER_HELP_COPY, type ParameterHelpTopic } from '@/features/inference/parameterHelp'
 
-const props = defineProps<{ topic: ParameterHelpTopic; compact?: boolean }>()
+const props = defineProps<{ topic: ParameterHelpTopic; compact?: boolean; bitRateCodec?: 'mp3' | 'aac' }>()
 const { t, locale } = useI18n()
 const augmented = ref(true)
 const batchSize = ref(1)
-const bitRate = ref(192)
+const bitRate = ref(320)
+const selectedCodec = ref<'mp3' | 'aac'>('mp3')
+const codec = computed(() => props.bitRateCodec || selectedCodec.value)
+const bitRates = computed(() => codec.value === 'aac' ? [128, 192, 320, 512] : [128, 192, 320])
+const maxBitRate = computed(() => bitRates.value.at(-1)!)
+const bitRateBarY = (index: number) => bitRates.value.length === 4 ? 49 + index * 40 : 52 + index * 57
+const bitDepthOptions = [
+  { label: 'audio.pcm16', description: 'parameterHelp.bitDepthPcm16' },
+  { label: 'audio.pcm24', description: 'parameterHelp.bitDepthPcm24' },
+  { label: 'audio.float', description: 'parameterHelp.bitDepthFloat' },
+]
 const isTta = computed(() => props.topic === 'tta' || props.topic === 'vrTta')
 const passes = computed(() => augmented.value ? (props.topic === 'vrTta' ? 2 : 3) : 1)
 const variants = computed(() => {
@@ -19,20 +29,31 @@ const variants = computed(() => {
 const rawSignal = Array.from({ length: 97 }, (_, index) => Math.sin(index / 96 * Math.PI * 4) + .25 * Math.sin(index / 96 * Math.PI * 14))
 const peak = Math.max(...rawSignal.map(Math.abs))
 const signal = rawSignal.map(value => value / peak)
-function wave(x: number, y: number, width: number, amplitude: number, bias = 0, levels?: number) {
+function wave(x: number, y: number, width: number, amplitude: number, bias = 0, peakLimit?: number) {
   return signal.map((value, index) => {
-    const sample = levels ? Math.round((value + 1) * (levels - 1) / 2) * 2 / (levels - 1) - 1 : value
+    const offset = value * amplitude
+    const sample = peakLimit === undefined ? offset : Math.max(-peakLimit, Math.min(peakLimit, offset))
     const px = x + index / (signal.length - 1) * width
-    const py = y - bias - sample * amplitude
-    return index === 0 ? `M${px},${py}` : levels ? `H${px}V${py}` : `L${px},${py}`
+    const py = y - bias - sample
+    return index === 0 ? `M${px},${py}` : `L${px},${py}`
   }).join(' ')
 }
 const fileSize = computed(() => new Intl.NumberFormat(locale.value, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(bitRate.value * 60 / 8000))
-watch(() => props.topic, () => { augmented.value = true; batchSize.value = 1; bitRate.value = 192 })
+watch(() => props.topic, () => { augmented.value = true; batchSize.value = 1; bitRate.value = 320; selectedCodec.value = 'mp3' })
+watch(codec, () => { bitRate.value = 320 })
 </script>
 
 <template>
   <div class="audio-diagram" :class="{ 'audio-diagram--compact': compact }" :data-diagram="topic">
+    <div v-if="topic === 'bitRate' && !bitRateCodec" class="diagram-options bit-rate-codecs" role="group" :aria-label="t('parameterHelp.diagram.chooseCodec')">
+      <button v-for="value in ['mp3', 'aac'] as const" :key="value" type="button" :aria-pressed="codec === value" @click="selectedCodec = value">{{ value.toUpperCase() }}</button>
+    </div>
+    <p v-if="topic === 'bitRate'" class="bit-rate-limit">{{ t(codec === 'mp3' ? 'parameterHelp.mp3BitRateLimit' : 'parameterHelp.aacBitRateLimit') }}</p>
+    <dl v-if="topic === 'bitDepth'" class="bit-depth-options">
+      <div v-for="option in bitDepthOptions" :key="option.label">
+        <dt>{{ t(option.label) }}</dt><dd>{{ t(option.description) }}</dd>
+      </div>
+    </dl>
     <svg viewBox="0 0 636 242" role="img" :aria-label="t(PARAMETER_HELP_COPY[topic].title)">
       <g v-if="isTta">
         <g v-for="variant in variants" :key="variant.key">
@@ -66,15 +87,15 @@ watch(() => props.topic, () => { augmented.value = true; batchSize.value = 1; bi
       <g v-else-if="topic === 'normalize'">
         <text x="146" y="24">{{ t('parameterHelp.diagram.before') }}</text>
         <text x="492" y="24">{{ t('parameterHelp.diagram.after') }}</text>
-        <g v-for="(amplitude, index) in [.35, .7]" :key="amplitude">
-          <text x="20" :y="52 + index * 91" class="track-label">{{ t(index === 0 ? 'parameterHelp.diagram.vocals' : 'parameterHelp.diagram.instrumental') }}</text>
-          <line x1="24" x2="272" :y1="85 + index * 91" :y2="85 + index * 91" class="axis" />
-          <line x1="370" x2="614" :y1="85 + index * 91" :y2="85 + index * 91" class="axis" />
-          <path :d="wave(26, 85 + index * 91, 244, 30 * amplitude)" class="wave" />
-          <path :d="wave(374, 85 + index * 91, 238, 30 * .99)" class="wave" />
-          <path :d="`M289,${85 + index * 91}h61m-7,-5l7,5l-7,5`" class="arrow" />
-        </g>
-        <text x="318" y="235" class="caption">{{ t('parameterHelp.diagram.perStemPeak') }}</text>
+        <text x="318" y="73" class="caption">0 dBFS</text>
+        <line x1="24" x2="614" y1="82" y2="82" class="peak-limit" />
+        <line x1="24" x2="614" y1="178" y2="178" class="peak-limit" />
+        <line x1="24" x2="272" y1="130" y2="130" class="axis" />
+        <line x1="370" x2="614" y1="130" y2="130" class="axis" />
+        <path :d="wave(26, 130, 244, 65)" class="wave" />
+        <path :d="wave(374, 130, 238, 42)" class="wave" />
+        <path d="M289,130h61m-7,-5l7,5l-7,5" class="arrow" />
+        <text x="318" y="235" class="caption">{{ t('parameterHelp.diagram.attenuatePeak') }}</text>
       </g>
       <g v-else-if="topic === 'batch'">
         <text x="164" y="31">{{ t('parameterHelp.diagram.chunks') }}</text>
@@ -86,33 +107,38 @@ watch(() => props.topic, () => { augmented.value = true; batchSize.value = 1; bi
         <text x="318" y="225" class="caption">{{ t('parameterHelp.diagram.batchCost') }}</text>
       </g>
       <g v-else-if="topic === 'bitDepth'">
-        <text x="151" y="26">{{ t('parameterHelp.diagram.fewerLevels') }}</text>
-        <text x="489" y="26">{{ t('parameterHelp.diagram.moreLevels') }}</text>
-        <rect x="14" y="45" width="274" height="138" rx="8" class="panel" />
-        <rect x="352" y="45" width="274" height="138" rx="8" class="panel" />
-        <g v-for="(levels, index) in [8, 32]" :key="levels">
-          <path :d="wave(24 + index * 338, 114, 254, 54)" class="reference" />
-          <path :d="wave(24 + index * 338, 114, 254, 54, 0, levels)" class="wave quantized" />
+        <text x="151" y="26">PCM_16 / PCM_24</text>
+        <text x="489" y="26">WAV FLOAT</text>
+        <g v-for="offset in [0, 338]" :key="offset">
+          <rect :x="14 + offset" y="44" width="274" height="154" rx="8" class="panel" />
+          <line :x1="24 + offset" :x2="278 + offset" y1="80" y2="80" class="peak-limit" />
+          <line :x1="24 + offset" :x2="278 + offset" y1="164" y2="164" class="peak-limit" />
+          <line :x1="24 + offset" :x2="278 + offset" y1="122" y2="122" class="axis" />
         </g>
-        <text x="318" y="225" class="caption">{{ t('parameterHelp.diagram.quantization') }}</text>
+        <path :d="wave(24, 122, 254, 64)" class="reference" />
+        <path :d="wave(24, 122, 254, 64, 0, 42)" class="wave" />
+        <path :d="wave(362, 122, 254, 64)" class="wave" />
+        <text x="151" y="225" class="caption">{{ t('parameterHelp.diagram.clippedPeak') }}</text>
+        <text x="489" y="225" class="caption">{{ t('parameterHelp.diagram.retainedPeak') }}</text>
       </g>
       <g v-else-if="topic === 'bitRate'">
         <text x="318" y="31">{{ t('parameterHelp.diagram.oneMinute') }}</text>
-        <g v-for="(rate, index) in [128, 192, 320]" :key="rate" :opacity="rate === bitRate ? 1 : .4">
-          <text x="88" :y="77 + index * 57">{{ rate }} kbps</text>
-          <rect x="172" :y="52 + index * 57" :width="rate / 320 * 400" height="34" rx="5" class="rate-bar" />
+        <g v-for="(rate, index) in bitRates" :key="rate" :opacity="rate === bitRate ? 1 : .4">
+          <text x="88" :y="bitRateBarY(index) + 24">{{ rate }} kbps</text>
+          <rect x="172" :y="bitRateBarY(index)" :width="rate / maxBitRate * 400" :height="bitRates.length === 4 ? 28 : 34" rx="5" class="rate-bar" />
         </g>
         <text x="318" y="234" class="caption">{{ t('parameterHelp.diagram.fileSize', { size: fileSize }) }}</text>
       </g>
     </svg>
+    <p v-if="topic === 'bitDepth'" class="bit-depth-note">{{ t('parameterHelp.bitDepthNote') }}</p>
     <div v-if="isTta" class="diagram-options" role="group" :aria-label="t('parameterHelp.diagram.compareTta')">
       <button v-for="value in [false, true]" :key="String(value)" type="button" :aria-pressed="augmented === value" @click="augmented = value">{{ t(value ? 'parameterHelp.diagram.enabled' : 'parameterHelp.diagram.disabled') }}</button>
     </div>
     <div v-else-if="topic === 'batch'" class="diagram-options" role="group" :aria-label="t('parameterHelp.batchTitle')">
       <button v-for="value in [1, 4]" :key="value" type="button" :aria-pressed="batchSize === value" @click="batchSize = value">{{ t('parameterHelp.diagram.batchCount', { count: value }) }}</button>
     </div>
-    <div v-else-if="topic === 'bitRate'" class="diagram-options" role="group" :aria-label="t('parameterHelp.bitRateTitle')">
-      <button v-for="value in [128, 192, 320]" :key="value" type="button" :aria-pressed="bitRate === value" @click="bitRate = value">{{ value }} kbps</button>
+    <div v-else-if="topic === 'bitRate'" class="diagram-options bit-rate-options" role="group" :aria-label="t('parameterHelp.bitRateTitle')">
+      <button v-for="value in bitRates" :key="value" type="button" :aria-pressed="bitRate === value" @click="bitRate = value">{{ value }} kbps</button>
     </div>
   </div>
 </template>
@@ -121,17 +147,22 @@ watch(() => props.topic, () => { augmented.value = true; batchSize.value = 1; bi
 svg { display: block; width: 100%; height: auto; margin-top: 28px; overflow: visible; }
 text { fill: var(--on-surface); text-anchor: middle; font-size: 16px; }
 .caption { fill: var(--on-surface-muted); font-size: 14px; }
-.track-label { text-anchor: start; font-size: 14px; fill: var(--on-surface-muted); }
 .panel { fill: color-mix(in srgb, var(--primary) 5%, var(--surface-2)); stroke: var(--outline); }
 .panel--accent { fill: color-mix(in srgb, var(--primary) 12%, var(--surface-2)); stroke: var(--primary-border); }
 .arrow { fill: none; stroke: var(--on-surface-muted); stroke-width: 1.5; stroke-linejoin: round; }
 .axis { stroke: var(--outline-strong); stroke-dasharray: 3 5; }
+.peak-limit { stroke: var(--on-surface-muted); stroke-dasharray: 6 5; stroke-opacity: .65; }
 .audio-diagram[data-diagram='standardize'] .axis { stroke: var(--on-surface-muted); stroke-opacity: .55; }
 .wave, .reference { fill: none; stroke: var(--primary); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
 .reference { stroke: var(--on-surface-muted); opacity: .3; stroke-width: 1.5; }
-.quantized { stroke-width: 2; }
 .batch-block { fill: var(--surface-3); stroke: var(--outline); }
 .batch-block--active, .rate-bar { fill: var(--primary); opacity: .75; }
+.bit-depth-options { margin: 16px 0 0; font-size: 13px; line-height: 1.65; }
+.bit-depth-options > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; padding: 8px 0; border-top: 1px solid var(--outline); }
+.bit-depth-options dt { color: var(--on-surface); font-weight: 600; }
+.bit-depth-options dd { margin: 0; color: var(--on-surface-muted); }
+.bit-depth-note { margin: 10px 0 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.65; }
+.bit-rate-limit { margin: 10px 0 0; color: var(--on-surface-muted); font-size: 13px; line-height: 1.65; text-align: center; }
 .diagram-options { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .diagram-options button { border: 1px solid transparent; border-radius: 6px; padding: 5px 12px; background: transparent; color: var(--on-surface-muted); font: inherit; font-size: 13px; cursor: pointer; }
 .diagram-options button:hover { background: var(--surface-3); }
@@ -139,8 +170,12 @@ text { fill: var(--on-surface); text-anchor: middle; font-size: 16px; }
 .diagram-options button:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
 .audio-diagram--compact svg { margin-top: 0; }
 .audio-diagram--compact text { font-size: 22px; }
-.audio-diagram--compact .caption, .audio-diagram--compact .track-label { font-size: 20px; }
+.audio-diagram--compact .caption { font-size: 20px; }
 .audio-diagram--compact .formula { font-size: 19px; }
+.audio-diagram--compact .bit-depth-options { margin-top: 12px; font-size: 12px; }
+.audio-diagram--compact .bit-depth-options > div { grid-template-columns: 62px minmax(0, 1fr); gap: 8px; padding: 6px 0; }
+.audio-diagram--compact .bit-depth-note { font-size: 11px; }
+.audio-diagram--compact .bit-rate-limit { margin-top: 0; font-size: 12px; }
 .audio-diagram--compact .diagram-options button { font-size: 12px; padding: 4px 8px; }
-@media (max-width: 600px) { text { font-size: 21px; } .caption, .track-label { font-size: 19px; } .formula { font-size: 18px; } }
+@media (max-width: 600px) { text { font-size: 21px; } .caption { font-size: 19px; } .formula { font-size: 18px; } }
 </style>

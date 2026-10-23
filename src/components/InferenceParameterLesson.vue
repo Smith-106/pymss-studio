@@ -83,7 +83,16 @@ watch(() => props.topic, () => { detailsVisible.value = false })
 
 <style scoped>
 .parameter-lesson { display: flex; flex-direction: column; width: var(--modal-width-md); max-height: var(--modal-max-height); overflow: hidden; background: var(--surface-2); color: var(--on-surface); border: 1px solid var(--outline); border-radius: 16px; box-sizing: border-box; }
-.parameter-lesson__body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px 42px 32px; }
+.parameter-lesson__body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--on-surface-muted) 35%, transparent) transparent; padding: 28px 42px 32px; }
+@supports selector(::-webkit-scrollbar) {
+  .parameter-lesson__body { scrollbar-width: auto; scrollbar-color: auto; }
+}
+.parameter-lesson__body::-webkit-scrollbar { width: 6px; }
+.parameter-lesson__body::-webkit-scrollbar-track { background: transparent; margin-block: 16px; }
+.parameter-lesson__body::-webkit-scrollbar-thumb { border-radius: 999px; background: color-mix(in srgb, var(--on-surface-muted) 35%, transparent); }
+.parameter-lesson__body::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--on-surface-muted) 55%, transparent); }
+.parameter-lesson__body::-webkit-scrollbar-button,
+.parameter-lesson__body::-webkit-scrollbar-corner { display: none; width: 0; height: 0; }
 .parameter-lesson__topline { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 30px; font-size: 12px; color: var(--on-surface-muted); }
 .parameter-lesson__count { margin-left: 10px; font-variant-numeric: tabular-nums; }
 .parameter-lesson h2 { margin: 0; font-size: 26px; line-height: 1.35; font-weight: 600; }

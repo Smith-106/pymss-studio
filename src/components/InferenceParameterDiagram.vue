@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { msstOverlapSize, PARAMETER_EXAMPLE, PARAMETER_HELP_COPY, type ParameterHelpTopic } from '@/features/inference/parameterHelp'
 import AudioParameterDiagram from '@/components/AudioParameterDiagram.vue'
 
-const props = defineProps<{ topic: ParameterHelpTopic; compact?: boolean }>()
+const props = defineProps<{ topic: ParameterHelpTopic; compact?: boolean; bitRateCodec?: 'mp3' | 'aac' }>()
 const preset = defineModel<'video' | 2 | 4>('preset', { default: 'video' })
 const { t, locale } = useI18n()
 const example = PARAMETER_EXAMPLE
@@ -36,7 +36,7 @@ const spectrum = Array.from({ length: 360 }, (_, index) => ({
 
 <template>
   <div class="parameter-diagram" :class="{ 'parameter-diagram--compact': compact }">
-      <AudioParameterDiagram v-if="!['chunk', 'overlap', 'vrWindow', 'vrAggression'].includes(topic)" :topic="topic" :compact="compact" />
+      <AudioParameterDiagram v-if="!['chunk', 'overlap', 'vrWindow', 'vrAggression'].includes(topic)" :topic="topic" :compact="compact" :bit-rate-codec="bitRateCodec" />
       <svg v-else class="parameter-lesson__diagram" viewBox="0 0 636 216" role="img" :aria-label="t(title)">
         <g v-if="topic === 'chunk'">
           <g v-for="(lines, index) in chunkWaves" :key="index" :class="{ 'parameter-lesson__muted-wave': index > 0 }">

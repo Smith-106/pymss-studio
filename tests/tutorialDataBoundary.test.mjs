@@ -4,8 +4,31 @@ import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { createDemoRuntime } from '../src/features/onboarding/demoRuntime.ts'
+import { visibleParameterGuides } from '../src/features/onboarding/parameters.ts'
 
 const config = { locale: 'en', themeMode: 'dark', themeAccent: 'blue', platform: 'win32', progress: { step: 0, stepId: 'workspace' } }
+
+test('resumed encoding parameters remain available in the matching tutorial output format', async t => {
+  for (const [parameter, format] of [['wavBitDepth', 'wav'], ['flacBitDepth', 'flac'], ['mp3BitRate', 'mp3'], ['m4aBitRate', 'm4a'], ['m4aCodec', 'm4a']]) {
+    const progress = { status: 'active', step: 11, stepId: 'encoding', parameter }
+    const runtime = createDemoRuntime({ ...config, progress })
+    t.after(() => runtime.dispose())
+    const settings = await runtime.invoke('load_app_store', { name: 'app-settings' })
+    assert.equal(settings.defaultFormat, format, parameter)
+    assert.deepEqual(settings.beginnerGuideProgress, progress)
+    assert.ok(visibleParameterGuides({ hasModel: true, defaults: {}, format: settings.defaultFormat, canSaveDefaults: false })
+      .some(item => item.id === parameter), parameter)
+  }
+})
+
+test('new tutorials and non-encoding progress retain the WAV default', async t => {
+  for (const parameter of [undefined, 'batch_size', 'unknown']) {
+    const runtime = createDemoRuntime({ ...config, progress: { ...config.progress, parameter } })
+    t.after(() => runtime.dispose())
+    const settings = await runtime.invoke('load_app_store', { name: 'app-settings' })
+    assert.equal(settings.defaultFormat, 'wav')
+  }
+})
 
 test('tutorial data is private to each session and unknown operations never reach native services', async t => {
   const first = createDemoRuntime(config), second = createDemoRuntime(config)
