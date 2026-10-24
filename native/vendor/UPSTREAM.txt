@@ -15,6 +15,12 @@ AUv3 uses Apple's documented AudioComponentInstantiate and RequestViewController
 C compatibility bridge. Bounded main-runloop waits, late-result retirement,
 retained view controllers and distinct au3: identities are local additions.
 No private AUAudioUnit property/getter or 64-bit parameter-address cast is used.
+Independent mono/stereo main-input/output negotiation, per-direction channel
+mapping and exact offline-mode layout restoration are local additions. Explicit
+instantiation retries initialization failures; automatic metadata probes retain
+failure coalescing. No new AudioToolbox ABI declaration is introduced.
+https://developer.apple.com/documentation/audiotoolbox/auchannelinfo
+https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_supportednumchannels
 API reference:
 https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api
 soundcraft-dsp: only the plugin interfaces and data types from crates/dsp/src/lib.rs;
@@ -28,6 +34,11 @@ and autorelease scopes; Linux X11/XEmbed windows and per-context/frame IRunLoop 
 VST3 realtime/offline setup and process modes, same-instance stopped mode changes,
 and isolated processing-mode fixture contracts are local adaptations. Mode setup
 and bus negotiation run on the helper control/UI thread.
+OnlyARA/OnlyOfflineProcess normal-insert rejection, live factory revalidation and
+OnlyRT refusal before offline reconfiguration are local additions. NoOfflineProcess
+is not treated as a ban on ordinary downmix export; it concerns direct offline processing.
+https://raw.githubusercontent.com/steinbergmedia/vst3_pluginterfaces/master/vst/ivstaudioprocessor.h
+https://steinbergmedia.github.io/vst3_dev_portal/pages/FAQ/Processing.html
 Timing readers, lifecycle flags shared with the worker and an atomic latency/tail
 pair are local additions. SDK timing queries and latency-change reactivation run
 on the creating control thread while the application suspends DSP. Getter-raised

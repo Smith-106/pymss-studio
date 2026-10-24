@@ -600,6 +600,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pymss-aax-probe"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "plist",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "pymss-audio-host"
 version = "0.1.0"
 dependencies = [
@@ -608,6 +618,7 @@ dependencies = [
  "crossbeam-channel",
  "hound",
  "libc",
+ "pymss-aax-probe",
  "pymss-vst2-host",
  "rtrb",
  "serde",

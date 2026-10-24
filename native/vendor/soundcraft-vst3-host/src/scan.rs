@@ -200,6 +200,23 @@ pub fn split_sub_categories(s: &str) -> Vec<String> {
     s.split('|').map(str::trim).filter(|t| !t.is_empty()).take(32).map(str::to_string).collect()
 }
 
+/// Restrictions declared by the SDK sub-category tokens, independent of display categories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProcessingRestrictions {
+    pub only_ara: bool,
+    pub only_offline: bool,
+    pub only_realtime: bool,
+}
+
+pub(crate) fn processing_restrictions<S: AsRef<str>>(subs: &[S]) -> ProcessingRestrictions {
+    let has = |token: &str| subs.iter().any(|sub| sub.as_ref().trim().eq_ignore_ascii_case(token));
+    ProcessingRestrictions {
+        only_ara: has("OnlyARA"),
+        only_offline: has("OnlyOfflineProcess"),
+        only_realtime: has("OnlyRT"),
+    }
+}
+
 /// Maps VST3 sub-categories (`Fx|EQ`, `Instrument|Synth`, …) to a SoundCraft insert-menu category.
 pub fn category_from_sub_categories<S: AsRef<str>>(subs: &[S]) -> Category {
     let has = |names: &[&str]| subs.iter().any(|f| names.iter().any(|n| f.as_ref().eq_ignore_ascii_case(n)));
@@ -304,6 +321,25 @@ mod tests {
         let unix = os_search_paths(Os::Unix, Some("/home/u".into()), None, None);
         assert_eq!(unix, vec![PathBuf::from("/home/u/.vst3"), PathBuf::from("/usr/lib64/vst3"), PathBuf::from("/usr/lib/vst3"), PathBuf::from("/usr/local/lib64/vst3"), PathBuf::from("/usr/local/lib/vst3")]);
         assert!(!default_search_paths().is_empty());
+    }
+
+    #[test]
+    fn processing_restrictions_match_trimmed_complete_sdk_tokens() {
+        assert_eq!(processing_restrictions(&[" Fx ", " OnlyARA ", "onlyofflineprocess", "oNlYrT"]),
+            ProcessingRestrictions { only_ara: true, only_offline: true, only_realtime: true });
+        assert_eq!(processing_restrictions(&["OnlyARA"]),
+            ProcessingRestrictions { only_ara: true, ..ProcessingRestrictions::default() });
+        assert_eq!(processing_restrictions(&["OnlyOfflineProcess"]),
+            ProcessingRestrictions { only_offline: true, ..ProcessingRestrictions::default() });
+        assert_eq!(processing_restrictions(&["OnlyRT"]),
+            ProcessingRestrictions { only_realtime: true, ..ProcessingRestrictions::default() });
+    }
+
+    #[test]
+    fn processing_restrictions_do_not_infer_substrings_or_dop_export_restrictions() {
+        assert_eq!(processing_restrictions(&["Fx", "NoOfflineProcess", "NotOnlyARA", "OnlyARAExtra",
+            "OnlyOfflineProcessExtension", "XOnlyRT", "OnlyRT Extra", "Only RT"]), ProcessingRestrictions::default());
+        assert_eq!(processing_restrictions::<&str>(&[]), ProcessingRestrictions::default());
     }
 
     #[test]

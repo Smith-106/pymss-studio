@@ -104,6 +104,7 @@ pub(crate) fn optional_property(status: i32, size: u32, writable: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::ChannelLayout;
     use std::cell::RefCell;
 
     struct Unit {
@@ -118,6 +119,7 @@ mod tests {
         parameters: [f32; 2],
         class_info: Vec<u8>,
         editor: usize,
+        layout: ChannelLayout,
     }
     impl Unit {
         fn new(prepared: bool, supported: bool) -> Self {
@@ -133,13 +135,17 @@ mod tests {
                 parameters: [0.25, 0.75],
                 class_info: vec![1, 2, 3],
                 editor: 42,
+                layout: ChannelLayout {
+                    inputs: 2,
+                    outputs: 2,
+                },
             }
         }
     }
     impl OfflineUnit for Unit {
-        type Configuration = (u32, usize, usize);
+        type Configuration = (u32, usize, ChannelLayout);
         fn configuration(&self) -> Option<Self::Configuration> {
-            self.prepared.then_some((48_000, 256, 2))
+            self.prepared.then_some((48_000, 256, self.layout))
         }
         fn stop(&mut self) -> Result<(), String> {
             if self.prepared {
@@ -163,6 +169,12 @@ mod tests {
                 .borrow_mut()
                 .push(if offline { "offline" } else { "realtime" });
             self.mode = offline;
+            // Some units rebuild their bus defaults while changing render mode. Restart must
+            // restore the saved pair instead of reading this replacement configuration.
+            self.layout = ChannelLayout {
+                inputs: 2,
+                outputs: 2,
+            };
             if self.fail_set && offline {
                 Err("property setter failed".into())
             } else {
@@ -171,13 +183,15 @@ mod tests {
         }
         fn restart(&mut self, configuration: Self::Configuration) -> Result<(), String> {
             assert!(!self.prepared);
-            assert_eq!(configuration, (48_000, 256, 2));
+            assert_eq!(configuration.0, 48_000);
+            assert_eq!(configuration.1, 256);
             self.calls.borrow_mut().push("configure/initialize");
             if self.fail_restart > 0 {
                 self.fail_restart -= 1;
                 return Err("initialize failed".into());
             }
             self.prepared = true;
+            self.layout = configuration.2;
             Ok(())
         }
         fn invalidate(&mut self) {
@@ -198,7 +212,7 @@ mod tests {
         assert!(state.requested());
         assert!(unit.mode);
         assert!(!unit.prepared);
-        unit.restart((48_000, 256, 2)).unwrap();
+        unit.restart((48_000, 256, unit.layout)).unwrap();
         assert!(
             unit.mode,
             "Preparing the same unit must retain the previously set context"
@@ -243,6 +257,36 @@ mod tests {
             &*unit.calls.borrow(),
             &["uninitialize", "query", "configure/initialize"]
         );
+    }
+
+    #[test]
+    fn asymmetric_layout_is_preserved_on_mode_switch_and_failed_switch_rollback() {
+        for layout in [
+            ChannelLayout {
+                inputs: 1,
+                outputs: 2,
+            },
+            ChannelLayout {
+                inputs: 2,
+                outputs: 1,
+            },
+        ] {
+            let mut state = OfflineState::default();
+            let mut unit = Unit::new(true, true);
+            unit.layout = layout;
+            state.set(&mut unit, true).unwrap();
+            assert_eq!(unit.layout, layout);
+            state.set(&mut unit, false).unwrap();
+            assert_eq!(unit.layout, layout);
+            unit.fail_restart = 1;
+            assert!(state.set(&mut unit, true).is_err());
+            assert!(!state.requested());
+            assert!(unit.prepared);
+            assert_eq!(unit.layout, layout);
+            assert_eq!(unit.parameters, [0.25, 0.75]);
+            assert_eq!(unit.class_info, [1, 2, 3]);
+            assert_eq!(unit.editor, 42);
+        }
     }
 
     #[test]

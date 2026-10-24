@@ -9,6 +9,7 @@ publish = false
 soundcraft-vst3-host.workspace = true
 soundcraft-au-host.workspace = true
 pymss-vst2-host.workspace = true
+pymss-aax-probe = { path = "../aax-probe" }
 soundcraft-dsp.workspace = true
 serde.workspace = true
 serde_json = "1"

@@ -27,6 +27,9 @@ pub struct Vst2Descriptor {
     pub vendor: String,
     pub version: String,
     pub path: PathBuf,
+    /// Raw effGetPlugCategory value; shell children remain unknown until instantiated.
+    #[serde(default)]
+    pub raw_category: Option<i32>,
     /// A shell's lightweight enumeration does not reveal the child's category.
     pub is_instrument: Option<bool>,
     #[serde(default)]

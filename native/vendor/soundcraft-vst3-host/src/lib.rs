@@ -285,7 +285,8 @@ pub fn load_bundle(path: &Path) -> Result<Vec<Vst3Descriptor>, Vst3Error> {
 }
 
 /// Creates a plugin by `vst3:<class id>`, prepared for 48 kHz stereo with 1024-frame blocks (like
-/// `soundcraft_dsp::create`), with the reason when it fails.
+/// `soundcraft_dsp::create`), with the reason when it fails. `OnlyARA` and `OnlyOfflineProcess`
+/// classes are rejected because this API creates normal inserts.
 pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
     api::instantiate(id)
 }
@@ -417,7 +418,8 @@ mod tests {
     }
 }
 
-/// Load a previously scanned descriptor, without an implicit system-wide scan.
+/// Load a previously scanned descriptor, without an implicit system-wide scan. Factory processing
+/// restrictions are checked again; ARA-only and direct-offline-only classes cannot be normal inserts.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn instantiate_descriptor(desc: &Vst3Descriptor) -> Result<Vst3Plugin, Vst3Error> {
     registry::instantiate_descriptor(desc)

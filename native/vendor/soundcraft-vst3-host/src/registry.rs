@@ -197,8 +197,29 @@ fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
     }))
 }
 
+fn insert_restrictions(id: &str, subs: &[String]) -> Result<paths::ProcessingRestrictions, Vst3Error> {
+    let restrictions = paths::processing_restrictions(subs);
+    let reason = if restrictions.only_ara {
+        Some("OnlyARA requires an ARA host and cannot be used as a normal insert")
+    } else if restrictions.only_offline {
+        Some("OnlyOfflineProcess requires direct offline processing and cannot be used as a normal insert")
+    } else { None };
+    if let Some(reason) = reason { return Err(Vst3Error::Instantiate(id.to_string(), reason.into())); }
+    Ok(restrictions)
+}
+
+/// Re-read factory metadata before constructing a component, including for caller-supplied descriptors.
+fn load_insert(d: &Vst3Descriptor, cid: &[u8; 16]) -> Result<(Instance, paths::ProcessingRestrictions), Vst3Error> {
+    insert_restrictions(&d.id, &d.sub_categories)?;
+    let bundle = Bundle::load(&d.path)?;
+    let class = bundle.classes().into_iter().find(|c| c.cid == *cid && c.category == AUDIO_MODULE_CLASS)
+        .ok_or_else(|| Vst3Error::NotFound(d.id.clone()))?;
+    let restrictions = insert_restrictions(&d.id, &paths::split_sub_categories(&class.sub_categories))?;
+    Ok((bundle.instantiate(cid)?, restrictions))
+}
+
 /// Finds the descriptor, loads its binary and creates an instance plus its (cached) info.
-fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Error> {
+fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, paths::ProcessingRestrictions), Vst3Error> {
     let cid = parse_id(id).ok_or_else(|| Vst3Error::NotFound(id.to_string()))?;
     let desc = {
         let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
@@ -207,10 +228,10 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
         }
         ensure_scanned(&mut r).iter().find(|d| d.id == id).cloned().ok_or_else(|| Vst3Error::NotFound(id.to_string()))?
     };
-    let made = Bundle::load(&desc.path).and_then(|b| b.instantiate(&cid));
+    let made = load_insert(&desc, &cid);
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     match made {
-        Ok(inst) => {
+        Ok((inst, restrictions)) => {
             let info = match r.infos.get(id) {
                 Some(i) => *i,
                 None => {
@@ -219,7 +240,7 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
                     i
                 }
             };
-            Ok((inst, info))
+            Ok((inst, info, restrictions))
         }
         Err(e) => {
             r.failed.insert(id.to_string());
@@ -233,8 +254,8 @@ pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
 }
 
 pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
-    let (inst, info) = instantiate_raw(id)?;
-    let mut p = Vst3Plugin::new(inst, info);
+    let (inst, info, restrictions) = instantiate_raw(id)?;
+    let mut p = Vst3Plugin::new(inst, info, restrictions.only_realtime);
     p.prepare(48_000.0, 1024, 2);
     Ok(p)
 }
@@ -251,7 +272,7 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         }
     }
     // Instantiate once to learn the parameters (VST3 exposes them only on a live controller).
-    instantiate_raw(id).ok().map(|(_, info)| info)
+    instantiate_raw(id).ok().map(|(_, info, _)| info)
 }
 
 #[cfg(test)]
@@ -274,11 +295,11 @@ mod tests {
 /// Instantiate exactly one descriptor without scanning any other installed binary.
 pub fn instantiate_descriptor(desc: &Vst3Descriptor) -> Result<Vst3Plugin, Vst3Error> {
     let cid = parse_id(&desc.id).ok_or_else(|| Vst3Error::NotFound(desc.id.clone()))?;
-    let inst = Bundle::load(&desc.path)?.instantiate(&cid)?;
+    let (inst, restrictions) = load_insert(desc, &cid)?;
     let key = format!("{}:{}", desc.path.display(), desc.id);
     let info = {
         let mut registry = registry().lock().unwrap_or_else(PoisonError::into_inner);
         *registry.infos.entry(key).or_insert_with(|| build_info(desc, &inst))
     };
-    Ok(Vst3Plugin::new(inst, info))
+    Ok(Vst3Plugin::new(inst, info, restrictions.only_realtime))
 }

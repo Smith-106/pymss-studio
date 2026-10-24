@@ -38,6 +38,43 @@ export function pluginDescriptorVariant(descriptor: PluginDescriptorIdentity) {
   return format === 'vst2' && descriptor.isShellChild ? 'VST2 Shell' : format.toUpperCase()
 }
 
+export type PluginCatalogCategory = 'eq' | 'dynamics' | 'pitch' | 'reverb' | 'delay' | 'modulation'
+  | 'distortion' | 'dither' | 'instrument' | 'analyzer' | 'mastering' | 'spatial' | 'ambience'
+  | 'restoration' | 'offline' | 'generator' | 'tools' | 'other'
+
+/** Only vendor-declared metadata is used; names and paths do not establish effect types. */
+export function pluginDescriptorCategory(plugin: PluginDescriptorIdentity & {
+  isInstrument?: boolean | null; category?: string; subCategories?: string[]
+  rawCategory?: number | null; componentType?: number
+}): PluginCatalogCategory {
+  if (plugin.isInstrument === true || plugin.componentType === 0x61756d75) return 'instrument'
+  const format = pluginDescriptorFormat(plugin)
+  if (format === 'vst3') {
+    const categories: Record<string, PluginCatalogCategory> = {
+      eq: 'eq', filter: 'eq', dynamics: 'dynamics', pitchshift: 'pitch', 'pitch shift': 'pitch',
+      reverb: 'reverb', delay: 'delay', modulation: 'modulation', harmonic: 'distortion',
+      distortion: 'distortion', dither: 'dither', analyzer: 'analyzer', mastering: 'mastering',
+      spatial: 'spatial', surround: 'spatial', restoration: 'restoration', generator: 'generator', tools: 'tools',
+    }
+    const categoryKey = typeof plugin.category === 'string' ? plugin.category.trim().toLowerCase() : ''
+    const category = Object.hasOwn(categories, categoryKey) ? categories[categoryKey] : undefined
+    if (category) return category
+    const tokens = Array.isArray(plugin.subCategories) ? plugin.subCategories.filter(token => typeof token === 'string')
+      .flatMap(token => token.split('|')).slice(0, 32).map(token => token.trim().toLowerCase()) : []
+    if (tokens[0] === 'instrument') return 'instrument'
+    for (const token of tokens) if (Object.hasOwn(categories, token)) return categories[token]
+  }
+  if (format === 'vst2' && !plugin.isShellChild && typeof plugin.rawCategory === 'number') {
+    // VST2 RoomFx declares both delays and reverbs; keep that coarse distinction.
+    const categories: Record<number, PluginCatalogCategory> = {
+      2: 'instrument', 3: 'analyzer', 4: 'mastering', 5: 'spatial', 6: 'ambience',
+      7: 'spatial', 8: 'restoration', 9: 'offline', 11: 'generator',
+    }
+    return categories[plugin.rawCategory] || 'other'
+  }
+  return 'other'
+}
+
 /** Distinguish variants and same-name shell entries without hiding their full identities. */
 export function pluginDescriptorLabels(descriptors: readonly (PluginDescriptorIdentity & { name: string; vendor?: string; path: string })[], includePath = false) {
   const count = (labels: readonly string[]) => {

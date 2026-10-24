@@ -5,8 +5,9 @@ edition = "2021"
 authors = ["TheSmallHanCat"]
 
 [features]
-default = []
-vst-lab = ["dep:pymss-audio-host"]
+default = ["native-plugins"]
+native-plugins = ["dep:pymss-audio-host"]
+vst-lab = ["native-plugins"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

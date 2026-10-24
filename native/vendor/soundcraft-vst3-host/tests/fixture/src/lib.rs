@@ -91,6 +91,10 @@ struct FixtureBehavior {
     no_controller: bool,
     reject_reactivate: bool,
     reject_stop: bool,
+    only_ara: bool,
+    only_offline: bool,
+    only_realtime: bool,
+    no_offline: bool,
 }
 
 impl FixtureBehavior {
@@ -122,6 +126,10 @@ impl FixtureBehavior {
                     "no-controller" => behavior.no_controller = true,
                     "reject-reactivate" => behavior.reject_reactivate = true,
                     "reject-stop" => behavior.reject_stop = true,
+                    "only-ara" => behavior.only_ara = true,
+                    "only-offline" => behavior.only_offline = true,
+                    "only-rt" => behavior.only_realtime = true,
+                    "no-offline" => behavior.no_offline = true,
                     _ => (),
                 }
             }
@@ -300,6 +308,7 @@ impl IAudioProcessorTrait for GainProcessor {
         assert_eq!(s.symbolicSampleSize, SymbolicSampleSizes_::kSample32 as i32);
         assert!(s.maxSamplesPerBlock > 0 && s.sampleRate > 0.0);
         assert!(s.processMode == ProcessModes_::kRealtime as i32 || s.processMode == ProcessModes_::kOffline as i32);
+        assert!(!self.behavior.only_realtime || s.processMode != ProcessModes_::kOffline as i32, "OnlyRT must be rejected before setupProcessing changes");
         if s.processMode == ProcessModes_::kOffline as i32 && self.behavior.reject_offline {
             self.offline_attempted.store(true, Ordering::Relaxed);
             return kResultFalse;
@@ -910,6 +919,11 @@ impl IPluginFactoryTrait for Factory {
     unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
         set_up_late_state();
         let cid = unsafe { *(cid as *const TUID) };
+        let restrictions = FixtureBehavior::from_environment();
+        if cid == GAIN_CID && (restrictions.only_ara || restrictions.only_offline) {
+            // These classes are discoverable but cannot be constructed by a normal insert host.
+            std::process::abort();
+        }
         let unknown = if cid == GAIN_CID {
             ComWrapper::new(GainProcessor {
                 gain: AtomicU64::new(0.25f64.to_bits()),
@@ -964,6 +978,13 @@ impl IPluginFactory2Trait for Factory {
         copy_c8(cat, &mut i.category);
         copy_c8(name, &mut i.name);
         i.classFlags = 0;
+        let restrictions = FixtureBehavior::from_environment();
+        let subs = if cid != GAIN_CID { subs }
+            else if restrictions.only_ara { "Fx|OnlyARA" }
+            else if restrictions.only_offline { "Fx|OnlyOfflineProcess" }
+            else if restrictions.only_realtime { "Fx|OnlyRT" }
+            else if restrictions.no_offline { "Fx|NoOfflineProcess" }
+            else { subs };
         copy_c8(subs, &mut i.subCategories);
         copy_c8("", &mut i.vendor);
         copy_c8("1.2.3", &mut i.version);

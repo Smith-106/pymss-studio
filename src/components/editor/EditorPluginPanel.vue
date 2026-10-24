@@ -6,12 +6,12 @@ import { AddOutline, ArrowDownOutline, ArrowUpOutline, CloseOutline, FolderOpenO
 import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import type { EditorSession } from '@/types/editor'
-import { clonePluginChain, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
+import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
 import { observePluginSession, openPluginEditor, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type UnavailablePlugin } from '@/utils/pluginHost'
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const editor = useEditorStore()
 const playback = useEditorPlaybackStore()
 const capabilities = ref<PluginHostCapabilities | null>(null)
@@ -23,6 +23,7 @@ const manageButton = ref<{ $el: HTMLElement } | null>(null)
 const reloadConfirmOpen = ref(false)
 const targetMenuOpen = ref(false)
 const librarySearch = ref('')
+const catalogGroupBy = ref<'vendor' | 'category' | 'format'>('vendor')
 const feedback = ref('')
 const error = ref('')
 const descriptors = ref<PluginDescriptor[]>([])
@@ -52,18 +53,46 @@ const chain = computed(() => target.value === 'master'
 const descriptorKey = (plugin: PluginDescriptor) => JSON.stringify([plugin.id, plugin.path])
 const relocatingSlot = computed(() => chain.value.find(slot => slot.id === relocatingSlotId.value))
 const operationError = computed(() => error.value || editor.pluginStateError || playback.error)
+const categoryLabels = computed(() => ({
+  eq: t('editor.plugins.categories.eq'), dynamics: t('editor.plugins.categories.dynamics'),
+  pitch: t('editor.plugins.categories.pitch'), reverb: t('editor.plugins.categories.reverb'),
+  delay: t('editor.plugins.categories.delay'), modulation: t('editor.plugins.categories.modulation'),
+  distortion: t('editor.plugins.categories.distortion'), dither: t('editor.plugins.categories.dither'),
+  instrument: t('editor.plugins.categories.instrument'), analyzer: t('editor.plugins.categories.analyzer'),
+  mastering: t('editor.plugins.categories.mastering'), spatial: t('editor.plugins.categories.spatial'),
+  ambience: t('editor.plugins.categories.ambience'), restoration: t('editor.plugins.categories.restoration'),
+  offline: t('editor.plugins.categories.offline'), generator: t('editor.plugins.categories.generator'),
+  tools: t('editor.plugins.categories.tools'), other: t('editor.plugins.categories.other'),
+}))
 const pluginOptions = computed(() => {
   const plugins = descriptors.value.filter(plugin => !relocatingSlot.value || pluginSlotMatchesDescriptor(relocatingSlot.value, plugin))
   const labels = pluginDescriptorLabels(plugins, Boolean(relocatingSlot.value))
   const query = librarySearch.value.trim().toLocaleLowerCase()
   return plugins.map((plugin, index) => {
     const variant = pluginDescriptorVariant(plugin)
+    const category = pluginDescriptorCategory(plugin)
     const baseLabel = `${plugin.name} · ${variant}${plugin.vendor ? ` · ${plugin.vendor}` : ''}`
-    return { label: labels[index], value: descriptorKey(plugin), plugin, variant,
+    return { label: labels[index], value: descriptorKey(plugin), plugin, variant, category,
       detail: labels[index].startsWith(`${baseLabel} · `) ? labels[index].slice(baseLabel.length + 3) : '',
       disabled: plugin.isInstrument === true || !capabilities.value?.formats.includes(pluginDescriptorFormat(plugin)) }
   })
-    .filter(option => !query || `${option.label} ${pluginDescriptorFormat(option.plugin)}`.toLocaleLowerCase().includes(query))
+    .filter(option => !query || `${option.label} ${pluginDescriptorFormat(option.plugin)} ${option.category} ${categoryLabels.value[option.category]} ${option.plugin.subCategories?.join(' ') || ''}`.toLocaleLowerCase().includes(query))
+})
+const catalogGroups = computed(() => {
+  const groups = new Map<string, { key: string; label: string; unknown: boolean; plugins: typeof pluginOptions.value }>()
+  const collator = new Intl.Collator(locale.value, { numeric: true, sensitivity: 'base' })
+  for (const option of pluginOptions.value) {
+    const vendor = option.plugin.vendor?.trim() || ''
+    const key = catalogGroupBy.value === 'vendor' ? `vendor:${vendor.toLowerCase()}`
+      : catalogGroupBy.value === 'category' ? `category:${option.category}` : `format:${option.variant}`
+    const label = catalogGroupBy.value === 'vendor' ? vendor || t('editor.plugins.unknownVendor')
+      : catalogGroupBy.value === 'category' ? categoryLabels.value[option.category] : option.variant
+    const unknown = catalogGroupBy.value === 'vendor' ? !vendor : catalogGroupBy.value === 'category' && option.category === 'other'
+    if (!groups.has(key)) groups.set(key, { key, label, unknown, plugins: [] })
+    groups.get(key)!.plugins.push(option)
+  }
+  for (const group of groups.values()) group.plugins.sort((a, b) => collator.compare(a.plugin.name, b.plugin.name) || collator.compare(a.variant, b.variant) || collator.compare(a.plugin.path, b.plugin.path))
+  return [...groups.values()].sort((a, b) => Number(a.unknown) - Number(b.unknown) || collator.compare(a.label, b.label))
 })
 const selectedDescriptor = computed(() => descriptors.value.find(plugin => descriptorKey(plugin) === selectedPluginId.value))
 const stopObservingSession = observePluginSession(host => {
@@ -339,12 +368,23 @@ async function toggleEditor(slotId: string) {
             </div>
             <div v-if="relocatingSlot" class="plugin-manager__relocation"><p>{{ t('editor.plugins.relocationHint', { name: relocatingSlot.name || relocatingSlot.pluginId }) }}</p><n-button size="tiny" :disabled="busy" @click="relocatingSlotId = null; selectedPluginId = null">{{ t('common.cancel') }}</n-button></div>
             <n-input v-if="descriptors.length" v-model:value="librarySearch" clearable :placeholder="t('editor.plugins.searchLibrary')" :disabled="busy"><template #prefix><n-icon :component="SearchOutline" /></template></n-input>
+            <div v-if="descriptors.length" class="plugin-manager__group-controls">
+              <span>{{ t('editor.plugins.groupBy') }}</span>
+              <n-radio-group v-model:value="catalogGroupBy" size="small" :disabled="busy" :aria-label="t('editor.plugins.groupBy')">
+                <n-radio-button value="vendor">{{ t('editor.plugins.groupVendor') }}</n-radio-button>
+                <n-radio-button value="category">{{ t('editor.plugins.groupCategory') }}</n-radio-button>
+                <n-radio-button value="format">{{ t('editor.plugins.groupFormat') }}</n-radio-button>
+              </n-radio-group>
+            </div>
             <div class="plugin-manager__catalog" :aria-label="t('editor.plugins.selectPlugin')" :aria-busy="busy">
-              <button v-for="option in pluginOptions" :key="option.value" type="button" class="plugin-manager__plugin" :class="{ 'plugin-manager__plugin--selected': selectedPluginId === option.value }" :disabled="busy || option.disabled" :aria-pressed="selectedPluginId === option.value" :aria-label="option.label" :title="option.label" @click="selectedPluginId = option.value">
+              <section v-for="group in catalogGroups" :key="group.key" class="plugin-manager__group" :aria-label="group.label">
+              <div class="plugin-manager__group-heading"><strong>{{ group.label }}</strong><span>{{ group.plugins.length }}</span></div>
+              <button v-for="option in group.plugins" :key="option.value" type="button" class="plugin-manager__plugin" :class="{ 'plugin-manager__plugin--selected': selectedPluginId === option.value }" :disabled="busy || option.disabled" :aria-pressed="selectedPluginId === option.value" :aria-label="option.label" :title="option.label" @click="selectedPluginId = option.value">
                 <span class="plugin-manager__plugin-icon"><n-icon :component="OptionsOutline" :size="19" /></span>
-                <span class="plugin-manager__plugin-info"><strong>{{ option.plugin.name }}</strong><small v-if="option.plugin.vendor || option.disabled">{{ option.plugin.vendor }}<template v-if="option.disabled"> · {{ t('editor.plugins.unsupportedPlugin') }}</template></small><small v-if="option.detail" class="plugin-manager__plugin-identity">{{ option.detail }}</small></span>
+                <span class="plugin-manager__plugin-info"><strong>{{ option.plugin.name }}</strong><small>{{ catalogGroupBy === 'vendor' ? categoryLabels[option.category] : option.plugin.vendor || t('editor.plugins.unknownVendor') }}<template v-if="option.disabled"> · {{ t('editor.plugins.unsupportedPlugin') }}</template></small><small v-if="option.detail" class="plugin-manager__plugin-identity">{{ option.detail }}</small></span>
                 <span class="plugin-manager__format">{{ option.variant }}</span>
               </button>
+              </section>
               <div v-if="!pluginOptions.length" class="plugin-manager__empty plugin-manager__empty--library">
                 <n-icon :component="SearchOutline" :size="26" />
                 <strong>{{ scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
@@ -481,6 +521,13 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__relocation { display: flex; align-items: flex-start; gap: 8px; padding: 9px; border-radius: 6px; background: var(--primary-softer); }
 .plugin-manager__relocation > p { margin: 0; flex: 1; font-size: 12px; line-height: 1.6; }
 .plugin-manager__catalog { flex: 1; min-height: 0; overflow: auto; }
+.plugin-manager__group-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.plugin-manager__group-controls > span { font-size: 11px; color: var(--on-surface-muted); }
+.plugin-manager__group { padding-top: 2px; }
+.plugin-manager__group + .plugin-manager__group { margin-top: 10px; }
+.plugin-manager__group-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 10px 8px; color: var(--on-surface-muted); }
+.plugin-manager__group-heading > strong { min-width: 0; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-manager__group-heading > span { font-size: 10px; font-variant-numeric: tabular-nums; }
 .plugin-manager__plugin { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; margin: 0 0 4px; padding: 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; transition: background 120ms, border-color 120ms; }
 .plugin-manager__plugin:hover:not(:disabled) { background: var(--surface-2); }
 .plugin-manager__plugin--selected, .plugin-manager__plugin--selected:hover:not(:disabled) { background: var(--primary-softer); border-color: var(--primary-border); }

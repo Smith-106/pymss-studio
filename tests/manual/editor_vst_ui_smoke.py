@@ -24,13 +24,13 @@ MOCK = """enabled => {
     unregisterCallback:id=>callbacks.delete(id),convertFileSrc:path=>path,
     invoke:async(command,args={})=>{
       __vstCalls.push({command,args:JSON.parse(JSON.stringify(args))});
-      if(command==='plugin_host_capabilities') return {enabled,platform:enabled?'windows':'linux',formats:['vst3'],nativeEditor:enabled,experimental:true};
+      if(command==='plugin_host_capabilities') return {enabled,platform:enabled?'windows':'linux',formats:['vst3'],nativeEditor:enabled,experimental:true,labBuild:true};
       if(command==='plugin_host_scan_report') {
         await new Promise(resolve=>setTimeout(resolve,__scanDelay));
         if(__scanError) throw new Error('插件扫描未完成：目录不可访问');
-        const plugins=__catalogOverride||[{id:'gain',classId:'gain',name:'Precision Gain',vendor:'Audio Tools',path:'C:/VST3/Gain.vst3',version:'1',isInstrument:false},
-          {id:'echo',classId:'echo',name:'Stereo Echo',vendor:'Audio Tools',path:'C:/VST3/Echo.vst3',version:'1',isInstrument:false},
-          {id:'synth',classId:'synth',name:'Keyboard Instrument',vendor:'Audio Tools',path:'C:/VST3/Synth.vst3',version:'1',isInstrument:true}];
+        const plugins=__catalogOverride||[{id:'gain',classId:'gain',name:'Precision Gain',vendor:'Audio Tools',path:'C:/VST3/Gain.vst3',version:'1',isInstrument:false,category:'Eq',subCategories:['Fx','EQ']},
+          {id:'echo',classId:'echo',name:'Stereo Echo',vendor:'Room Audio',path:'C:/VST3/Echo.vst3',version:'1',isInstrument:false,category:'Delay',subCategories:['Fx','Delay']},
+          {id:'synth',classId:'synth',name:'Keyboard Instrument',vendor:'Audio Tools',path:'C:/VST3/Synth.vst3',version:'1',isInstrument:true,category:'Instrument',subCategories:['Instrument','Synth']}];
         if(args.force)__scanFailures=[];
         return {plugins,failures:[...__scanFailures],scanned:args.force?3:0,cached:args.force?0:3};
       }
@@ -189,13 +189,28 @@ with sync_playwright() as playwright:
         expect(panel).to_be_visible()
         def choose_plugin(name):
             panel.locator('.plugin-manager__plugin').filter(has_text=name).click()
-        search=panel.get_by_placeholder('搜索名称、厂商或格式',exact=True)
+        search=panel.get_by_placeholder('搜索名称、厂商、类型或格式',exact=True)
+        expect(panel.locator('.plugin-manager__group-heading strong')).to_have_text(['Audio Tools','Room Audio'])
+        choose_plugin('Precision Gain')
+        panel.get_by_text('效果类型',exact=True).click()
+        expect(panel.get_by_role('radio',name='效果类型',exact=True)).to_be_checked()
+        expect(panel.locator('.plugin-manager__group-heading strong')).to_have_count(3)
+        assert sorted(panel.locator('.plugin-manager__group-heading strong').all_text_contents())==sorted(['均衡与滤波','延迟','乐器'])
+        expect(panel.locator('.plugin-manager__plugin').filter(has_text='Precision Gain')).to_have_attribute('aria-pressed','true')
+        search.fill('均衡')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
+        expect(panel.locator('.plugin-manager__group-heading strong')).to_have_text(['均衡与滤波'])
+        search.fill('')
+        panel.get_by_text('插件格式',exact=True).click()
+        expect(panel.locator('.plugin-manager__group-heading strong')).to_have_text(['VST3'])
+        panel.get_by_text('厂商',exact=True).click()
+        results.append({'scenario':'vendor-effect-type-and-format-groups-preserve-selection-and-search','passed':True})
         choose_plugin('Precision Gain')
         search.fill('not-installed-effect')
         expect(panel.get_by_text('没有符合条件的效果器',exact=True)).to_be_visible()
         expect(panel.locator('.plugin-manager__add-button')).to_be_disabled()
         search.fill('audio tools')
-        expect(panel.locator('.plugin-manager__plugin')).to_have_count(3)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(2)
         search.fill('PRECISION')
         expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
         expect(panel.locator('.plugin-manager__plugin')).to_contain_text('Precision Gain')

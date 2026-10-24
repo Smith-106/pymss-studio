@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["audio-host", "vst2-host", "vendor/soundcraft-au-host", "vendor/soundcraft-vst3-host", "vendor/soundcraft-dsp"]
+members = ["audio-host", "vst2-host", "aax-probe", "vendor/soundcraft-au-host", "vendor/soundcraft-vst3-host", "vendor/soundcraft-dsp"]
 
 [workspace.package]
 version = "0.12.1"

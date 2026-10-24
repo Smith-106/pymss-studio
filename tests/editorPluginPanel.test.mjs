@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { computed, effectScope, nextTick, reactive, ref, watch } from 'vue'
-import { clonePluginChain, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
+import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 const component = readFileSync(new URL('../src/components/editor/EditorPluginPanel.vue', import.meta.url), 'utf8')
 const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
@@ -25,7 +25,7 @@ function environment(t) {
     failures: [], scanned: 1, cached: 0,
   } }
   const context = vm.createContext({
-    computed, ref, watch, defineProps: () => props, useI18n: () => ({ t: key => key }),
+    computed, ref, watch, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
     useEditorStore: () => ({
       async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise },
       setPluginChain(trackId, chain) {
@@ -52,7 +52,7 @@ function environment(t) {
     crypto: { randomUUID: () => 'added-slot' },
     localStorage: { getItem: key => preferences.get(key) ?? null, setItem: (key, value) => preferences.set(key, value) },
     window: { addEventListener() {}, removeEventListener() {} },
-    clonePluginChain, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
+    clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
   })
   const scope = effectScope()
   scope.run(() => vm.runInContext(code, context))
@@ -100,6 +100,46 @@ test('catalog searches names, vendors and formats and clears a hidden or unsuppo
   env.set('capabilities', { enabled: true, formats: ['vst2'] })
   await flush()
   assert.equal(env.read('selectedPluginId'), null)
+  assert.equal(env.writes.length, 0)
+})
+
+test('vendor grouping merges casing and whitespace, sorts names and keeps unknown vendors last', async t => {
+  const env = environment(t)
+  const plugins = [
+    { id: 'late', name: 'Zeta', vendor: ' Vendor ', path: '/zeta.vst3' },
+    { id: 'first', name: 'Alpha', vendor: 'vendor', path: '/alpha.vst3' },
+    { id: 'unknown', name: 'Unlabelled', vendor: '', path: '/unknown.vst3' },
+    { id: 'second', name: 'Other', vendor: 'Another', path: '/other.vst3' },
+  ]
+  env.set('descriptors', plugins)
+  const groups = env.read('catalogGroups')
+  assert.deepEqual(Array.from(groups, group => group.key), ['vendor:another', 'vendor:vendor', 'vendor:'])
+  assert.deepEqual(Array.from(groups[1].plugins, option => option.plugin.name), ['Alpha', 'Zeta'])
+  env.set('selectedPluginId', JSON.stringify(['late', '/zeta.vst3']))
+  env.set('catalogGroupBy', 'format')
+  await flush()
+  assert.equal(env.read('selectedPluginId'), JSON.stringify(['late', '/zeta.vst3']))
+  assert.equal(env.read('catalogGroups').length, 1)
+  assert.equal(env.read('catalogGroups')[0].label, 'VST3')
+  assert.equal(env.writes.length, 0)
+})
+
+test('effect groups and category search use reported metadata and never infer types from names', async t => {
+  const env = environment(t)
+  env.set('descriptors', [
+    { id: 'eq', name: 'Channel', vendor: 'Maker', path: '/eq.vst3', category: 'Eq', subCategories: ['Fx', 'EQ'] },
+    { id: 'room', name: 'Room', vendor: 'Maker', path: '/room.dll', format: 'vst2', rawCategory: 6 },
+    { id: 'unknown', name: 'Magic EQ Reverb Delay', vendor: '', path: '/unknown.vst3' },
+  ])
+  env.set('catalogGroupBy', 'category')
+  assert.deepEqual(Array.from(env.read('catalogGroups'), group => group.key).sort(), ['category:ambience', 'category:eq', 'category:other'])
+  assert.equal(env.read('catalogGroups').at(-1).key, 'category:other')
+  env.set('selectedPluginId', JSON.stringify(['room', '/room.dll']))
+  env.set('librarySearch', 'EQ')
+  await flush()
+  assert.equal(env.read('selectedPluginId'), null)
+  assert.equal(env.read('pluginOptions').length, 2)
+  assert.ok(env.read('catalogGroups').every(group => group.plugins.every(option => option.plugin.id !== 'room')))
   assert.equal(env.writes.length, 0)
 })
 

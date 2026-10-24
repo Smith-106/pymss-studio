@@ -9,6 +9,7 @@ globalThis.window={matchMedia:()=>({matches:false}),addEventListener(){},removeE
 Object.defineProperty(globalThis,'navigator',{value:{language:'en'},configurable:true})
 const { useEditorStore }=await vite.ssrLoadModule('/src/stores/editor.ts')
 const host=await vite.ssrLoadModule('/src/utils/pluginHost.ts')
+const {runWindowCloseGuards,WindowClosePersistenceError}=await vite.ssrLoadModule('/src/utils/windowCloseGuards.ts')
 const environments=[]
 const hostCapabilities={enabled:true,formats:['vst3','vst2','au']}
 const flush=async()=>{for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve))}
@@ -56,7 +57,7 @@ function environment(t,{builtinEffects}={}){
       }
       return status()
     }
-    if(command==='save_editor_project'){controls.persisted=JSON.parse(JSON.stringify(args.project));return args.project}
+    if(command==='save_editor_project'){if(controls.saveError)throw new Error('Project storage is unavailable');controls.persisted=JSON.parse(JSON.stringify(args.project));return args.project}
     if(command==='load_editor_project')return controls.persisted
     if(command==='plugin_host_render')return{path:'C:/native-render.wav',duration:2,sampleRate:48000,channels:2}
     if(command==='plugin_host_cleanup_render')return
@@ -74,7 +75,7 @@ function environment(t,{builtinEffects}={}){
 }
 afterEach(async()=>{
   for(const env of environments.splice(0)){
-    env.controls.snapshotError=false;env.controls.statusError=false;env.controls.updateError=false;env.controls.partialSnapshot=false;env.controls.omittedSlots=[];env.controls.snapshotGate=null;env.controls.parameterGate=null
+    env.controls.snapshotError=false;env.controls.statusError=false;env.controls.updateError=false;env.controls.saveError=false;env.controls.partialSnapshot=false;env.controls.omittedSlots=[];env.controls.snapshotGate=null;env.controls.parameterGate=null
     const current=host.currentPluginSession()
     if(current){await host.snapshotPluginStates(current.project,{force:true});await host.unloadPluginSession(current.project.id)}
     env.editor.$dispose();env.t.mock.timers.reset()
@@ -275,6 +276,79 @@ test('a dead host stays dirty until explicit recovery restores saved slots and p
  assert.equal(env.saved().at(-1).args.project.masterVolume,0.33)
  assert.equal(env.editor.pluginStateUnavailable,false)
  assert.equal(env.editor.pluginStateError,null)
+})
+
+test('window close saves native edits before unloading and disposed stores leave no close guards',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.states.slot='sha256:closing-state'
+ env.calls.length=0
+ await runWindowCloseGuards()
+ assert.equal(env.saved().at(-1).args.project.pluginChain[0].state,'sha256:closing-state')
+ assert.equal(env.calls.at(-1).args.request.op,'unload')
+ assert.equal(host.currentPluginSession(),null)
+ env.editor.$dispose();env.calls.length=0
+ await runWindowCloseGuards()
+ assert.equal(env.calls.length,0)
+})
+
+test('failed close preserves native state until explicit discard, which never writes a stale project',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ await env.tick(900)
+ env.calls.length=0;env.controls.snapshotError=true
+ await assert.rejects(runWindowCloseGuards(),WindowClosePersistenceError)
+ assert.equal(env.calls.some(call=>call.args?.request?.op==='unload'),false)
+ assert.equal(env.saved().length,0)
+ await runWindowCloseGuards(async()=> 'discard')
+ assert.equal(env.saved().length,0)
+ assert.equal(env.calls.at(-1).args.request.op,'unload')
+ assert.equal(env.calls.at(-1).args.request.discardUnsaved,true)
+ assert.equal(host.currentPluginSession(),null)
+ await env.tick(20000)
+ assert.equal(env.saved().length,0)
+})
+
+test('retrying a blocked window close saves the surviving controller and releases it',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.snapshotError=true;env.controls.states.slot='sha256:retry-close'
+ await runWindowCloseGuards(async()=>{env.controls.snapshotError=false;return 'retry'})
+ assert.equal(env.saved().at(-1).args.project.pluginChain[0].state,'sha256:retry-close')
+ assert.equal(host.currentPluginSession(),null)
+})
+
+test('an autosave capture already in flight cannot start a new save after explicit discard',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ await env.tick(900)
+ env.calls.length=0;env.controls.saveError=true
+ let failure
+ try{await runWindowCloseGuards()}catch(error){failure=error}
+ assert.ok(failure instanceof WindowClosePersistenceError)
+ env.controls.saveError=false;env.calls.length=0;env.controls.states.slot='sha256:discarded-autosave';env.controls.revision++
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ env.controls.snapshotGate=deferred()
+ await env.tick(900)
+ assert.equal(env.snapshots().length,1)
+ const discarding=failure.discardAndRelease()
+ await flush()
+ env.controls.snapshotGate.resolve()
+ await discarding
+ await env.tick(10000)
+ assert.equal(env.saved().length,0)
+ assert.equal(host.currentPluginSession(),null)
+})
+
+test('discarding a failed close cannot release a project opened while the decision was pending',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.snapshotError=true
+ await assert.rejects(runWindowCloseGuards(async()=>{
+  env.editor.session={...env.editor.session,id:'next-project'}
+  return 'discard'
+ }),/changed|superseded|已/)
+ assert.equal(env.calls.some(call=>call.args?.request?.op==='unload'),false)
 })
 
 test('retry probes an unavailable session and captures a surviving controller without reloading it',async t=>{

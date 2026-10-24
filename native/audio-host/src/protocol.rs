@@ -24,15 +24,26 @@ fn au_scan_target(path: &Path) -> Result<Option<&str>, String> {
 
 #[cfg(any(target_os = "macos", test))]
 fn au_descriptor(plugin: soundcraft_au_host::AuDescriptor) -> Value {
+    let codes = soundcraft_au_host::parse_id(&plugin.id);
     json!({ "id": plugin.id, "classId": plugin.id, "format": "au", "name": plugin.name,
         "vendor": plugin.vendor, "version": plugin.version, "path": plugin.id,
-        "isInstrument": plugin.is_instrument, "auVersion": if plugin.is_v3 { 3 } else { 2 } })
+        "isInstrument": plugin.is_instrument, "auVersion": if plugin.is_v3 { 3 } else { 2 },
+        "componentType": codes.map(|codes| codes.0), "componentSubtype": codes.map(|codes| codes.1),
+        "componentManufacturer": codes.map(|codes| codes.2) })
 }
 
 fn vst2_descriptor(plugin: pymss_vst2_host::Vst2Descriptor) -> Value {
     json!({ "id": plugin.id, "classId": plugin.id, "format": "vst2", "name": plugin.name,
         "vendor": plugin.vendor, "version": plugin.version, "path": plugin.path,
-        "isInstrument": plugin.is_instrument, "isShellChild": plugin.is_shell_child })
+        "isInstrument": plugin.is_instrument, "isShellChild": plugin.is_shell_child,
+        "rawCategory": plugin.raw_category })
+}
+
+fn vst3_descriptor(plugin: soundcraft_vst3_host::Vst3Descriptor) -> Value {
+    json!({ "id": plugin.id, "classId": plugin.class_id, "format": "vst3", "name": plugin.name,
+        "vendor": plugin.vendor, "version": plugin.version, "path": plugin.path,
+        "isInstrument": plugin.is_instrument, "category": plugin.category,
+        "subCategories": plugin.sub_categories })
 }
 
 fn scan(path: &Path) -> Result<Value, String> {
@@ -73,10 +84,7 @@ fn scan(path: &Path) -> Result<Value, String> {
     let plugins: Vec<Value> = soundcraft_vst3_host::load_bundle(path)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|p| {
-            json!({ "id": p.id, "classId": p.class_id, "format": "vst3", "name": p.name, "vendor": p.vendor,
-            "version": p.version, "path": p.path, "isInstrument": p.is_instrument })
-        })
+        .map(vst3_descriptor)
         .collect();
     Ok(json!({ "plugins": plugins }))
 }
@@ -458,7 +466,7 @@ fn host_tick(
 pub fn run_cli() -> Option<i32> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mode = args.first()?.to_str()?;
-    if mode != "--audio-host" && mode != "--plugin-scan" {
+    if mode != "--audio-host" && mode != "--plugin-scan" && mode != "--aax-probe" {
         return None;
     }
     if let Err(error) = crate::protocol_output::initialize() {
@@ -474,12 +482,20 @@ pub fn run_cli() -> Option<i32> {
         )
     };
     let code = soundcraft_vst3_host::with_ui_context(|| {
-        if mode == "--plugin-scan" {
+        if mode == "--plugin-scan" || mode == "--aax-probe" {
             let result = args
                 .get(1)
                 .map(PathBuf::from)
                 .ok_or_else(|| "Plugin path is required".to_string())
-                .and_then(|p| scan(&p));
+                .and_then(|p| {
+                    if mode == "--aax-probe" {
+                        pymss_aax_probe::probe(&p).and_then(|report| {
+                            serde_json::to_value(report).map_err(|error| error.to_string())
+                        })
+                    } else {
+                        scan(&p)
+                    }
+                });
             match result {
                 Ok(value) => match crate::protocol_output::write(&value) {
                     Ok(()) => 0,
@@ -590,6 +606,67 @@ mod tests {
     }
 
     #[test]
+    fn vst3_scan_metadata_preserves_sdk_categories() {
+        let descriptor = vst3_descriptor(soundcraft_vst3_host::Vst3Descriptor {
+            id: "vst3:0123456789ABCDEF0123456789ABCDEF".into(),
+            class_id: "0123456789ABCDEF0123456789ABCDEF".into(),
+            name: "Audio Processor".into(),
+            vendor: "Vendor".into(),
+            version: "1.0.0".into(),
+            sdk_version: "VST 3.7".into(),
+            sub_categories: vec!["Fx".into(), "EQ".into(), "Filter".into()],
+            category: soundcraft_dsp::Category::Eq,
+            is_instrument: false,
+            path: PathBuf::from("processor.vst3"),
+        });
+        assert_eq!(descriptor["category"], "Eq");
+        assert_eq!(descriptor["subCategories"], json!(["Fx", "EQ", "Filter"]));
+        assert_eq!(descriptor["format"], "vst3");
+        assert_eq!(descriptor["isInstrument"], false);
+    }
+
+    #[test]
+    fn vst2_scan_metadata_preserves_the_reported_raw_category() {
+        let descriptor = vst2_descriptor(pymss_vst2_host::Vst2Descriptor {
+            id: "vst2:1234ABCD".into(),
+            name: "Equalizer".into(),
+            vendor: "Vendor".into(),
+            version: "1".into(),
+            path: PathBuf::from("processor.dll"),
+            raw_category: Some(6),
+            is_instrument: Some(false),
+            is_shell_child: false,
+        });
+        assert_eq!(descriptor["rawCategory"], 6);
+        assert!(descriptor.get("category").is_none());
+        assert!(descriptor.get("subCategories").is_none());
+    }
+
+    #[test]
+    fn au_scan_metadata_exposes_component_codes_without_inferred_categories() {
+        let descriptor = au_descriptor(soundcraft_au_host::AuDescriptor {
+            id: "au:aufx:abcd:ABCD".into(),
+            name: "Reverb".into(),
+            vendor: "Vendor".into(),
+            version: "1.0.0".into(),
+            component_type: "aufx".into(),
+            subtype: "abcd".into(),
+            manufacturer: "ABCD".into(),
+            category: soundcraft_dsp::Category::Reverb,
+            is_instrument: false,
+            is_v3: false,
+        });
+        assert_eq!(descriptor["componentType"], u32::from_be_bytes(*b"aufx"));
+        assert_eq!(descriptor["componentSubtype"], u32::from_be_bytes(*b"abcd"));
+        assert_eq!(
+            descriptor["componentManufacturer"],
+            u32::from_be_bytes(*b"ABCD")
+        );
+        assert!(descriptor.get("category").is_none());
+        assert!(descriptor.get("subCategories").is_none());
+    }
+
+    #[test]
     fn shell_scan_metadata_preserves_unknown_classification() {
         let descriptor = vst2_descriptor(pymss_vst2_host::Vst2Descriptor {
             id: "vst2:1234ABCD".into(),
@@ -597,10 +674,12 @@ mod tests {
             vendor: "Vendor".into(),
             version: String::new(),
             path: PathBuf::from("shell.dll"),
+            raw_category: None,
             is_instrument: None,
             is_shell_child: true,
         });
         assert!(descriptor["isInstrument"].is_null());
+        assert!(descriptor["rawCategory"].is_null());
         assert_eq!(descriptor["isShellChild"], true);
     }
 

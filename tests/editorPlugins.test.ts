@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { EditorSession } from '../src/types/editor.ts'
-import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
+import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 function project(): EditorSession {
   return { id: 'project', name: 'Project', masterVolume: 0.6, masterPan: -0.4,
@@ -167,4 +167,28 @@ test('normalization preserves AU variant, shell classification and future plugin
     { ...slot, format: 'vst2', pluginId: 'vst2:12345678', isShellChild: true, isInstrument: null, future: { revision: 4 } },
   ]
   assert.deepEqual(clonePluginChain(normalizePluginChain(saved)), saved)
+})
+
+test('effect categories use declared VST3 types and coarse VST2 values', () => {
+  assert.equal(pluginDescriptorCategory({ id: 'gain', category: 'Eq' }), 'eq')
+  assert.equal(pluginDescriptorCategory({ id: 'meter', category: 'Other', subCategories: ['Fx', 'Analyzer'] }), 'analyzer')
+  assert.equal(pluginDescriptorCategory({ id: 'delay', subCategories: ['Fx|Delay'] }), 'delay')
+  assert.equal(pluginDescriptorCategory({ id: 'vst2:room', rawCategory: 6 }), 'ambience')
+  assert.equal(pluginDescriptorCategory({ id: 'vst2:master', rawCategory: 4 }), 'mastering')
+  assert.equal(pluginDescriptorCategory({ id: 'vst2:unknown', rawCategory: -1 }), 'other')
+  assert.equal(pluginDescriptorCategory({ id: 'vst2:shell-child', isShellChild: true, rawCategory: null }), 'other')
+  assert.equal(pluginDescriptorCategory({ id: 'vst2:shell-child', isShellChild: true, rawCategory: 6 }), 'other')
+})
+
+test('names, unknown tokens and inferred AU categories do not invent effect classifications', () => {
+  const descriptor = { id: 'gain', name: 'Delay Reverb EQ', path: '/Equalizers/Reverb.vst3' }
+  assert.equal(pluginDescriptorCategory(descriptor), 'other')
+  assert.equal(pluginDescriptorCategory({ ...descriptor, category: 'A custom category', subCategories: ['Fx', 'CustomVendorTag'] }), 'other')
+  for (const token of ['constructor', '__proto__', 'toString']) {
+    assert.equal(pluginDescriptorCategory({ ...descriptor, category: token, subCategories: ['Fx', token] }), 'other')
+  }
+  assert.equal(pluginDescriptorCategory({ id: 'au:aufx:test:Make', category: 'Reverb', componentType: 0x61756678 }), 'other')
+  assert.equal(pluginDescriptorCategory({ id: 'au3:aumu:test:Make', componentType: 0x61756d75 }), 'instrument')
+  assert.equal(pluginDescriptorCategory({ id: 'synth', isInstrument: true }), 'instrument')
+  assert.equal(pluginDescriptorCategory({ id: 'synth', subCategories: ['Instrument', 'Synth'] }), 'instrument')
 })

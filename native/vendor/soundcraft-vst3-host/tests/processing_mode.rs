@@ -10,7 +10,7 @@ fn main() {
         soundcraft_vst3_host::shutdown();
         return;
     }
-    for mode in ["", "mode-quality", "reject-offline", "reject-rollback"] {
+    for mode in ["", "mode-quality", "reject-offline", "reject-rollback", "only-ara", "only-offline", "only-rt", "only-rt,reject-reactivate", "no-offline"] {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--child")
             .arg(mode)
@@ -22,11 +22,31 @@ fn main() {
 }
 
 fn check(mode: &str) {
-    let id = soundcraft_vst3_host::scan_paths(&[common::fixture_dir().to_path_buf()])
+    let descriptor = soundcraft_vst3_host::scan_paths(&[common::fixture_dir().to_path_buf()])
         .into_iter()
         .find(|plugin| plugin.name == "Fixture Gain")
-        .unwrap()
-        .id;
+        .unwrap();
+    let id = descriptor.id.clone();
+    if mode == "only-ara" || mode == "only-offline" {
+        let token = if mode == "only-ara" { "OnlyARA" } else { "OnlyOfflineProcess" };
+        assert!(descriptor.sub_categories.iter().any(|category| category == token));
+        assert!(soundcraft_vst3_host::instantiate_plugin(&id).err().unwrap().to_string().contains(token));
+        assert!(soundcraft_vst3_host::instantiate_descriptor(&descriptor).err().unwrap().to_string().contains(token));
+        // A stale or altered caller descriptor must not bypass the live factory's restriction.
+        let mut stale = descriptor;
+        stale.sub_categories.clear();
+        assert!(soundcraft_vst3_host::instantiate_descriptor(&stale).err().unwrap().to_string().contains(token));
+        assert!(soundcraft_vst3_host::create(&id).is_none());
+        assert!(soundcraft_vst3_host::plugin_info(&id).is_none());
+        return;
+    }
+    if mode.split(',').any(|token| token == "only-rt") {
+        check_realtime_only(&descriptor);
+        return;
+    }
+    if mode == "no-offline" {
+        assert!(descriptor.sub_categories.iter().any(|category| category == "NoOfflineProcess"));
+    }
     let mut plugin = soundcraft_vst3_host::instantiate_plugin(&id).unwrap();
     assert!(!plugin.is_offline());
     if mode.starts_with("reject-") {
@@ -87,4 +107,37 @@ fn check(mode: &str) {
     }
     assert!(plugin.load_state(&state));
     assert_eq!(plugin.param("7"), Some(1.5));
+}
+
+
+fn check_realtime_only(descriptor: &soundcraft_vst3_host::Vst3Descriptor) {
+    assert!(descriptor.sub_categories.iter().any(|category| category == "OnlyRT"));
+    let mut unprepared = soundcraft_vst3_host::instantiate_descriptor(descriptor).unwrap();
+    assert!(unprepared.set_offline(true).unwrap_err().contains("OnlyRT"));
+    assert!(!unprepared.is_offline());
+    unprepared.try_prepare(48_000.0, 64, 2).unwrap();
+    let mut initial = vec![vec![0.25; 64]; 2];
+    unprepared.try_process(&mut initial, 64).unwrap();
+    assert!(initial.iter().flatten().all(|value| (*value - 0.125).abs() < 1e-6));
+    drop(unprepared);
+
+    let mut plugin = soundcraft_vst3_host::instantiate_plugin(&descriptor.id).unwrap();
+    plugin.try_prepare(48_000.0, 64, 2).unwrap();
+    assert!(plugin.set_param("7", 1.5));
+    let mut first = vec![vec![0.25; 64]; 2];
+    plugin.try_process(&mut first, 64).unwrap();
+    assert!(first.iter().flatten().all(|value| (*value - 0.375).abs() < 1e-6));
+    let timing = (plugin.latency(), plugin.tail_samples());
+    assert!(plugin.set_param("7", 1.25));
+    let state = plugin.save_state().unwrap();
+    assert!(plugin.set_offline(true).unwrap_err().contains("OnlyRT"));
+    assert!(!plugin.is_offline());
+    assert_eq!(plugin.param("7"), Some(1.25));
+    assert_eq!((plugin.latency(), plugin.tail_samples()), timing);
+    assert_eq!(plugin.save_state().unwrap(), state);
+    // reject-reactivate makes an accidental reconfiguration poison the instance after this point.
+    let mut next = vec![vec![0.25; 64]; 2];
+    plugin.try_process(&mut next, 64).unwrap();
+    assert!(next.iter().flatten().all(|value| (*value - 0.3125).abs() < 1e-6));
+    plugin.set_offline(false).unwrap();
 }

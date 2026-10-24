@@ -3,8 +3,8 @@ import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
-export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; builtinEffects?: boolean; recording?: boolean; experimental: boolean }
-export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean }
+export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; builtinEffects?: boolean; recording?: boolean; experimental: boolean; labBuild?: boolean }
+export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean; category?: string; subCategories?: string[]; rawCategory?: number | null; componentType?: number; componentSubtype?: number; componentManufacturer?: number }
 export type PluginParameter = { id: string; name: string; min: number; max: number; default: number; unit: string; taper: string; choices: string[] }
 export type PluginParameters = Partial<PluginHostStatus> & { params: PluginParameter[]; values: Record<string, number> }
 export type PluginScanReport = { plugins: PluginDescriptor[]; failures: { path: string; message: string }[]; scanned: number; cached: number }
@@ -197,12 +197,12 @@ export function snapshotPluginStates(project: EditorSession, options: { force?: 
   })
 }
 
-export function unloadPluginSession(projectId: string) {
+export function unloadPluginSession(projectId: string, options: { discardUnsaved?: boolean } = {}) {
   return enqueue(async () => {
     const current = loaded
     if (!current || current.project.id !== projectId) return
-    if (current.dirty || current.error) throw new Error(current.error || String(i18n.global.t('editor.plugins.stateCaptureUnavailable')))
-    await requestNow({ op: 'unload', projectId })
+    if (!options.discardUnsaved && (current.dirty || current.error)) throw new Error(current.error || String(i18n.global.t('editor.plugins.stateCaptureUnavailable')))
+    await requestNow({ op: 'unload', projectId, ...(options.discardUnsaved ? { discardUnsaved: true, expectedSessionId: current.sessionId } : {}) })
     if (loaded === current) { loaded = null; publish() }
     if (monitor) { clearTimeout(monitor); monitor = null }
   })

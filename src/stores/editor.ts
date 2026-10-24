@@ -12,7 +12,7 @@ import {
   syncSingleClipFadeCompatibility,
   timelineDuration,
 } from '@/utils/editorClips'
-import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
+import { registerWindowCloseGuard, WindowClosePersistenceError } from '@/utils/windowCloseGuards'
 import { isTauriRuntime } from '@/utils/appStore'
 import type { SeparationTask, StemOutput } from '@/stores/task'
 import type {
@@ -774,9 +774,10 @@ export const useEditorStore = defineStore('editor', () => {
   let saveDrainTask: Promise<EditorSession | null> | null = null
   const pendingProjectSaves = new Map<string, PersistedSession>()
   const suspendedProjectSaves = new Set<string>()
+  let discardingWindowChanges = false
 
   function queueSessionSave() {
-    if (!session.value) return null
+    if (!session.value || discardingWindowChanges) return null
     const project = toPersistedSession(session.value)
     if (suspendedProjectSaves.has(project.id)) return null
     pendingProjectSaves.set(project.id, project)
@@ -799,12 +800,14 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   function schedulePluginStateSave(project: EditorSession, attempt = 0) {
+    if (discardingWindowChanges) return
     if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
     pluginSaveTimer = setTimeout(async () => {
       pluginSaveTimer = null
       if (session.value !== project) return
       try {
         await capturePluginState(project)
+        if (discardingWindowChanges || session.value !== project) return
         queueSessionSave()
         await drainPendingSaves()
       } catch {
@@ -869,11 +872,13 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   async function drainPendingSaves() {
+    if (discardingWindowChanges) return null
     if (saveDrainTask) return saveDrainTask
     const task = (async () => {
       saving.value = true
       try {
         while (pendingProjectSaves.size) {
+          if (discardingWindowChanges) return null
           const next = pendingProjectSaves.entries().next().value as [string, PersistedSession] | undefined
           if (!next) break
           const [projectId, project] = next
@@ -881,6 +886,7 @@ export const useEditorStore = defineStore('editor', () => {
           try {
             const target = session.value?.id === projectId ? session.value : project
             if (hasEditorPlugins(target)) await capturePluginState(target)
+            if (discardingWindowChanges) return null
             const captured = toPersistedSession(target)
             const result = await invoke<PersistedSession>('save_editor_project', { project: captured })
             if (session.value?.id === projectId) {
@@ -893,7 +899,7 @@ export const useEditorStore = defineStore('editor', () => {
             }
           } catch (error) {
             // Keep a newer snapshot if edits arrived while this save was in flight.
-            if (!pendingProjectSaves.has(projectId)) pendingProjectSaves.set(projectId, toPersistedSession(session.value?.id === projectId ? session.value : project))
+            if (!discardingWindowChanges && !pendingProjectSaves.has(projectId)) pendingProjectSaves.set(projectId, toPersistedSession(session.value?.id === projectId ? session.value : project))
             lastError.value = error instanceof Error ? error.message : String(error)
             if (session.value?.id === projectId && hasEditorPlugins(project)) {
               pluginStateDirty.value = true
@@ -936,13 +942,36 @@ export const useEditorStore = defineStore('editor', () => {
 
   // The store outlives the editor route. Keeping persistence here ensures a
   // delayed autosave is still flushed when the user closes from another page.
-  registerWindowCloseGuard(async () => {
-    await flushSave()
-  }, -100)
+  onScopeDispose(registerWindowCloseGuard(async () => {
+    const closingProject = session.value
+    try {
+      await flushSave()
+      const host = currentPluginSession()
+      if (host?.project === closingProject) await unloadPluginSession(host.project.id)
+      else if (host) await releasePluginSession(host.project)
+    } catch (cause) {
+      throw new WindowClosePersistenceError(cause, async () => {
+        if (session.value !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+        discardingWindowChanges = true
+        try {
+          if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+          if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+          await saveDrainTask?.catch(() => undefined)
+          if (session.value !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+          const host = currentPluginSession()
+          if (host && host.project !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+          if (host) await unloadPluginSession(host.project.id, { discardUnsaved: true })
+          pendingProjectSaves.clear()
+        } finally {
+          discardingWindowChanges = false
+        }
+      })
+    }
+  }, -100))
 
-  registerWindowCloseGuard(async () => {
+  onScopeDispose(registerWindowCloseGuard(async () => {
     if (exporting.value) await cancelExport()
-  }, 100)
+  }, 100))
 
   function selectTrack(trackId: string | null) {
     selectedTrackId.value = trackId

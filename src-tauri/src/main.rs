@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod commands;
+#[cfg(any(target_os = "macos", test))]
+mod app_quit;
 mod automatic_report;
 mod diagnostic_context;
 mod diagnostic_report;
@@ -30,7 +32,10 @@ use state::AppState;
 use tauri::{Emitter, Manager};
 
 fn main() {
-    #[cfg(feature = "vst-lab")]
+    if let Some(code) = commands::plugin_host::run_capabilities_cli() {
+        std::process::exit(code);
+    }
+    #[cfg(feature = "native-plugins")]
     if let Some(code) = pymss_audio_host::run_cli() {
         std::process::exit(code);
     }
@@ -96,6 +101,11 @@ fn main() {
     #[cfg(all(desktop, not(feature = "vst-lab")))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(app_quit::menu)
+        .on_menu_event(app_quit::on_menu_event);
+
     builder
         .setup(|app| {
             let _ = session_log::init_session_log(app.handle());
@@ -106,6 +116,7 @@ fn main() {
             commands::plugin_host::plugin_host_capabilities,
             commands::plugin_host::plugin_host_scan,
             commands::plugin_host::plugin_host_scan_report,
+            commands::plugin_host::plugin_host_probe_aax,
             commands::plugin_host::plugin_host_request,
             commands::plugin_host::plugin_host_render,
             commands::plugin_host::plugin_host_cancel_render,

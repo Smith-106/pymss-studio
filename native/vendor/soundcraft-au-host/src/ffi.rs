@@ -735,7 +735,7 @@ pub struct Instance {
     abl: AudioBufferList,
     has_input: bool,
     initialized: bool,
-    channels: usize,
+    layout: crate::channels::ChannelLayout,
     max_frames: usize,
     sample_rate: f64,
     sample_time: f64,
@@ -841,7 +841,10 @@ impl Instance {
             has_input,
             link: Arc::new(StateLink::new(unit, is_v3)),
             initialized: false,
-            channels: 0,
+            layout: crate::channels::ChannelLayout {
+                inputs: 0,
+                outputs: 0,
+            },
             max_frames: 0,
             sample_rate: 48_000.0,
             sample_time: 0.0,
@@ -1034,14 +1037,27 @@ impl Instance {
     }
 
     /// (Re)configures and initializes the unit for `sample_rate`, `max_frames`-frame slices and
-    /// (preferably) `channels` channels on its main input and output buses. Returns the channel
-    /// count it accepted. Not realtime-safe (allocates the buffers).
+    /// (preferably) `channels` channels on its main input and output buses. Input/output widths
+    /// are negotiated independently. Not realtime-safe (allocates the buffers).
     pub fn configure(
         &mut self,
         sample_rate: f64,
         max_frames: usize,
         channels: usize,
-    ) -> Result<usize, String> {
+    ) -> Result<crate::channels::ChannelLayout, String> {
+        if !(1..=2).contains(&channels) {
+            return Err("invalid Audio Unit configuration".into());
+        }
+        let layouts = crate::channels::candidates(channels, self.has_input);
+        self.configure_layouts(sample_rate, max_frames, &layouts)
+    }
+
+    fn configure_layouts(
+        &mut self,
+        sample_rate: f64,
+        max_frames: usize,
+        layouts: &[crate::channels::ChannelLayout],
+    ) -> Result<crate::channels::ChannelLayout, String> {
         if self.initialized {
             // SAFETY: the unit is live and initialized.
             let status = unsafe { AudioUnitUninitialize(self.unit) };
@@ -1055,7 +1071,15 @@ impl Instance {
             || !(8_000.0..=384_000.0).contains(&sample_rate)
             || max_frames == 0
             || max_frames > MAX_SLICE
-            || !(1..=2).contains(&channels)
+            || layouts.is_empty()
+            || layouts.iter().any(|layout| {
+                !(1..=2).contains(&layout.outputs)
+                    || if self.has_input {
+                        !(1..=2).contains(&layout.inputs)
+                    } else {
+                        layout.inputs != 0
+                    }
+            })
         {
             return Err("invalid Audio Unit configuration".into());
         }
@@ -1080,56 +1104,42 @@ impl Instance {
                 return Err(format!("cannot set the input callback ({st})"));
             }
         }
-        let want = channels.clamp(1, MAX_AU_CHANNELS);
-        let mut tried = [0usize; 3];
-        let mut ok = None;
-        let mut last = 0;
-        for (k, ch) in [want, 2, 1].into_iter().enumerate() {
-            if tried.contains(&ch) {
-                continue;
-            }
-            if let Some(t) = tried.get_mut(k) {
-                *t = ch;
-            }
-            let o = self.format(SCOPE_OUTPUT, sample_rate, ch);
+        let layout = crate::channels::negotiate(layouts, |layout| {
+            let o = self.format(SCOPE_OUTPUT, sample_rate, layout.outputs);
             let i = if self.has_input {
-                self.format(SCOPE_INPUT, sample_rate, ch)
+                self.format(SCOPE_INPUT, sample_rate, layout.inputs)
             } else {
                 0
             };
             if o != 0 || i != 0 {
-                last = if o != 0 { o } else { i };
-                continue;
+                return Err(if o != 0 { o } else { i });
             }
             // SAFETY: the unit is live and uninitialized.
             let st = unsafe { AudioUnitInitialize(self.unit) };
             if st == 0 {
-                ok = Some(ch);
-                break;
+                Ok(())
+            } else {
+                Err(st)
             }
-            last = st;
-        }
-        let ch = ok.ok_or_else(|| {
-            format!("the unit accepts no 1/2/{want}-channel float format ({last})")
-        })?;
+        }).map_err(|status| format!("the unit accepts none of the requested mono/stereo input/output float formats ({status})"))?;
         self.initialized = true;
-        self.channels = ch;
+        self.layout = layout;
         self.sample_rate = sample_rate;
         self.time()
             .sample_rate
             .store(sample_rate.to_bits(), Ordering::Relaxed);
-        self.outputs = (0..ch).map(|_| vec![0.0; mf]).collect();
+        self.outputs = (0..layout.outputs).map(|_| vec![0.0; mf]).collect();
         // SAFETY: the callback only runs inside `AudioUnitRender`, which is not running now
         // (we hold `&mut self`), so this exclusive access does not alias.
         let input = unsafe { &mut *self.input };
         input.bufs = if self.has_input {
-            (0..ch).map(|_| vec![0.0; mf]).collect()
+            (0..layout.inputs).map(|_| vec![0.0; mf]).collect()
         } else {
             Vec::new()
         };
         input.frames = 0;
         self.max_frames = mf;
-        Ok(ch)
+        Ok(layout)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1185,7 +1195,7 @@ impl Instance {
 
     /// Output channel `ch` of the last render (`frames` long), wherever the unit left it.
     pub fn output(&self, ch: usize, frames: usize) -> Option<&[f32]> {
-        if self.abl.number_buffers as usize != self.channels || ch >= self.channels {
+        if self.abl.number_buffers as usize != self.layout.outputs || ch >= self.layout.outputs {
             return None;
         }
         let b = self.abl.buffers.get(ch)?;
@@ -1201,8 +1211,8 @@ impl Instance {
         Some(unsafe { std::slice::from_raw_parts(b.data as *const f32, len) })
     }
 
-    pub fn channels(&self) -> usize {
-        self.channels
+    pub fn channel_layout(&self) -> crate::channels::ChannelLayout {
+        self.layout
     }
 
     pub fn reset(&mut self) -> Result<(), OSStatus> {
@@ -1437,7 +1447,7 @@ impl Instance {
 pub(crate) struct RenderConfiguration {
     sample_rate: f64,
     max_frames: usize,
-    channels: usize,
+    layout: crate::channels::ChannelLayout,
 }
 
 impl crate::offline::OfflineUnit for Instance {
@@ -1447,7 +1457,7 @@ impl crate::offline::OfflineUnit for Instance {
         self.initialized.then_some(RenderConfiguration {
             sample_rate: self.sample_rate,
             max_frames: self.max_frames,
-            channels: self.channels,
+            layout: self.layout,
         })
     }
 
@@ -1492,10 +1502,10 @@ impl crate::offline::OfflineUnit for Instance {
     }
 
     fn restart(&mut self, configuration: Self::Configuration) -> Result<(), String> {
-        self.configure(
+        self.configure_layouts(
             configuration.sample_rate,
             configuration.max_frames,
-            configuration.channels,
+            &[configuration.layout],
         )?;
         Ok(())
     }

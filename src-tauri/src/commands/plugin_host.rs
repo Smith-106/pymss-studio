@@ -19,12 +19,13 @@ const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
-const SCAN_CACHE_VERSION: u32 = 2;
+const SCAN_CACHE_VERSION: u32 = 3;
 
 #[derive(Default)]
 struct Session {
     generation: u64,
     project_id: Option<String>,
+    native_session_id: Option<String>,
     process: Option<HostProcess>,
 }
 
@@ -63,8 +64,8 @@ struct HostCapabilities {
     native_editor: bool,
 }
 
-fn platform_capabilities(lab: bool, platform: &str, display: bool) -> HostCapabilities {
-    let enabled = lab && matches!(platform, "windows" | "macos" | "linux");
+fn platform_capabilities(host: bool, platform: &str, display: bool) -> HostCapabilities {
+    let enabled = host && matches!(platform, "windows" | "macos" | "linux");
     HostCapabilities {
         enabled,
         native_editor: enabled && (platform != "linux" || display),
@@ -73,7 +74,7 @@ fn platform_capabilities(lab: bool, platform: &str, display: bool) -> HostCapabi
 
 fn host_capabilities() -> HostCapabilities {
     platform_capabilities(
-        cfg!(feature = "vst-lab"),
+        cfg!(feature = "native-plugins"),
         std::env::consts::OS,
         std::env::var_os("DISPLAY").is_some_and(|value| !value.is_empty()),
     )
@@ -87,14 +88,14 @@ fn require_enabled() -> Result<(), String> {
     if enabled() {
         Ok(())
     } else {
-        Err("Native plugin hosting requires a VST Lab build on Windows, macOS, or Linux".into())
+        Err("Native plugin hosting requires a build with native-plugins enabled on Windows, macOS, or Linux".into())
     }
 }
 
 #[tauri::command]
 pub fn plugin_host_capabilities() -> Value {
     let capabilities = host_capabilities();
-    #[cfg(feature = "vst-lab")]
+    #[cfg(feature = "native-plugins")]
     let (formats, native_editor_formats) = if capabilities.enabled {
         (
             pymss_audio_host::supported_formats(),
@@ -107,7 +108,7 @@ pub fn plugin_host_capabilities() -> Value {
     } else {
         (Vec::new(), Vec::new())
     };
-    #[cfg(not(feature = "vst-lab"))]
+    #[cfg(not(feature = "native-plugins"))]
     let (formats, native_editor_formats): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     json!({
         "enabled": capabilities.enabled, "platform": std::env::consts::OS,
@@ -115,6 +116,32 @@ pub fn plugin_host_capabilities() -> Value {
         "builtinEffects": capabilities.enabled,
         "recording": capabilities.enabled,
         "nativeEditor": capabilities.native_editor, "experimental": true,
+        "labBuild": cfg!(feature = "vst-lab"),
+    })
+}
+
+/// Report build capabilities before desktop, storage, logging or singleton startup.
+/// This also handles builds without the optional host, so packaging checks never open a GUI.
+pub fn run_capabilities_cli() -> Option<i32> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--plugin-host-capabilities")) {
+        return None;
+    }
+    if args.next().is_some() {
+        eprintln!("The plugin capability query does not accept additional arguments");
+        return Some(2);
+    }
+    let mut output = std::io::stdout().lock();
+    let result = serde_json::to_writer(&mut output, &plugin_host_capabilities())
+        .map_err(std::io::Error::other)
+        .and_then(|()| output.write_all(b"\n"))
+        .and_then(|()| output.flush());
+    Some(match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Cannot write plugin host capabilities: {error}");
+            1
+        }
     })
 }
 
@@ -532,6 +559,16 @@ fn close_session(session: &mut Session, pid: &ProcessLease) {
     pid.clear();
     session.process.take();
     session.project_id = None;
+    session.native_session_id = None;
+}
+
+fn discard_session(session: &mut Session, pid: &ProcessLease, project: &str, generation: u64, native_session: &str) -> Value {
+    // An old window may release its own unavailable session, but never a newer project's graph.
+    if session.project_id.as_deref() == Some(project) && session.generation == generation
+        && session.native_session_id.as_deref() == Some(native_session) {
+        close_session(session, pid);
+    }
+    json!({ "closed": true })
 }
 
 fn prepare_session_request(
@@ -567,6 +604,11 @@ fn request_session(
     };
     if result.as_ref().is_err_and(|error| error.is_fatal()) || (result.is_ok() && closing) {
         close_session(session, pid);
+    } else if let Ok(response) = &result {
+        if let Some(id) = response.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            // Latency recovery can replace the native instance without a load/update command.
+            session.native_session_id = Some(id.to_owned());
+        }
     }
     result
 }
@@ -835,6 +877,11 @@ pub async fn plugin_host_request(
             .lock()
             .map_err(|_| "Audio host session lock failed")?;
         require_generation(&state, generation)?;
+        if op == "unload" && request.get("discardUnsaved").and_then(Value::as_bool) == Some(true) {
+            let expected = request.get("expectedSessionId").and_then(Value::as_str)
+                .filter(|id| !id.is_empty()).ok_or("A native session identifier is required to discard changes")?;
+            return Ok(discard_session(&mut session, &state.session_pid, &id, generation, expected));
+        }
         if op != "load"
             && (session.project_id.as_deref() != Some(id.as_str())
                 || session.generation != generation)
@@ -930,11 +977,11 @@ struct ScanFailure {
 }
 
 fn is_plugin_path(path: &Path) -> bool {
-    #[cfg(feature = "vst-lab")]
+    #[cfg(feature = "native-plugins")]
     {
         pymss_audio_host::is_plugin_path(path)
     }
-    #[cfg(not(feature = "vst-lab"))]
+    #[cfg(not(feature = "native-plugins"))]
     {
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -953,11 +1000,11 @@ fn is_virtual_scan_target(path: &Path) -> bool {
 }
 
 fn unsupported_scan_reason(path: &Path) -> Option<&'static str> {
-    #[cfg(feature = "vst-lab")]
+    #[cfg(feature = "native-plugins")]
     {
         pymss_audio_host::unsupported_plugin_reason(path)
     }
-    #[cfg(not(feature = "vst-lab"))]
+    #[cfg(not(feature = "native-plugins"))]
     {
         path.ancestors()
             .any(|path| {
@@ -1052,7 +1099,7 @@ fn scan_paths(paths: Vec<String>) -> Result<(Vec<PathBuf>, Vec<ScanFailure>), St
     for path in paths {
         let result = (|| {
             if is_virtual_scan_target(&path) {
-                return if cfg!(all(feature = "vst-lab", target_os = "macos")) {
+                return if cfg!(all(feature = "native-plugins", target_os = "macos")) {
                     Ok(())
                 } else {
                     Err("Audio Unit discovery is only available on macOS".into())
@@ -1081,20 +1128,20 @@ fn scan_paths(paths: Vec<String>) -> Result<(Vec<PathBuf>, Vec<ScanFailure>), St
 }
 
 fn selected_scan_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let audio_units = cfg!(all(feature = "vst-lab", target_os = "macos"))
+    let audio_units = cfg!(all(feature = "native-plugins", target_os = "macos"))
         && paths.iter().any(|path| is_virtual_scan_target(path));
     let roots: Vec<_> = paths
         .into_iter()
         .filter(|path| !is_virtual_scan_target(path))
         .collect();
     // Never let an empty source list reach the native finder's default fallback.
-    #[cfg(feature = "vst-lab")]
+    #[cfg(feature = "native-plugins")]
     let mut bundles = if roots.is_empty() {
         Vec::new()
     } else {
         pymss_audio_host::find_bundles(&roots)
     };
-    #[cfg(not(feature = "vst-lab"))]
+    #[cfg(not(feature = "native-plugins"))]
     let mut bundles: Vec<PathBuf> = {
         let _ = roots;
         Vec::new()
@@ -1342,6 +1389,52 @@ pub async fn plugin_host_scan_report(
     .map_err(|error| error.to_string())
 }
 
+fn aax_probe_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute()
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("aaxplugin"))
+    {
+        return Err("An absolute AAX package path is required".into());
+    }
+    Ok(path)
+}
+
+/// Module/version diagnostics only; this does not add AAX to supported_formats.
+#[tauri::command]
+pub async fn plugin_host_probe_aax(
+    state: State<'_, PluginHostState>,
+    path: String,
+) -> Result<Value, String> {
+    require_enabled()?;
+    let path = aax_probe_path(&path)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .scan_lock
+            .lock()
+            .map_err(|_| "Plugin scan lock failed")?;
+        if state.scan_process.id() == u32::MAX {
+            return Err("Plugin inspection was cancelled".into());
+        }
+        let process = HostProcess::spawn(&[std::ffi::OsStr::new("--aax-probe"), path.as_os_str()])?;
+        state.scan_process.publish(&process)?;
+        let result = process
+            .receive(SCAN_TIMEOUT)
+            .map_err(|error| error.to_string());
+        drop(process);
+        state.scan_process.release();
+        if state.scan_process.id() == u32::MAX {
+            Err("Plugin inspection was cancelled".into())
+        } else {
+            result
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn render_directory(root: &Path, task_id: &str) -> Result<PathBuf, String> {
     if task_id.is_empty()
         || task_id.len() > 128
@@ -1520,6 +1613,56 @@ pub async fn plugin_host_cleanup_render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_discard_releases_only_its_own_session_and_tolerates_an_already_closed_host() {
+        let pid = ProcessLease::default();
+        let mut session = Session { project_id: Some("old".into()), native_session_id: Some("instance-new".into()), generation: 4, ..Session::default() };
+        discard_session(&mut session, &pid, "old", 3, "instance-new");
+        assert_eq!(session.project_id.as_deref(), Some("old"));
+        discard_session(&mut session, &pid, "other", 4, "instance-new");
+        assert_eq!(session.project_id.as_deref(), Some("old"));
+        discard_session(&mut session, &pid, "old", 4, "instance-old");
+        assert_eq!(session.project_id.as_deref(), Some("old"));
+        assert_eq!(discard_session(&mut session, &pid, "old", 4, "instance-new")["closed"], true);
+        assert!(session.project_id.is_none());
+        assert_eq!(discard_session(&mut session, &pid, "old", 4, "instance-new")["closed"], true);
+    }
+
+    #[test]
+    fn build_capabilities_separate_native_host_support_from_lab_identity() {
+        let capabilities = plugin_host_capabilities();
+        let available = cfg!(feature = "native-plugins")
+            && matches!(std::env::consts::OS, "windows" | "macos" | "linux");
+        assert_eq!(capabilities["enabled"], available);
+        assert_eq!(capabilities["labBuild"], cfg!(feature = "vst-lab"));
+        assert_eq!(capabilities["experimental"], true);
+        let formats = capabilities["formats"].as_array().unwrap();
+        if available {
+            assert!(formats.contains(&json!("vst2")));
+            assert!(formats.contains(&json!("vst3")));
+            assert_eq!(formats.contains(&json!("au")), cfg!(target_os = "macos"));
+        } else {
+            assert!(formats.is_empty());
+        }
+        assert!(!formats.contains(&json!("aax")));
+    }
+
+    #[test]
+    fn aax_probe_accepts_only_explicit_absolute_package_paths() {
+        for path in [
+            "Effect.aaxplugin",
+            "au:system",
+            "",
+            "relative/Effect.aaxplugin",
+        ] {
+            assert!(aax_probe_path(path).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(aax_probe_path(&root.path().join("Other.vst3").to_string_lossy()).is_err());
+        let package = root.path().join("音频 Effect.AAXPLUGIN");
+        assert_eq!(aax_probe_path(&package.to_string_lossy()).unwrap(), package);
+    }
 
     #[test]
     fn platform_support_keeps_headless_linux_audio_enabled_without_an_editor() {
@@ -1927,6 +2070,44 @@ mod tests {
     }
 
     #[test]
+    fn old_scan_cache_is_reprobed_and_current_category_metadata_survives_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("effect.vst3");
+        fs::write(&binary, "plugin-binary").unwrap();
+        let path = binary
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let fingerprint = bundle_fingerprint(&binary).unwrap();
+        fs::write(
+            root.path().join("plugin-cache.json"),
+            serde_json::to_vec(&json!({
+                "version":2,"entries":[{"path":path,"fingerprint":fingerprint,
+                    "plugins":[{"id":"gain","isInstrument":false}],"error":null}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = scan_bundles(root.path(), vec![binary.clone()], Vec::new(), false, |_| {
+            Ok(vec![
+                json!({"id":"gain","format":"vst3","isInstrument":false,
+                "category":"Eq","subCategories":["Fx","EQ"]}),
+            ])
+        })
+        .unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.cached, 0);
+        let cached = scan_bundles(root.path(), vec![binary], Vec::new(), false, |_| {
+            panic!("current metadata should be reused without loading the plugin")
+        })
+        .unwrap();
+        assert_eq!(cached.cached, 1);
+        assert_eq!(cached.plugins[0]["category"], "Eq");
+        assert_eq!(cached.plugins[0]["subCategories"], json!(["Fx", "EQ"]));
+    }
+
+    #[test]
     fn scan_paths_only_validates_explicit_sources() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing");
@@ -1972,7 +2153,7 @@ mod tests {
         assert_eq!(report.cached, 0);
     }
 
-    #[cfg(feature = "vst-lab")]
+    #[cfg(feature = "native-plugins")]
     #[test]
     fn selected_directory_does_not_include_other_sources_or_audio_units() {
         let root = tempfile::tempdir().unwrap();
@@ -1991,7 +2172,7 @@ mod tests {
     #[test]
     fn audio_unit_catalog_requires_an_explicit_supported_source() {
         let (paths, failures) = scan_paths(vec!["au:system".into(), "au:system".into()]).unwrap();
-        if cfg!(all(feature = "vst-lab", target_os = "macos")) {
+        if cfg!(all(feature = "native-plugins", target_os = "macos")) {
             assert!(failures.is_empty());
             assert_eq!(
                 selected_scan_targets(paths),
@@ -2269,10 +2450,27 @@ mod tests {
             Session {
                 generation: 9,
                 project_id: Some("fixture".into()),
+                native_session_id: Some("fixture-session".into()),
                 process: Some(process),
             },
             pid,
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn status_after_native_recovery_updates_the_identity_required_for_discard() {
+        let (_root, mut session, pid) = scripted_session(&[
+            r#"{"id":1,"ok":true,"result":{"sessionId":"recovered-session","stateRevision":8}}"#,
+        ]);
+        request_session(&mut session, &pid, json!({"op":"status"}), Duration::from_secs(2)).unwrap();
+        assert_eq!(session.native_session_id.as_deref(), Some("recovered-session"));
+        discard_session(&mut session, &pid, "fixture", 9, "fixture-session");
+        assert!(session.process.is_some());
+        discard_session(&mut session, &pid, "fixture", 9, "recovered-session");
+        assert!(session.process.is_none());
+        assert!(session.native_session_id.is_none());
+        assert_eq!(pid.id(), 0);
     }
 
     #[cfg(windows)]
@@ -2425,6 +2623,7 @@ mod tests {
             let mut session = Session {
                 generation: 1,
                 project_id: Some("fixture".into()),
+                native_session_id: Some("fixture-session".into()),
                 process: Some(process),
             };
             let error = request_session(

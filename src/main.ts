@@ -57,7 +57,7 @@ async function bootstrap() {
     }
   }
   const pluginHost = await pluginHostCapabilities()
-  if (!pluginHost.enabled) await updates.initialize().catch((error) => {
+  if (pluginHost.labBuild !== true) await updates.initialize().catch((error) => {
     studioLog.warn('Failed to initialize update store', error)
   })
   const tasks = await import('@/stores/task').then((mod) => mod.useTaskStore(pinia))
@@ -130,7 +130,7 @@ async function bootstrap() {
   }).catch((error) => {
     studioLog.warn('Failed to load runtime info', error)
   })
-  if (!pluginHost.enabled) void updates.checkForUpdates().catch((error) => {
+  if (pluginHost.labBuild !== true) void updates.checkForUpdates().catch((error) => {
     studioLog.warn('Failed to check for updates', error)
   })
 }

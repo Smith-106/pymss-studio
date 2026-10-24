@@ -1,0 +1,49 @@
+//! Failed metadata probes are coalesced; explicit loading always gets a fresh attempt.
+
+use std::collections::HashSet;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Attempt {
+    Explicit,
+    Metadata,
+}
+
+#[derive(Default)]
+pub(crate) struct Attempts {
+    failed: HashSet<String>,
+}
+
+impl Attempts {
+    pub(crate) fn allowed(&self, id: &str, attempt: Attempt) -> bool {
+        matches!(attempt, Attempt::Explicit) || !self.failed.contains(id)
+    }
+    pub(crate) fn completed(&mut self, id: &str, success: bool) {
+        if success {
+            self.failed.remove(id);
+        } else {
+            self.failed.insert(id.to_owned());
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.failed.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_retry_recovers_after_failure_and_reenables_metadata() {
+        let mut attempts = Attempts::default();
+        let id = "au:aufx:dely:appl";
+        assert!(attempts.allowed(id, Attempt::Metadata));
+        attempts.completed(id, false);
+        assert!(!attempts.allowed(id, Attempt::Metadata));
+        assert!(attempts.allowed(id, Attempt::Explicit));
+        attempts.completed(id, true);
+        assert!(attempts.allowed(id, Attempt::Metadata));
+        attempts.completed(id, false);
+        attempts.clear();
+        assert!(attempts.allowed(id, Attempt::Metadata));
+    }
+}

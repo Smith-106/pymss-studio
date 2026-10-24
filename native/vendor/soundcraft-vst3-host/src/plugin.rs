@@ -30,6 +30,7 @@ enum Mapping {
 pub struct Vst3Plugin {
     inst: Instance,
     info: &'static PluginInfo,
+    only_realtime: bool,
     /// VST3 id of each `info.params` entry (same order).
     ids: Vec<u32>,
     writable_ids: HashSet<u32>,
@@ -82,7 +83,7 @@ impl Vst3TimingReader {
 }
 
 impl Vst3Plugin {
-    pub(crate) fn new(inst: Instance, info: &'static PluginInfo) -> Vst3Plugin {
+    pub(crate) fn new(inst: Instance, info: &'static PluginInfo, only_realtime: bool) -> Vst3Plugin {
         let ids: Vec<u32> = info.params.iter().map(|p| p.id.parse::<u32>().unwrap_or(u32::MAX)).collect();
         let maps: Vec<Mapping> = info
             .params
@@ -107,6 +108,7 @@ impl Vst3Plugin {
             .collect();
         let mut p = Vst3Plugin {
             info,
+            only_realtime,
             values: Vec::with_capacity(ids.len()),
             pending: Vec::with_capacity(inst.params().len().min(PARAM_QUEUE_CAP)),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
@@ -214,7 +216,9 @@ impl Vst3Plugin {
 
     /// Select processing mode on the same control/UI thread used for preparation.
     /// No process call may be in flight; the processor is deactivated and configured again.
+    /// An OnlyRT class rejects offline mode before touching its processing configuration.
     pub fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        if offline && self.only_realtime { return Err("OnlyRT plugins support realtime processing only".into()); }
         self.inst.check_timing()?;
         if let Some(error) = &self.failure { return Err(error.clone()); }
         if self.inst.is_offline() == offline { return Ok(()); }

@@ -1,5 +1,6 @@
 //! The process-wide Audio Unit registry: scan cache, leaked `PluginInfo`s, instantiation.
 
+use crate::attempts::{Attempt, Attempts};
 use crate::ffi::{
     self, Instance, PARAM_FLAG_DISPLAY_LOG, PARAM_FLAG_METER_READ_ONLY, PARAM_FLAG_WRITABLE,
     RawParam,
@@ -35,7 +36,7 @@ struct Registry {
     /// One leaked `PluginInfo` per plugin type that was actually instantiated.
     infos: HashMap<String, &'static PluginInfo>,
     /// Ids that failed to instantiate (not retried every UI frame).
-    failed: HashSet<String>,
+    attempts: Attempts,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -94,7 +95,7 @@ pub fn scan() -> Vec<AuDescriptor> {
 pub fn rescan() -> Vec<AuDescriptor> {
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     r.scanned = None;
-    r.failed.clear();
+    r.attempts.clear();
     ensure_scanned(&mut r).clone()
 }
 
@@ -216,11 +217,14 @@ fn build_info(d: &AuDescriptor, inst: &Instance) -> &'static PluginInfo {
 }
 
 /// Finds the descriptor and creates an instance plus its (cached) info.
-fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, u32), AuError> {
+fn instantiate_raw(
+    id: &str,
+    attempt: Attempt,
+) -> Result<(Instance, &'static PluginInfo, u32), AuError> {
     let (ty, sub, manu) = parse_id(id).ok_or_else(|| AuError::NotFound(id.to_string()))?;
     let desc = {
         let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        if r.failed.contains(id) {
+        if !r.attempts.allowed(id, attempt) {
             return Err(AuError::Instantiate(id.to_string(), "failed before".into()));
         }
         ensure_scanned(&mut r)
@@ -234,6 +238,7 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, u32), AuE
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     match made {
         Ok(inst) => {
+            r.attempts.completed(id, true);
             let info = match r.infos.get(id) {
                 Some(i) => *i,
                 None => {
@@ -245,7 +250,7 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, u32), AuE
             Ok((inst, info, ty))
         }
         Err(e) => {
-            r.failed.insert(id.to_string());
+            r.attempts.completed(id, false);
             Err(AuError::Instantiate(id.to_string(), e))
         }
     }
@@ -262,7 +267,7 @@ pub fn instantiate_plugin(id: &str) -> Result<AuPlugin, AuError> {
             "Audio Unit instruments are not supported".into(),
         ));
     }
-    let (inst, info, ty) = instantiate_raw(id)?;
+    let (inst, info, ty) = instantiate_raw(id, Attempt::Explicit)?;
     if ty != TYPE_EFFECT && ty != TYPE_MUSIC_EFFECT {
         return Err(AuError::Unsupported);
     }
@@ -276,12 +281,14 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         if let Some(i) = r.infos.get(id) {
             return Some(*i);
         }
-        if r.failed.contains(id) {
+        if !r.attempts.allowed(id, Attempt::Metadata) {
             return None;
         }
     }
     // Instantiate once to learn the parameters.
-    instantiate_raw(id).ok().map(|(_, info, _)| info)
+    instantiate_raw(id, Attempt::Metadata)
+        .ok()
+        .map(|(_, info, _)| info)
 }
 
 #[cfg(test)]

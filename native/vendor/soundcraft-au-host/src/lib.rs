@@ -52,6 +52,10 @@
 )]
 
 #[cfg(any(target_os = "macos", test))]
+mod attempts;
+#[cfg(any(target_os = "macos", test))]
+mod channels;
+#[cfg(any(target_os = "macos", test))]
 mod completion;
 #[cfg(any(target_os = "macos", test))]
 mod controller;

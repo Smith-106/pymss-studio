@@ -3,9 +3,11 @@ Pymss Studio VST Lab
 
 Experimental branch: codex/vst3-host-lab
 Original requirement audit and remaining acceptance work: VST-REQUIREMENTS-AUDIT.txt.
-Original three-platform/four-format production target is not complete: AAX has no
-loader, macOS/Linux runtime acceptance is pending, and release builds do not enable
-the optional vst-lab host. The current executable is a Windows debug lab build.
+Current implementation target: Windows/macOS/Linux VST2/VST3 effects and macOS
+AUv2/AUv3 effects. AAX audio hosting is deferred at the user's request; existing
+module inspection remains diagnostic only. Native hosting is now enabled by
+default and connected to all release entries, with experimental status retained
+until real-plugin, native-platform and signed-package acceptance is complete.
 Initial validated host target: Windows x64 VST3 audio effects.
 VST3 implementation now also includes macOS and Linux; native validation is pending there.
 Additional code adapters: Windows/macOS/Linux VST2 effects, including shell children,
@@ -20,6 +22,12 @@ Run from this worktree:
 
 Build a debug executable without publishing/installing:
   pnpm vst:build
+
+Build with the ordinary application identity and native host:
+  pnpm plugins:build --debug --no-bundle
+This build shares the ordinary app's identity/data/update behavior. Its
+config adds macOS plugin-loading entitlements; signing/notarization and native
+platform compatibility still require validation. Lab identity remains separate.
 
 Cargo uses CARGO_TARGET_DIR when supplied. On this machine the experimental
 Tauri target is E:\pymss-vst-lab-target and the native-only target is
@@ -42,6 +50,9 @@ only explicitly selected sources are remembered. Empty lists never scan system
 defaults. On macOS, system Audio Units are a separate explicit source choice.
 The initial position leaves transport visible, and resizing recenters the panel.
 Closing it retains the selected target and catalog; native windows stay open.
+The library groups results by vendor, declared effect type or plugin format.
+VST3 uses SDK metadata; VST2 categories stay coarse; unknown categories are not
+guessed from names. AU currently uses vendor/format and actual component identity.
 Track and master chains support adding, ordering, bypassing, removing and opening
 the plugin's native window. Native edits are observed and automatically captured
 into immutable content-addressed files; manual save and window close await the
@@ -83,11 +94,14 @@ Run tests/manual/vst_real_plugin_smoke.py --help for user-supplied VST2/VST3/AU
 checks, explicit shell child selection and optional native-window validation.
 Run tests/manual/vst_host_fault_smoke.py --help for delay, chain-order and
 crash/hang recovery checks. They use task-specific audio and artifact directories.
+Run tests/manual/vst_processing_restrictions_smoke.py --help for VST3 mode
+admission and preview preservation checks through the native/application helper.
+Run tests/manual/aax_module_smoke.py --help for AAX module/ABI inspection checks.
+AAX diagnostics never enable AAX in the audio plugin library or processing graph.
 
 Upstream provenance: native/vendor/UPSTREAM.txt.
 Future work: native plugin compatibility validation, live input monitoring and
-recording latency calibration. AAX is a separate
-feasibility task pending verified third-party host access conditions.
+recording latency calibration. AAX audio runtime development is deferred.
 
 Validation record (Windows x64, 2026-10-23 UTC)
 -----------------------------------------
@@ -781,3 +795,91 @@ source invalidation, saved chain preservation and footer visibility are covered.
 Browser/native unit checks use synthetic data, not user projects or real plugins.
 macOS/Linux runtime and real third-party plugin/device acceptance remain deferred.
 Artifacts: E:/pymss-vst-lab-artifacts/plugin-manager-v16-* and native-v16-*.
+
+Seventeenth iteration: ordinary host builds and categorized library (2026-10-24 UTC)
+-------------------------------------------------------------------------------
+The native-plugins feature owns host functionality; vst-lab includes it but keeps
+application identity, storage, singleton and updater isolation separate. Frontend
+startup uses the explicit labBuild capability to preserve ordinary update behavior.
+The opt-in plugins:build entry adds the plugin-loading macOS entitlement overlay.
+Default release workflows remain unchanged pending production acceptance.
+
+VST3 categories/subcategories and raw VST2 categories now survive the scan protocol.
+AU component identity is exposed without name-based category inference. The library
+supports vendor/type/format groups, category search and stable plugin identities.
+Cache version 3 refreshes old descriptors. Unknown and shell-child metadata remain
+unclassified; VST2 RoomFx remains a combined reverb/delay type.
+
+Validation: frontend 1157 passed, three skipped; final focused 51 passed; native
+workspace lib 159 passed. Tauri default/native-plugins/vst-lab tests: 46/47/47.
+Both Windows debug builds and ten headless helper checks per executable passed.
+Linux x64 and macOS ARM64/x64 native host/test metadata checks passed offline.
+Eighteen browser scenarios and five light/dark layouts passed. No new real-plugin,
+device, macOS/Linux runtime or signed-release acceptance is claimed. AAX has public
+SDK interfaces to investigate but still has no runtime adapter in this project.
+Logs/hashes: E:/pymss-vst-lab-artifacts/native-v17-* and plugin-manager-v17-*.
+
+Eighteenth iteration: AAX module inspection and VST3 restrictions (2026-10-24 UTC)
+--------------------------------------------------------------------------------
+native/aax-probe resolves Windows x64/macOS packages, inspects seven ACF exports
+and calls the public SDK-version ABI in a disposable --aax-probe helper. The
+Tauri command shares bounded scanner process ownership and cancellation. Module
+stdout is isolated; result/version strings preserve native precision. The
+report always has audioProcessingAvailable=false. Ordinary scan/load and the
+format capability list still exclude AAX audio processing. ACF services/factory,
+generic algorithm contexts, PCM/packet routing, state and UI remain missing.
+Public Avid SDK ABI sources and RAVET's limited self-owned Gain harness were
+reviewed without copying SDK implementations; see native/aax-probe/ABI-SOURCES.txt.
+
+VST3 OnlyARA and OnlyOfflineProcess are refused before normal-insert construction,
+including when caller metadata is stale. OnlyRT refuses fast offline processing
+before mutating a prepared instance. NoOfflineProcess remains allowed for normal
+downmix: it concerns direct offline processing. SDK abort guards and headless
+helper checks cover refusal, preserved preview/state/monitor and bypass recovery.
+
+Validation: native library tests AAX/audio/VST2/AU/VST3 = 6/76/31/30/23; AAX ABI
+integration 2 and audio-host integration 12 passed. SDK fixture integration 11,
+nine isolated processing modes and lifecycle programs passed. Tauri bridge
+default/native-plugins/vst-lab = 47/48/48. Windows native, ordinary-identity and
+Lab application helpers passed nine AAX and five VST3 checks each. Both Windows
+debug builds passed with unchanged implementation source fingerprints. Linux x64 and
+macOS ARM64/x64 audio-host and probe test sources passed six offline metadata
+checks; this does not establish platform runtime compatibility. Three Python
+files passed Ruff/syntax checks. CI now includes these isolated regressions.
+No new real plugins, audio devices, desktop windows or signed releases were run.
+Artifacts and final build fingerprints: E:/pymss-vst-lab-artifacts/native-v18-*.
+
+Nineteenth iteration: non-AAX effect hosts, release and close lifecycle (2026-10-24 UTC)
+------------------------------------------------------------------------------------
+AAX development is deferred. The active target is VST2/VST3 on three desktop
+platforms and macOS AUv2/AUv3. Native hosting is enabled by default; explicit
+minimal builds can pass -- --no-default-features through the Tauri build runner.
+All six release build entries use the native-plugin configuration. macOS default
+and final re-signing preserve plugin-loading and unrelated entitlements. Staged
+executables are checked through the early --plugin-host-capabilities query and
+isolated helper shutdown; this does not certify real-plugin compatibility.
+
+AU effects negotiate independent 1/2-channel inputs/outputs, map each direction
+and retain that exact layout across offline transitions/rollback. Explicit load
+can retry a transient initialization failure; metadata probes still coalesce it.
+
+Window close now persists state then awaits plugin graph release. Persistence
+failure offers retry, keep open or explicit discard; recording/export/update
+guards cannot be bypassed by that recovery. Discard blocks new autosave drains,
+does not write stale project data and checks project/generation/native identity.
+Successful status/snapshot responses track identities changed by latency recovery.
+Recovery controls isolate editor shortcuts and handle Escape explicitly. macOS
+menu Quit/Cmd+Q requests normal guarded window closes, with the main window last;
+Dock Quit/logout native termination remains outside this menu fix.
+
+Validation: frontend 1169 passed/3 skipped, close/persistence focus 60 passed;
+native audio/VST2/AU/VST3 library tests 76/31/35/23 passed, Tauri bridge 50 and quit
+requests 5 passed. Release focus 12 passed; related release regressions 24 passed
+and one platform skip. AU macOS ARM64/x64 plus full native-host Linux x64 and
+macOS ARM64/x64 test-source metadata checks passed offline. macOS Tauri full-app
+compilation/runtime and actual signed releases were not performed. No real plugins,
+audio devices or desktop windows were started. Artifacts: native-v19-* on E:.
+Windows ordinary/Lab/minimal debug builds all passed with unchanged source hashes.
+The ordinary exe passed the real staged-package verifier; Lab identity and disabled
+minimal capability responses were checked without creating desktop data. Each native
+application exe also passed five processing-restriction/state-preservation scenarios.

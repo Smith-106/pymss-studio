@@ -179,52 +179,36 @@ impl AuPlugin {
             return Err("Audio Unit received an incomplete audio block".into());
         }
         self.flush_pending()?;
-        let au_ch = self.inst.channels();
+        let layout = self.inst.channel_layout();
         let mut start = 0;
         while start < frames {
             let n = (frames - start).min(self.inst.max_frames());
             let end = start + n;
-            for c in 0..au_ch {
-                if au_ch == 1 && self.channels == 2 {
-                    let Some(dst) = self.inst.input_mut(c) else {
-                        return Err("Audio Unit input buffer is unavailable".into());
-                    };
-                    for (i, sample) in dst[..n].iter_mut().enumerate() {
-                        *sample = 0.5 * (io[0][start + i] + io[1][start + i]);
-                    }
-                } else {
-                    let src = &io[c.min(self.channels - 1)][start..end];
-                    let Some(dst) = self.inst.input_mut(c) else {
-                        return Err("Audio Unit input buffer is unavailable".into());
-                    };
-                    dst[..n].copy_from_slice(src);
-                }
+            for c in 0..layout.inputs {
+                let source = &io[c.min(self.channels - 1)][start..end];
+                let second = (layout.inputs == 1 && self.channels == 2).then(|| &io[1][start..end]);
+                let Some(dst) = self.inst.input_mut(c) else {
+                    return Err("Audio Unit input buffer is unavailable".into());
+                };
+                crate::channels::copy_channel(&mut dst[..n], source, second)?;
             }
             self.inst
                 .render(n)
                 .map_err(|code| format!("AudioUnitRender failed ({code})"))?;
             for (c, dst) in io.iter_mut().take(self.channels).enumerate() {
                 let dst = &mut dst[start..end];
-                if self.channels == 1 && au_ch == 2 {
+                if self.channels == 1 && layout.outputs == 2 {
                     let (Some(left), Some(right)) =
                         (self.inst.output(0, n), self.inst.output(1, n))
                     else {
                         return Err("Audio Unit output buffer is unavailable".into());
                     };
-                    if left.len() != n || right.len() != n {
-                        return Err("Audio Unit returned an incomplete audio block".into());
-                    }
-                    for ((out, left), right) in dst.iter_mut().zip(left).zip(right) {
-                        *out = 0.5 * (left + right);
-                    }
+                    crate::channels::copy_channel(dst, left, Some(right))?;
                 } else {
-                    let Some(src) = self.inst.output(c.min(au_ch - 1), n) else {
+                    let Some(src) = self.inst.output(c.min(layout.outputs - 1), n) else {
                         return Err("Audio Unit output buffer is unavailable".into());
                     };
-                    if src.len() != n {
-                        return Err("Audio Unit returned an incomplete audio block".into());
-                    }
-                    dst.copy_from_slice(src);
+                    crate::channels::copy_channel(dst, src, None)?;
                 }
                 if dst.iter().any(|sample| !sample.is_finite()) {
                     return Err("Audio Unit returned non-finite audio".into());

@@ -956,7 +956,7 @@ impl Instance {
 
     pub(crate) fn scan_descriptors(&self, path: &Path) -> Result<Vec<Vst2Descriptor>, String> {
         let container = self.descriptor(path);
-        if unsafe { dispatch(self.effect, CATEGORY, 0, 0, ptr::null_mut(), 0.0) } != 10 {
+        if container.raw_category != Some(10) {
             return Ok(vec![container]);
         }
         let mut seen = HashSet::new();
@@ -1008,6 +1008,7 @@ impl Instance {
                 // deliberately unknown until selected instantiation, rather than parent's data.
                 version: String::new(),
                 path: path.to_path_buf(),
+                raw_category: None,
                 is_instrument: None,
                 is_shell_child: true,
             });
@@ -1026,16 +1027,17 @@ impl Instance {
                 |name| name.to_string_lossy().into_owned(),
             );
         }
+        let raw_category =
+            i32::try_from(unsafe { dispatch(self.effect, CATEGORY, 0, 0, ptr::null_mut(), 0.0) })
+                .ok();
         Vst2Descriptor {
             id: format!("vst2:{:08X}", self.shared.unique_id as u32),
             name,
             vendor: unsafe { read_text(self.effect, VENDOR, 0, 64) },
             version: self.shared.version.to_string(),
             path: path.to_path_buf(),
-            is_instrument: Some(
-                self.shared.flags & IS_SYNTH != 0
-                    || unsafe { dispatch(self.effect, CATEGORY, 0, 0, ptr::null_mut(), 0.0) } == 2,
-            ),
+            raw_category,
+            is_instrument: Some(self.shared.flags & IS_SYNTH != 0 || raw_category == Some(2)),
             is_shell_child: self.shared.host.requested_id != 0,
         }
     }
@@ -1975,6 +1977,23 @@ mod tests {
     }
 
     #[test]
+    fn standalone_scan_preserves_raw_dispatch_categories() {
+        for category in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, -1] {
+            let (instance, _) = instance(2, 2, false);
+            // SAFETY: this instance owns the fake effect and no processing thread is running.
+            unsafe {
+                let fake = &mut *((*instance.effect.as_ptr()).object as *mut Fake);
+                fake.category = category;
+            }
+            let descriptors = instance.scan_descriptors(Path::new("gain.dll")).unwrap();
+            assert_eq!(descriptors.len(), 1);
+            assert_eq!(descriptors[0].raw_category, Some(category as i32));
+            assert_eq!(descriptors[0].is_instrument, Some(category == 2));
+            assert!(!descriptors[0].is_shell_child);
+        }
+    }
+
+    #[test]
     fn shell_scan_enumerates_children_without_entering_each_child() {
         let first = 0x1234_5678i32;
         let second = 0x8765_4321u32 as i32;
@@ -1992,6 +2011,7 @@ mod tests {
                 .iter()
                 .all(|descriptor| descriptor.is_shell_child
                     && descriptor.is_instrument.is_none()
+                    && descriptor.raw_category.is_none()
                     && descriptor.version.is_empty())
         );
         assert_eq!(

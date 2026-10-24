@@ -40,7 +40,7 @@ import wave
 
 
 class Host:
-    def __init__(self, executable: Path) -> None:
+    def __init__(self, executable: Path, *, env: dict[str, str] | None = None) -> None:
         self.process = subprocess.Popen(
             [str(executable), "--audio-host"],
             stdin=subprocess.PIPE,
@@ -50,6 +50,7 @@ class Host:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
         self.responses: queue.Queue[dict[str, Any] | Exception] = queue.Queue()
         self.errors: list[str] = []
