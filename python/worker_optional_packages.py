@@ -34,7 +34,12 @@ OPTIONAL_PACKAGES: dict[str, dict[str, str]] = {
 # On Apple Silicon the FunASR component is satisfied by the asr *plugin*
 # (funasr-mlx backend) instead of the Torch-based sidecar: the MLX runtime
 # ships no PyTorch, so the legacy path can only fail there.
-_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
+def _is_apple_silicon() -> bool:
+    """Runtime check (tests monkeypatch sys.platform; keep it authoritative)."""
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+_APPLE_SILICON = _is_apple_silicon()
 
 
 def _apple_silicon_plugin_status(runtime: RuntimeContext | None = None) -> dict[str, Any] | None:
@@ -555,7 +560,10 @@ def cmd_manage_optional_package(payload: dict[str, Any]) -> int:
         # Apple Silicon: installing/uninstalling the funasr component manages the
         # asr plugin (funasr-mlx backend) through the plugin lifecycle instead of
         # the Torch-based sidecar, which cannot work without PyTorch.
-        if name == "funasr" and _APPLE_SILICON:
+        # Apple Silicon reroutes funasr to the asr plugin — but only when there is
+        # no managed sidecar copy in play: a present sidecar copy means classic
+        # optional-package semantics (install/uninstall of that copy).
+        if name == "funasr" and _is_apple_silicon() and not optional_package_status(name, runtime)["installed"] and action == "install":
             return _manage_funasr_via_plugin(action, payload, task_id, runtime)
         current = optional_package_status(name, runtime)
         if action == "install" and not current["installed"]:

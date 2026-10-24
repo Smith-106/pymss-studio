@@ -14,7 +14,6 @@ import { useMessage } from 'naive-ui'
 import { AddOutline, ArrowRedoOutline, ArrowUndoOutline, ExpandOutline, SearchOutline } from '@vicons/ionicons5'
 import { invoke } from '@tauri-apps/api/core'
 import { LGraph, LGraphCanvas, LiteGraph, createBounds, type LGraphNode } from '@comfyorg/litegraph'
-import { invoke } from '@tauri-apps/api/core'
 import '@comfyorg/litegraph/style.css'
 import {
   registerPymssNodes,

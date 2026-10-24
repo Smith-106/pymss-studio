@@ -26,8 +26,6 @@ router.beforeEach(createWorkflowEditorRouteGuard({
 }))
 router.afterEach((to, from, failure) => {
   if (!failure && typeof to.name === 'string' && to.name !== from.name) recordFeatureVisit(to.name)
-  { path: '/plugin-view/:plugin/:viewId', name: 'plugin-view', component: () => import('@/views/PluginWorkspaceView.vue') },
-    { path: '/plugins', name: 'plugins', component: () => import('@/views/PluginsView.vue') },
 })
 
 export default router

@@ -46,6 +46,9 @@ _PLUGIN_TOOL_OPERATIONS = {
     "asr": "pymss.asr.transcribe",
 }
 
+# Tools without a plugin operation route straight to their legacy handler.
+_LEGACY_ONLY_TOOLS = {"loudness"}
+
 
 def _runtime():
     from worker_operations import _runtime as operations_runtime
@@ -296,8 +299,28 @@ def _run_tool_merge(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _run_plugin_tool(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Run midi/asr through their plugin operations; fallback to legacy on absence."""
-    runtime = _runtime()
-    operation = _PLUGIN_TOOL_OPERATIONS[tool]
+    if tool in _LEGACY_ONLY_TOOLS:
+        operation = None
+    else:
+        runtime = _runtime()
+        operation = _PLUGIN_TOOL_OPERATIONS[tool]
+        if not _operation_available(runtime, operation):
+            operation = None
+    if operation is None:
+        # Legacy dedicated implementation keeps the tool working out of the box.
+        # Route through worker_tools' module attribute so tests (and any future
+        # overrides) that patch it there are honored on this path too.
+        from worker_tools import get_audio_tool_handler
+
+        handler = get_audio_tool_handler(tool)
+        if handler is None:
+            from audio_tools.registry import get_audio_tool_handler as registry_handler
+
+            handler = registry_handler(tool)
+        return handler(payload)  # type: ignore[return-value]
+    from audio_tools_op_bridge import run_plugin_operation_as_tool
+
+    return run_plugin_operation_as_tool(runtime, tool, operation, payload)
     if _operation_available(runtime, operation):
         from audio_tools_op_bridge import run_plugin_operation_as_tool
 
@@ -323,6 +346,7 @@ _ADAPTERS = {
     "merge": _run_tool_merge,
     "midi": lambda payload: _run_plugin_tool("midi", payload),
     "asr": lambda payload: _run_plugin_tool("asr", payload),
+    "loudness": lambda payload: _run_plugin_tool("loudness", payload),
 }
 
 

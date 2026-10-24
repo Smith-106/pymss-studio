@@ -13,6 +13,7 @@ import { loadAudioToolsState, updateAudioToolsState } from '../../state'
 const GAME_URL = 'https://github.com/openvpi/GAME/releases/tag/v1.0.0'
 const { t } = useI18n(); const message = useMessage(); const settings = useSettingsStore(); const runtime = useAudioToolRuntime(); const state = runtime.stateFor('midi')
 const isMacOS = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent)
+type Language = '' | 'zh' | 'yue' | 'ja' | 'en'
 const AUTO_MODEL = '__auto__'
 const inputPath = ref(''); const modelPath = ref(isMacOS ? AUTO_MODEL : ''); const outputDir = ref(settings.outputDir); const bpm = ref<number | null>(120); const detectingBpm = ref(false); const language = ref<Language>(''); let restored = false
 const autoModel = computed(() => modelPath.value === AUTO_MODEL)

@@ -3,7 +3,6 @@ import { computed, onMounted, provide, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { useBeginnerGuideStore } from '@/stores/beginnerGuide'
-import { useRoute } from 'vue-router'
 import { audioTools } from '@/features/audio-tools/registry'
 import { isAudioToolAvailable } from '@/features/audio-tools/availability'
 import { audioToolRuntimeKey, createAudioToolRuntime } from '@/features/audio-tools/runtime'
@@ -22,9 +21,6 @@ const router = useRouter()
 const guide = useBeginnerGuideStore()
 import { invoke } from '@tauri-apps/api/core'
 import { ExtensionPuzzleOutline } from '@vicons/ionicons5'
-defineOptions({ name: 'ToolsView' })
-const { t } = useI18n()
-const app = useAppStore()
 const pluginMarket = usePluginMarketplace()
 // Plugin-contributed tool pages (protocol v1 views with placement "tool").
 const pluginToolViews = computed(() =>
@@ -51,7 +47,6 @@ watch(pluginMarket.snapshot, async snapshot => {
 const runtime = createAudioToolRuntime()
 provide(audioToolRuntimeKey, runtime)
 const activeTool = ref<AudioToolKey>('convert')
-const route = useRoute()
 watch(() => route.query.tool, (tool) => {
   if (audioTools.some(definition => definition.id === tool)) activeTool.value = tool as AudioToolKey
 }, { immediate: true })
@@ -108,15 +103,11 @@ onMounted(async () => {
   recordActiveToolVisit()
   await runtime.start()
 })
-onMounted(async () => { const stored = await loadAudioToolsState(); if (!route.query.tool && stored?.activeTool && visibleAudioTools.value.some(tool => tool.id === stored.activeTool)) activeTool.value = stored.activeTool; restored = true; await runtime.start() })
 watch(visibleAudioTools, tools => { if (!tools.some(tool => tool.id === activeTool.value) && tools[0]) activeTool.value = tools[0].id }, { immediate: true })
 watch(activeTool, value => { if (restored) { recordActiveToolVisit(); void updateAudioToolsState({ activeTool: value }) } })
 </script>
 <template><div class="page tools-page audio-tools-page"><div class="page-header-compact"><div><h1>{{ t('tools.title') }}</h1><p>{{ t('tools.subtitle') }}</p></div></div>
   <n-select :value="activeTool" @update:value="selectTool" class="audio-tools-mobile-select" data-guide="audio-tools" :options="mobileToolOptions" />
-  <div class="audio-tools-workspace"><nav class="audio-tools-nav" data-guide="audio-tools" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: activeTool === tool.id }" @click="selectTool(tool.id)"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section></nav>
-    <main class="audio-tools-content" :data-tool="activeTool"><KeepAlive><component :is="activeDefinition.component" :key="activeDefinition.id" /></KeepAlive></main>
-  <n-select v-model:value="activeTool" class="audio-tools-mobile-select" :options="mobileToolOptions" />
   <div class="audio-tools-workspace"><nav class="audio-tools-nav" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: !activePluginTool && activeTool === tool.id }" @click="activeTool = tool.id"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section><section v-if="pluginToolViews.length"><strong>{{ t('tools.categoryPlugins') }}</strong><button v-for="entry in pluginToolViews" :key="`${entry.pluginName}/${entry.view.id}`" type="button" :class="{ active: activePluginTool === `${entry.pluginName}/${entry.view.id}` }" @click="activePluginTool = `${entry.pluginName}/${entry.view.id}`"><n-icon :component="ExtensionPuzzleOutline" /><span>{{ entry.view.title || entry.view.id }}</span></button></section></nav>
     <main class="audio-tools-content">
       <PluginViewHost v-if="activePluginToolView" :key="activePluginTool" :plugin-name="activePluginToolView.pluginName" :view="activePluginToolView.view" />
