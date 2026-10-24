@@ -21,9 +21,64 @@ else:
 
 import worker_operations
 
-_LOUDNORM_SRC = (
-    Path(__file__).resolve().parents[2] / ".." / "pymss-plugins" / "plugins" / "loudnorm"
-)
+def _loudnorm_fixture() -> Path:
+    """Minimal loudnorm-like plugin source for tests.
+
+    Prefers the real plugin from a sibling pymss-plugins checkout (local dev);
+    CI has no sibling repo, so fall back to a self-contained fixture with the
+    same operation surface.
+    """
+    real = Path(__file__).resolve().parents[2] / ".." / "pymss-plugins" / "plugins" / "loudnorm"
+    if real.is_dir():
+        return real
+    import tempfile
+    fixture = Path(tempfile.mkdtemp()) / "loudnorm"
+    fixture.mkdir()
+    (fixture / "pyproject.toml").write_text(
+        '[project]
+name="pymss-plugin-loudnorm"
+version="0.2.0"
+requires-python=">=3.10"
+dependencies=[]
+
+'
+        '[project.entry-points."pymss.plugins"]
+loudnorm="loudnorm"
+
+'
+        '[tool.pymss.plugin]
+id="pymss.loudnorm"
+api_version=1
+'
+    )
+    (fixture / "__init__.py").write_text(
+        'def setup(plugin):
+'
+        '    plugin.register_operation(
+'
+        '        id="pymss.loudnorm.normalize", title="Normalize Loudness (LUFS)",
+'
+        '        description="LUFS loudness normalization",
+'
+        '        inputs={"audio": {"type": "audio"}},
+'
+        '        params={"type": "object", "properties": {
+'
+        '            "target_lufs": {"type": "number", "default": -14.0, "minimum": -70.0, "maximum": -5.0},
+'
+        '        }, "additionalProperties": False},
+'
+        '        outputs={"audio": {"type": "audio"}},
+'
+        '        run=lambda ctx, inputs, params: {"audio": inputs["audio"]},
+'
+        '    )
+'
+    )
+    return fixture
+
+
+_LOUDNORM_SRC = None  # resolved lazily via _loudnorm_fixture()
 
 
 def _read_event(output: io.StringIO) -> dict:
@@ -35,7 +90,7 @@ class ListOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             plugins = Path(d) / "plugins"
             plugins.mkdir()
-            shutil.copytree(_LOUDNORM_SRC, plugins / "loudnorm")
+            shutil.copytree(_loudnorm_fixture(), plugins / "loudnorm")
             old = os.environ.get("PYMSS_PLUGINS_DIR")
             os.environ["PYMSS_PLUGINS_DIR"] = str(plugins)
             try:
@@ -79,7 +134,7 @@ class RunOperationTests(unittest.TestCase):
     def _install_plugin(self, d: Path) -> None:
         plugins = d / "plugins"
         plugins.mkdir()
-        shutil.copytree(_LOUDNORM_SRC, plugins / "loudnorm")
+        shutil.copytree(_loudnorm_fixture(), plugins / "loudnorm")
         os.environ["PYMSS_PLUGINS_DIR"] = str(plugins)
 
     def _reset_runtime(self) -> None:

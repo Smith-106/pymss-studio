@@ -88,7 +88,8 @@ modes = ["rendered_preview"]
         row = next(item for item in plugins._inventory(self.root)["installed"] if item["name"] == "chain")
         contributions = row["contributions"]
         self.assertEqual(contributions["views"][0]["pluginId"], "author.chain")
-        self.assertTrue(contributions["views"][0]["entryPath"].endswith("ui/index.html"))
+        entry_path = contributions["views"][0]["entryPath"].replace("\\", "/")
+        self.assertTrue(entry_path.endswith("ui/index.html"))
         self.assertEqual(contributions["views"][0]["placements"], ["tool", "workspace"])
         self.assertEqual(contributions["graphs"][0]["id"], "chain")
         self.assertEqual(contributions["player"][0]["scopes"], ["clip"])
