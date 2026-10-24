@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { createLogger } from '@/utils/logger'
 import { hasEditorEffects, prepareEditorExportEffects } from '@/utils/editorRender'
 import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
-import { assertPluginProjectSupported, currentPluginSession, observePluginSession, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession } from '@/utils/pluginHost'
+import { assertPluginProjectSupported, currentPluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession } from '@/utils/pluginHost'
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -789,12 +789,13 @@ export const useEditorStore = defineStore('editor', () => {
       return await snapshotPluginStates(project, { force, recovery })
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause)
-      const error = String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail }))
+      const error = cause instanceof PluginHostDialogPendingError ? detail : String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail }))
       if (session.value?.id === project.id || currentPluginSession()?.project === project) {
         pluginStateDirty.value = true
         pluginStateError.value = error
-        lastError.value = error
+        if (!(cause instanceof PluginHostDialogPendingError)) lastError.value = error
       }
+      if (cause instanceof PluginHostDialogPendingError) throw cause
       throw new Error(error)
     }
   }
@@ -817,14 +818,21 @@ export const useEditorStore = defineStore('editor', () => {
     }, attempt === 0 ? 900 : 2000)
   }
 
+  let pendingDialogMessage: string | null = null
   const stopObservingPlugins = observePluginSession(host => {
     if (!host || host.project !== session.value) return
     pluginStateUnavailable.value = host.unavailable
     if (host.error) {
       pluginStateDirty.value = true
-      pluginStateError.value = String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail: host.error }))
-      lastError.value = pluginStateError.value
+      pluginStateError.value = host.interactionRequired ? host.error : String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail: host.error }))
+      pendingDialogMessage = host.interactionRequired ? pluginStateError.value : null
+      if (!host.interactionRequired) lastError.value = pluginStateError.value
       return
+    }
+    if (pendingDialogMessage) {
+      if (pluginStateError.value === pendingDialogMessage) pluginStateError.value = null
+      if (lastError.value === pendingDialogMessage) lastError.value = null
+      pendingDialogMessage = null
     }
     if (host.dirty) {
       pluginStateDirty.value = true
@@ -832,6 +840,7 @@ export const useEditorStore = defineStore('editor', () => {
     }
   })
   watch(() => session.value?.id, () => {
+    pendingDialogMessage = null
     if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
     pluginSaveTimer = null
     pluginStateDirty.value = false
@@ -900,10 +909,11 @@ export const useEditorStore = defineStore('editor', () => {
           } catch (error) {
             // Keep a newer snapshot if edits arrived while this save was in flight.
             if (!discardingWindowChanges && !pendingProjectSaves.has(projectId)) pendingProjectSaves.set(projectId, toPersistedSession(session.value?.id === projectId ? session.value : project))
-            lastError.value = error instanceof Error ? error.message : String(error)
+            const detail = error instanceof Error ? error.message : String(error)
+            if (!(error instanceof PluginHostDialogPendingError)) lastError.value = detail
             if (session.value?.id === projectId && hasEditorPlugins(project)) {
               pluginStateDirty.value = true
-              pluginStateError.value = lastError.value
+              pluginStateError.value = detail
             }
             throw error
           }

@@ -909,3 +909,34 @@ and packaged capabilities/helper entry checks passed. No installed plugins, remo
 license servers, user windows, macOS/Linux desktop execution or signing were used.
 Unix descendant-held-pipe regression is included in the native validation workflow.
 Reports: E:/pymss-vst-lab-artifacts/native-v20-* and scan-control-ui/.
+
+Twenty-first iteration: plugin workbench and native dialog waits
+----------------------------------------------------------------
+The target selector moves into the header. The narrower grouped library keeps
+sources/blacklist/failures in source management; the main chain uses compact rows.
+Generic parameters are collapsed by default in a separate bounded dock. Numeric
+formatting preserves actual submitted precision, units and steps.
+
+A real installed ValhallaRoom 2.0.5 Windows VST3 opens an Authorization MessageBox
+and blocks its helper UI thread pending a user-selected license. The live bridge
+now retains one outstanding RPC while an owned visible standard Windows dialog is
+present. It strictly drains that reply ID before sending another operation, retains
+native identity/close semantics, and restores a bounded deadline after dismissal.
+Ordinary hangs, EOF and invalid IDs remain fatal. Scanners/temporary exporters keep
+their existing limits. Custom/non-Windows/external-process dialogs are not covered.
+
+The UI shows a recoverable warning and resumes observation, parameter reads and
+saving after dismissal. Pending waits do not become red notifications or unavailable
+sessions. Playback/pause observation also survives the wait. Unsaved state is retained.
+
+Validation: frontend 1192 passed/3 skipped; bridge 74 passed/one opt-in ignored.
+The ignored real-plugin observation was run explicitly and passed: the owned helper
+survived its real authorization window beyond 20 seconds, then was reaped. No license
+prompt was dismissed or activated; real post-authorization DSP/window recovery remains
+unverified. Actual Vue/browser tests with mock IPC passed 21 scenarios, including eight
+light/dark dialog recovery cases, no page errors and no red waiting notifications.
+Artifacts: native-v21-*, modal-backend-plugin-host.log, workbench-dialog-v7/ on E:.
+The user's existing application/project data and main branch remain untouched.
+Final Windows ordinary/Lab debug builds passed typecheck, frontend production build,
+linking, capabilities and helper shutdown. Source fingerprints match the final input;
+no desktop data directories were created by the headless verification.

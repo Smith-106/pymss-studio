@@ -12,7 +12,10 @@ export type PluginScanStatus = { scanId: string; phase: 'collecting' | 'scanning
 export type PluginScanReport = { plugins: PluginDescriptor[]; failures: { path: string; message: string }[]; scanned: number; cached: number; blacklisted?: PluginScanBlacklistEntry[]; cancelled?: boolean }
 export type UnavailablePlugin = { slotId: string; message: string }
 export type PluginHostStatus = { projectId?: string; sessionId?: string; stateRevision?: number; openEditors?: string[]; unavailablePlugins?: UnavailablePlugin[]; position: number; playing: boolean; duration: number; levels?: Record<string, [number, number]>; masterLevel?: [number, number]; error?: string }
-export type PluginSessionState = { project: EditorSession; sessionId: string; revision: number; dirty: boolean; error: string | null; openEditors: string[]; unavailablePlugins: UnavailablePlugin[]; unavailable: boolean }
+export type PluginSessionState = { project: EditorSession; sessionId: string; revision: number; dirty: boolean; error: string | null; openEditors: string[]; unavailablePlugins: UnavailablePlugin[]; unavailable: boolean; interactionRequired?: boolean }
+export class PluginHostDialogPendingError extends Error {
+  constructor() { super(String(i18n.global.t('editor.plugins.dialogPending'))); this.name = 'PluginHostDialogPendingError' }
+}
 type Session = PluginSessionState & { signature: string; capturedRevision: number; lastStatus: number; lastFallback: number }
 let loaded: Session | null = null
 let operationQueue: Promise<unknown> = Promise.resolve()
@@ -68,6 +71,9 @@ function observeResponse(request: Record<string, unknown>, value: unknown) {
   const response = value as Partial<PluginHostStatus>
   if (response.projectId && response.projectId !== current.project.id) return
   let changed = false
+  if (current.interactionRequired) {
+    current.interactionRequired = false; current.error = null; changed = true
+  }
   if (typeof response.sessionId === 'string' && response.sessionId !== current.sessionId) {
     current.sessionId = response.sessionId; current.revision = 0; current.capturedRevision = -1; current.dirty = true; current.error = null; changed = true
   }
@@ -97,13 +103,22 @@ async function requestNow<T>(request: Record<string, unknown>): Promise<T> {
     observeResponse(request, result)
     return result
   } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause)
+    const interactionRequired = message.startsWith('PLUGIN_HOST_DIALOG_PENDING:')
+    const failure = interactionRequired ? new PluginHostDialogPendingError() : cause
+    if (interactionRequired && current && loaded === current && request.projectId === current.project.id) {
+      current.interactionRequired = true; current.error = (failure as Error).message; current.dirty = true
+      publish()
+      throw failure
+    }
     if (current && loaded === current && request.projectId === current.project.id && request.op !== 'unload' && request.op !== 'editor') {
+      current.interactionRequired = false
       current.error = cause instanceof Error ? cause.message : String(cause)
       if (request.op === 'snapshot') current.dirty = true
       else { current.dirty = true; if (request.op === 'status') current.unavailable = true }
       publish()
     }
-    throw cause
+    throw failure
   }
 }
 export function pluginHostRequest<T = Record<string, unknown>>(request: Record<string, unknown>): Promise<T> {

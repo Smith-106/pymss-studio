@@ -3,7 +3,7 @@ import i18n from '@/i18n'
 import type { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import { hasEditorPlugins, pluginProjectSignature } from '@/utils/editorPlugins'
-import { ensurePluginSession, pluginHostCapabilities, pluginHostRequest, type PluginHostStatus } from '@/utils/pluginHost'
+import { ensurePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, pluginHostRequest, type PluginHostStatus } from '@/utils/pluginHost'
 
 export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore>, followPlayhead: () => void) {
   const playback = useEditorPlaybackStore()
@@ -26,6 +26,13 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
   }
 
   function fail(id: number, cause: unknown) {
+    if (cause instanceof PluginHostDialogPendingError) {
+      if (!disposed && playback.requestId === id && activeProjectId) {
+        pollingEnabled = true
+        schedulePoll()
+      } else if (!disposed && playback.requestId === id) playback.finishPause(id)
+      return
+    }
     stopPoll()
     playback.fail(id, cause instanceof Error ? cause.message : String(cause))
   }

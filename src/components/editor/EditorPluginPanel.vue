@@ -7,7 +7,7 @@ import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import type { EditorSession } from '@/types/editor'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
-import { observePluginSession, openPluginEditor, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
+import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
@@ -27,10 +27,14 @@ const managerCard = ref<{ $el: HTMLElement } | null>(null)
 const manageButton = ref<{ $el: HTMLElement } | null>(null)
 const reloadConfirmOpen = ref(false)
 const targetMenuOpen = ref(false)
+const sourcesOpen = ref(false)
+const sourceButton = ref<{ $el: HTMLElement } | null>(null)
 const librarySearch = ref('')
 const catalogGroupBy = ref<'vendor' | 'category' | 'format'>('vendor')
 const feedback = ref('')
 const error = ref('')
+const dialogPending = ref(false)
+let dialogOperationError = false
 const descriptors = ref<PluginDescriptor[]>([])
 const scanReport = ref<PluginScanReport | null>(null)
 const unavailablePlugins = ref<UnavailablePlugin[]>([])
@@ -54,7 +58,6 @@ const canStopScan = computed(() => scanning.value && !scanActionPending.value &&
 const scanPhaseLabel = computed(() => t(scanStatus.value?.phase === 'scanning' ? 'editor.plugins.scanPhaseScanning'
   : scanStatus.value?.phase === 'finished' ? 'editor.plugins.scanPhaseFinished'
   : scanStatus.value?.phase === 'cancelled' ? 'editor.plugins.scanPhaseCancelled' : 'editor.plugins.scanPhaseCollecting'))
-const workflowStep = computed(() => !directories.value.length ? 1 : !scanReport.value ? 2 : 3)
 const canChooseAudioUnits = computed(() => capabilities.value?.platform === 'macos' && capabilities.value.formats.includes('au'))
 const targetOptions = computed(() => [
   { label: t('editor.plugins.masterOutput'), value: 'master' },
@@ -64,6 +67,7 @@ const targetLabel = computed(() => targetOptions.value.find(option => option.val
 const chain = computed(() => target.value === 'master'
   ? props.session.pluginChain || []
   : props.session.tracks.find(track => track.id === target.value)?.pluginChain || [])
+const parameterSlot = computed(() => chain.value.find(slot => slot.id === parameterSlotId.value))
 const descriptorKey = (plugin: PluginDescriptor) => JSON.stringify([plugin.id, plugin.path])
 const relocatingSlot = computed(() => chain.value.find(slot => slot.id === relocatingSlotId.value))
 const operationError = computed(() => error.value || editor.pluginStateError || playback.error)
@@ -110,14 +114,17 @@ const catalogGroups = computed(() => {
 })
 const selectedDescriptor = computed(() => descriptors.value.find(plugin => descriptorKey(plugin) === selectedPluginId.value))
 const stopObservingSession = observePluginSession(host => {
+  dialogPending.value = host?.project === props.session && Boolean(host.interactionRequired)
+  if (!dialogPending.value && dialogOperationError) { error.value = ''; dialogOperationError = false }
   if (host?.project === props.session) { opened.value = [...host.openEditors]; unavailablePlugins.value = [...host.unavailablePlugins] }
   else { opened.value = []; unavailablePlugins.value = [] }
 })
 onScopeDispose(stopObservingSession)
 watch(() => props.selectedTrackId, id => { target.value = id || 'master' }, { immediate: true })
-watch(() => props.session, () => { managerOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; invalidateCatalog(); relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId || 'master' })
+watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; dialogPending.value = false; dialogOperationError = false; invalidateCatalog(); relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId || 'master' })
 watch(targetOptions, options => { if (!options.some(option => option.value === target.value)) target.value = 'master' })
 watch(target, () => { reloadConfirmOpen.value = false; targetMenuOpen.value = false; relocatingSlotId.value = null; selectedPluginId.value = null; parameterSlotId.value = null; feedback.value = '' })
+watch(() => chain.value.map(slot => slot.id), ids => { if (!ids.includes(parameterSlotId.value || '')) parameterSlotId.value = null })
 watch(directories, invalidateCatalog, { deep: true, flush: 'sync' })
 watch(pluginOptions, options => { if (!options.some(option => option.value === selectedPluginId.value && !option.disabled)) selectedPluginId.value = null })
 onMounted(async () => {
@@ -167,7 +174,9 @@ function recenterManager() {
 }
 function onManagerKeyCapture(event: KeyboardEvent) {
   if (event.key !== 'Escape' || event.defaultPrevented) return
-  if (!targetMenuOpen.value && !reloadConfirmOpen.value) return
+  if (!targetMenuOpen.value && !reloadConfirmOpen.value && !sourcesOpen.value) return
+  if (sourcesOpen.value) void nextTick(() => sourceButton.value?.$el.focus({ preventScroll: true }))
+  sourcesOpen.value = false
   targetMenuOpen.value = false
   reloadConfirmOpen.value = false
   event.preventDefault()
@@ -193,6 +202,7 @@ function closeManager() {
   const restoreFocus = managerCard.value?.$el.contains(document.activeElement)
   reloadConfirmOpen.value = false
   targetMenuOpen.value = false
+  sourcesOpen.value = false
   managerOpen.value = false
   if (restoreFocus) void nextTick(() => manageButton.value?.$el.focus({ preventScroll: true }))
 }
@@ -201,9 +211,10 @@ async function run(action: () => void | Promise<void>) {
   if (busy.value) return
   busy.value = true
   error.value = ''
+  dialogOperationError = false
   const project = props.session
   try { await action() }
-  catch (cause) { if (props.session === project) error.value = cause instanceof Error ? cause.message : String(cause) }
+  catch (cause) { if (props.session === project) { error.value = cause instanceof Error ? cause.message : String(cause); dialogOperationError = cause instanceof PluginHostDialogPendingError } }
   finally { busy.value = false }
 }
 function saveDirectories() {
@@ -230,12 +241,13 @@ async function browseDirectory() {
     const path = await invoke<string | null>('pick_input_folder')
     if (path && !disposed) { directoryDraft.value = path; addDirectory(); chosen = true }
   })
-  if (chosen && !disposed && props.session === project) await scan()
+  if (chosen && !disposed && props.session === project) { sourcesOpen.value = false; await scan() }
 }
 async function chooseAudioUnits() {
   if (busy.value || !canChooseAudioUnits.value) return
   if (!directories.value.includes('au:system')) directories.value.push('au:system')
   saveDirectories()
+  sourcesOpen.value = false
   await scan()
 }
 function isCurrentScan(scan: ActiveScan) {
@@ -349,6 +361,7 @@ async function scan(force = false) {
       ...(current.controlled ? { scanId: current.id } : {}) })
     if (!isCurrentScan(current)) return
     scanReport.value = report
+    if (report.cancelled) scanFeedback.value = ''
     descriptors.value = report.plugins
     if (!descriptors.value.some(plugin => descriptorKey(plugin) === selectedPluginId.value)) selectedPluginId.value = null
     if (current.controlled) {
@@ -437,6 +450,10 @@ function movePlugin(slotId: string, offset: number) {
     slots.splice(destination, 0, slot)
   })
 }
+function toggleParameters(slotId: string) {
+  if (!chain.value.some(slot => slot.id === slotId)) return
+  parameterSlotId.value = parameterSlotId.value === slotId ? null : slotId
+}
 async function toggleEditor(slotId: string) {
   await run(async () => {
     const project = props.session
@@ -468,66 +485,80 @@ async function toggleEditor(slotId: string) {
         <template #header>
           <div class="plugin-manager__heading">
             <strong>{{ t('editor.plugins.managerTitle') }}</strong>
-            <span>{{ targetLabel }} · {{ t('editor.plugins.chainCount', { count: chain.length }) }}</span>
+            <div class="plugin-manager__target" @pointerdown.stop @mousedown.stop>
+              <label>{{ t('editor.plugins.destination') }}</label>
+              <n-select v-model:value="target" v-model:show="targetMenuOpen" size="small" :options="targetOptions" :disabled="busy" :to="managerCard?.$el" :aria-label="t('editor.plugins.target')" />
+            </div>
+            <span class="plugin-manager__chain-count">{{ t('editor.plugins.chainCount', { count: chain.length }) }}</span>
           </div>
         </template>
         <template #header-extra><span class="plugin-manager__badge">{{ t('editor.plugins.experimental') }}</span></template>
-        <ol class="plugin-manager__steps" :aria-label="t('editor.plugins.usageSteps')">
-          <li v-for="(label, index) in [t('editor.plugins.stepChoose'), t('editor.plugins.stepScan'), t('editor.plugins.stepAdd')]" :key="label" :aria-current="workflowStep === index + 1 ? 'step' : undefined" :class="{ 'plugin-manager__step--done': workflowStep > index + 1 }"><span>{{ index + 1 }}</span>{{ label }}</li>
-        </ol>
         <div class="plugin-manager__body" :aria-busy="busy">
-          <section class="plugin-manager__library" :class="{ 'plugin-manager__library--scan-controls': capabilities.scanControl }" :aria-label="t('editor.plugins.library')">
+          <section class="plugin-manager__library" :aria-label="t('editor.plugins.library')">
             <div class="plugin-manager__section-heading">
-              <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count">{{ descriptors.length }}</span></div>
-              <n-button v-if="directories.length" size="small" secondary :loading="scanning" :disabled="busy" @click="scan()"><template #icon><n-icon :component="RefreshOutline" /></template>{{ t('editor.plugins.scan') }}</n-button>
-            </div>
-            <div class="plugin-manager__sources" :class="{ 'plugin-manager__sources--empty': !directories.length }">
-              <div class="plugin-manager__source-toolbar">
-                <span v-if="directories.length">{{ t('editor.plugins.customDirectoryCount', { count: directories.length }) }}</span>
-                <strong v-else>{{ t('editor.plugins.chooseDirectoryFirst') }}</strong>
-                <n-button size="small" :type="directories.length ? 'default' : 'primary'" :disabled="busy" @click="browseDirectory"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ directories.length ? t('editor.plugins.addDirectory') : t('editor.plugins.chooseDirectory') }}</n-button>
+              <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count" :title="t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: scanReport.plugins.length })">{{ descriptors.length }}</span></div>
+              <div class="plugin-manager__library-actions">
+                <n-popover v-model:show="sourcesOpen" trigger="click" placement="bottom-start" :show-arrow="false" :to="managerCard?.$el" raw>
+                  <template #trigger><n-button ref="sourceButton" size="tiny" quaternary :aria-expanded="sourcesOpen" :aria-label="t('editor.plugins.manageSources')"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('editor.plugins.sources') }}<span v-if="directories.length" class="plugin-manager__source-count">{{ directories.length }}</span></n-button></template>
+                  <section class="plugin-manager__source-manager" :aria-label="t('editor.plugins.manageSources')">
+                    <div class="plugin-manager__source-toolbar"><strong>{{ t('editor.plugins.manageSources') }}</strong><n-button size="tiny" quaternary :aria-label="t('common.close')" @click="sourcesOpen = false"><template #icon><n-icon :component="CloseOutline" /></template></n-button></div>
+                    <div class="plugin-manager__source-content">
+                      <div class="plugin-manager__sources">
+                        <div class="plugin-manager__source-toolbar">
+                          <span v-if="directories.length">{{ t('editor.plugins.customDirectoryCount', { count: directories.length }) }}</span>
+                          <strong v-else>{{ t('editor.plugins.chooseDirectoryFirst') }}</strong>
+                          <n-button size="small" :type="directories.length ? 'default' : 'primary'" :disabled="busy" @click="browseDirectory"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ directories.length ? t('editor.plugins.addDirectory') : t('editor.plugins.chooseDirectory') }}</n-button>
+                        </div>
+                        <p v-if="!directories.length" class="plugin-panel__hint">{{ t('editor.plugins.chooseDirectoryHint') }}</p>
+                        <div v-if="directories.length" class="plugin-manager__directories">
+                          <div v-for="(path, index) in directories" :key="path" class="plugin-panel__directory">
+                            <span :title="path"><strong>{{ directoryLabel(path) }}</strong><small v-if="path !== 'au:system'">{{ path }}</small><small v-else class="plugin-manager__au-source-hint">{{ t('editor.plugins.scanAudioUnitsHint') }}</small></span>
+                            <n-button size="tiny" quaternary :disabled="busy" :aria-label="t('editor.plugins.removeDirectory')" @click="removeDirectory(index)"><template #icon><n-icon :component="CloseOutline" /></template></n-button>
+                          </div>
+                        </div>
+                        <n-button v-if="canChooseAudioUnits && !directories.includes('au:system')" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
+                      </div>
+                      <details v-if="capabilities.scanControl" class="plugin-manager__blacklist">
+                        <summary>{{ t('editor.plugins.scanBlacklistTitle', { count: scanBlacklist.length }) }}</summary>
+                        <p class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistHint') }}</p>
+                        <p v-if="!scanBlacklist.length" class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistEmpty') }}</p>
+                        <div v-else class="plugin-manager__blacklist-list">
+                          <div v-for="entry in scanBlacklist" :key="entry.path" class="plugin-manager__blacklist-entry">
+                            <span :title="entry.path"><strong>{{ scanItemName(entry.path, entry.name) }}</strong><small>{{ entry.path }}</small><small>{{ t(entry.reason === 'timeout' ? 'editor.plugins.scanBlacklistTimeout' : 'editor.plugins.scanBlacklistManual') }}</small></span>
+                            <n-button size="tiny" secondary :disabled="busy" :aria-label="t('editor.plugins.removeScanBlacklistNamed', { name: scanItemName(entry.path, entry.name) })" @click="removeBlacklistedPlugin(entry.path)">{{ t('editor.plugins.removeScanBlacklist') }}</n-button>
+                          </div>
+                        </div>
+                      </details>
+                      <div v-if="scanReport?.failures.length" class="plugin-panel__scan-failures" role="status">
+                        <div class="plugin-manager__scan-actions"><strong>{{ t('editor.plugins.scanFailures', { count: scanReport.failures.length }) }}</strong><n-button size="tiny" :disabled="busy" @click="sourcesOpen = false; scan(true)">{{ t('editor.plugins.retryScan') }}</n-button></div>
+                        <details><summary>{{ t('editor.plugins.scanFailureDetails') }}</summary><p v-for="failure in scanReport.failures" :key="failure.path" :title="failure.path"><span>{{ failure.path }}</span>{{ failure.message }}</p></details>
+                      </div>
+                    </div>
+                  </section>
+                </n-popover>
+                <n-button v-if="directories.length" size="tiny" quaternary :loading="scanning" :disabled="busy" :title="t('editor.plugins.scan')" :aria-label="t('editor.plugins.scan')" @click="scan()"><template #icon><n-icon :component="RefreshOutline" /></template></n-button>
               </div>
-              <p v-if="!directories.length" class="plugin-panel__hint">{{ t('editor.plugins.chooseDirectoryHint') }}</p>
-              <div v-if="directories.length" class="plugin-manager__directories">
-                <div v-for="(path, index) in directories" :key="path" class="plugin-panel__directory">
-                  <span :title="path"><strong>{{ directoryLabel(path) }}</strong><small v-if="path !== 'au:system'">{{ path }}</small><small v-else class="plugin-manager__au-source-hint">{{ t('editor.plugins.scanAudioUnitsHint') }}</small></span>
-                  <n-button size="tiny" quaternary :disabled="busy" :aria-label="t('editor.plugins.removeDirectory')" @click="removeDirectory(index)"><template #icon><n-icon :component="CloseOutline" /></template></n-button>
-                </div>
-              </div>
-              <n-button v-if="canChooseAudioUnits && !directories.includes('au:system')" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
             </div>
             <div v-if="scanning && capabilities.scanControl" class="plugin-manager__scan-progress" :aria-label="t('editor.plugins.scanProgress')">
               <div class="plugin-manager__scan-progress-heading"><strong role="status">{{ scanPhaseLabel }}</strong><span>{{ t('editor.plugins.scanCompletedCount', { completed: scanStatus?.completed || 0, total: scanStatus?.total || 0 }) }}</span></div>
-              <div v-if="scanStatus?.currentPath" class="plugin-manager__scan-current" :title="scanStatus.currentPath"><strong>{{ scanItemName(scanStatus.currentPath, scanStatus.currentName) }}</strong><small>{{ scanStatus.currentPath }}</small></div>
-              <span v-if="scanStatus?.currentPath" class="plugin-panel__hint">{{ t('editor.plugins.scanElapsed', { seconds: Math.floor(scanStatus.elapsedMs / 1000) }) }}</span>
-              <p class="plugin-panel__hint">{{ t('editor.plugins.scanTimeoutHint') }}</p>
-              <p class="plugin-panel__hint">{{ t(scanStatus?.currentPath === 'au:system' ? 'editor.plugins.scanAudioUnitsHint' : 'editor.plugins.scanPackageHint') }}</p>
+              <div v-if="scanStatus?.currentPath" class="plugin-manager__scan-current" :title="scanStatus.currentPath"><strong>{{ scanItemName(scanStatus.currentPath, scanStatus.currentName) }}</strong><small>{{ t('editor.plugins.scanElapsed', { seconds: Math.floor(scanStatus.elapsedMs / 1000) }) }}</small></div>
               <div class="plugin-manager__scan-control-actions">
                 <n-button size="small" secondary type="warning" :disabled="!canSkipScan" :loading="scanActionPending === 'skip'" @click="skipCurrentScanPlugin">{{ t('editor.plugins.skipScanPlugin') }}</n-button>
                 <n-button size="small" secondary :disabled="!canStopScan" :loading="scanActionPending === 'cancel'" @click="stopScan">{{ t('editor.plugins.stopScan') }}</n-button>
               </div>
+              <details class="plugin-manager__scan-details">
+                <summary>{{ t('editor.plugins.scanDetails') }}</summary>
+                <p v-if="scanStatus?.currentPath" class="plugin-panel__hint">{{ scanStatus.currentPath }}</p>
+                <p class="plugin-panel__hint">{{ t('editor.plugins.scanTimeoutHint') }}</p>
+                <p class="plugin-panel__hint">{{ t(scanStatus?.currentPath === 'au:system' ? 'editor.plugins.scanAudioUnitsHint' : 'editor.plugins.scanPackageHint') }}</p>
+              </details>
             </div>
-            <p v-if="scanFeedback" class="plugin-manager__feedback" role="status">{{ scanFeedback }}</p>
-            <p v-if="scanReport?.cancelled" class="plugin-panel__hint" role="status">{{ t('editor.plugins.scanCancelledHint') }}</p>
-            <details v-if="capabilities.scanControl" class="plugin-manager__blacklist">
-              <summary>{{ t('editor.plugins.scanBlacklistTitle', { count: scanBlacklist.length }) }}</summary>
-              <p class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistHint') }}</p>
-              <p v-if="!scanBlacklist.length" class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistEmpty') }}</p>
-              <div v-else class="plugin-manager__blacklist-list">
-                <div v-for="entry in scanBlacklist" :key="entry.path" class="plugin-manager__blacklist-entry">
-                  <span :title="entry.path"><strong>{{ scanItemName(entry.path, entry.name) }}</strong><small>{{ entry.path }}</small><small>{{ t(entry.reason === 'timeout' ? 'editor.plugins.scanBlacklistTimeout' : 'editor.plugins.scanBlacklistManual') }}</small></span>
-                  <n-button size="tiny" secondary :disabled="busy" :aria-label="t('editor.plugins.removeScanBlacklistNamed', { name: scanItemName(entry.path, entry.name) })" @click="removeBlacklistedPlugin(entry.path)">{{ t('editor.plugins.removeScanBlacklist') }}</n-button>
-                </div>
-              </div>
-            </details>
-            <div v-if="scanReport?.failures.length" class="plugin-panel__scan-failures" role="status">
-              <div class="plugin-manager__scan-actions"><strong>{{ t('editor.plugins.scanFailures', { count: scanReport.failures.length }) }}</strong><n-button size="tiny" :disabled="busy" @click="scan(true)">{{ t('editor.plugins.retryScan') }}</n-button></div>
-              <details><summary>{{ t('editor.plugins.scanFailureDetails') }}</summary><p v-for="failure in scanReport.failures" :key="failure.path" :title="failure.path"><span>{{ failure.path }}</span>{{ failure.message }}</p></details>
-            </div>
+            <p v-if="scanFeedback" class="plugin-manager__scan-feedback" :title="scanFeedback" role="status">{{ scanFeedback }}</p>
+            <p v-if="scanReport?.cancelled" class="plugin-manager__scan-feedback" role="status">{{ t('editor.plugins.scanCancelledHint') }}</p>
+            <n-button v-if="scanReport?.failures.length" size="tiny" text type="warning" class="plugin-manager__scan-warning" @click="sourcesOpen = true">{{ t('editor.plugins.scanFailures', { count: scanReport.failures.length }) }}</n-button>
             <div v-if="relocatingSlot" class="plugin-manager__relocation"><p>{{ t('editor.plugins.relocationHint', { name: relocatingSlot.name || relocatingSlot.pluginId }) }}</p><n-button size="tiny" :disabled="busy" @click="relocatingSlotId = null; selectedPluginId = null">{{ t('common.cancel') }}</n-button></div>
-            <n-input v-if="descriptors.length" v-model:value="librarySearch" clearable :placeholder="t('editor.plugins.searchLibrary')" :disabled="busy"><template #prefix><n-icon :component="SearchOutline" /></template></n-input>
+            <n-input v-if="descriptors.length" v-model:value="librarySearch" size="small" clearable :placeholder="t('editor.plugins.searchLibrary')" :disabled="busy"><template #prefix><n-icon :component="SearchOutline" /></template></n-input>
             <div v-if="descriptors.length" class="plugin-manager__group-controls">
-              <span>{{ t('editor.plugins.groupBy') }}</span>
               <n-radio-group v-model:value="catalogGroupBy" size="small" :disabled="busy" :aria-label="t('editor.plugins.groupBy')">
                 <n-radio-button value="vendor">{{ t('editor.plugins.groupVendor') }}</n-radio-button>
                 <n-radio-button value="category">{{ t('editor.plugins.groupCategory') }}</n-radio-button>
@@ -538,7 +569,6 @@ async function toggleEditor(slotId: string) {
               <section v-for="group in catalogGroups" :key="group.key" class="plugin-manager__group" :aria-label="group.label">
               <div class="plugin-manager__group-heading"><strong>{{ group.label }}</strong><span>{{ group.plugins.length }}</span></div>
               <button v-for="option in group.plugins" :key="option.value" type="button" class="plugin-manager__plugin" :class="{ 'plugin-manager__plugin--selected': selectedPluginId === option.value }" :disabled="busy || option.disabled" :aria-pressed="selectedPluginId === option.value" :aria-label="option.label" :title="option.label" @click="selectedPluginId = option.value">
-                <span class="plugin-manager__plugin-icon"><n-icon :component="OptionsOutline" :size="19" /></span>
                 <span class="plugin-manager__plugin-info"><strong>{{ option.plugin.name }}</strong><small>{{ catalogGroupBy === 'vendor' ? categoryLabels[option.category] : option.plugin.vendor || t('editor.plugins.unknownVendor') }}<template v-if="option.disabled"> · {{ t('editor.plugins.unsupportedPlugin') }}</template></small><small v-if="option.detail" class="plugin-manager__plugin-identity">{{ option.detail }}</small></span>
                 <span class="plugin-manager__format">{{ option.variant }}</span>
               </button>
@@ -547,34 +577,27 @@ async function toggleEditor(slotId: string) {
                 <n-icon :component="SearchOutline" :size="26" />
                 <strong>{{ scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
                 <p>{{ !directories.length ? t('editor.plugins.supportedFormats', { formats: capabilities.formats.map(format => format.toUpperCase()).join(' / ') }) : librarySearch.trim() ? t('editor.plugins.adjustSearch') : t('editor.plugins.checkLocations') }}</p>
+                <n-button v-if="!directories.length" size="small" secondary :disabled="busy" :title="t('editor.plugins.chooseDirectoryHint')" @click="browseDirectory"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('editor.plugins.chooseDirectory') }}</n-button>
+                <n-button v-if="!directories.length && canChooseAudioUnits" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
               </div>
             </div>
             <div v-if="scanReport && descriptors.length" class="plugin-manager__library-footer">
-              <span class="plugin-panel__hint" role="status">{{ t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: scanReport.plugins.length }) }}</span>
-              <div class="plugin-manager__add-row">
-                <div class="plugin-manager__selection"><strong>{{ selectedDescriptor?.name || t('editor.plugins.selectPlugin') }}</strong><span :title="selectedDescriptor?.path">{{ selectedDescriptor?.path || t('editor.plugins.selectionHint') }}</span></div>
-                <n-button v-if="relocatingSlot" type="primary" :disabled="busy || !selectedPluginId" @click="relocatePlugin">{{ t('editor.plugins.applyLocation') }}</n-button>
-                <n-button v-else class="plugin-manager__add-button" type="primary" :disabled="busy || !selectedPluginId" @click="addPlugin"><template #icon><n-icon :component="AddOutline" /></template>{{ t('editor.plugins.addPlugin', { name: targetLabel }) }}</n-button>
-              </div>
+              <div class="plugin-manager__selection" :title="selectedDescriptor?.path"><strong>{{ selectedDescriptor?.name || t('editor.plugins.selectPlugin') }}</strong><span>{{ selectedDescriptor?.path || t('editor.plugins.selectionHint') }}</span></div>
+              <n-button v-if="relocatingSlot" type="primary" block :disabled="busy || !selectedPluginId" @click="relocatePlugin">{{ t('editor.plugins.applyLocation') }}</n-button>
+              <n-button v-else class="plugin-manager__add-button" type="primary" block :aria-label="t('editor.plugins.addPlugin', { name: targetLabel })" :disabled="busy || !selectedPluginId" @click="addPlugin"><template #icon><n-icon :component="AddOutline" /></template>{{ t('editor.plugins.addSelected') }}</n-button>
             </div>
           </section>
 
           <section class="plugin-manager__chain" :aria-label="t('editor.plugins.chainTitle')">
-            <div class="plugin-manager__section-heading">
-              <strong>{{ t('editor.plugins.chainTitle') }}</strong>
-              <span>{{ t('editor.plugins.chainCount', { count: chain.length }) }}</span>
-            </div>
-            <label class="plugin-manager__target-label">{{ t('editor.plugins.destination') }}</label>
-            <n-select v-model:value="target" v-model:show="targetMenuOpen" :options="targetOptions" :disabled="busy" :to="managerCard?.$el" :aria-label="t('editor.plugins.target')" />
-            <p v-if="chain.length" class="plugin-panel__hint">{{ t('editor.plugins.editingHint') }}</p>
-            <p v-if="feedback" class="plugin-manager__feedback" role="status">{{ feedback }}</p>
+            <div class="plugin-manager__section-heading"><strong>{{ t('editor.plugins.chainTitle') }}</strong><span class="plugin-manager__editing-hint" :title="t('editor.plugins.editingHint')">{{ t('editor.plugins.editingHint') }}</span></div>
+            <p v-if="feedback" class="plugin-manager__feedback" :title="feedback" role="status">{{ feedback }}</p>
             <div v-if="!chain.length" class="plugin-manager__empty">
               <n-icon :component="OptionsOutline" :size="28" />
               <strong>{{ t('editor.plugins.emptyChain') }}</strong>
               <p>{{ t('editor.plugins.emptyChainHint') }}</p>
             </div>
-            <div class="plugin-manager__slots">
-            <div v-for="(slot, index) in chain" :key="slot.id" class="plugin-panel__slot" :class="{ 'plugin-panel__slot--bypassed': slot.bypassed }">
+            <div v-else class="plugin-manager__slots">
+            <div v-for="(slot, index) in chain" :key="slot.id" class="plugin-panel__slot" :class="{ 'plugin-panel__slot--bypassed': slot.bypassed, 'plugin-panel__slot--parameters': parameterSlotId === slot.id }">
               <div class="plugin-manager__slot-heading">
                 <span class="plugin-manager__slot-number">{{ index + 1 }}</span>
                 <strong :title="slot.path">{{ slot.name || slot.pluginId }}</strong>
@@ -583,7 +606,7 @@ async function toggleEditor(slotId: string) {
               </div>
               <div class="plugin-manager__slot-actions">
                 <n-button size="small" secondary :type="opened.includes(slot.id) ? 'primary' : 'default'" :disabled="busy || !capabilities.nativeEditor || !(capabilities.nativeEditorFormats || ['vst3']).includes(slot.format)" @click="toggleEditor(slot.id)"><template #icon><n-icon :component="OpenOutline" /></template>{{ opened.includes(slot.id) ? t('editor.plugins.closeEditor') : t('editor.plugins.openEditor') }}</n-button>
-                <n-button size="small" quaternary :type="parameterSlotId === slot.id ? 'primary' : 'default'" :aria-expanded="parameterSlotId === slot.id" :disabled="busy || !capabilities.formats.includes(slot.format) || unavailablePlugins.some(item => item.slotId === slot.id)" @click="parameterSlotId = parameterSlotId === slot.id ? null : slot.id">{{ t('editor.plugins.parameters') }}</n-button>
+                <n-button size="small" quaternary :type="parameterSlotId === slot.id ? 'primary' : 'default'" :aria-expanded="parameterSlotId === slot.id" :disabled="busy || !capabilities.formats.includes(slot.format) || unavailablePlugins.some(item => item.slotId === slot.id)" @click="toggleParameters(slot.id)" :aria-controls="parameterSlotId === slot.id ? 'plugin-parameter-dock' : undefined">{{ t('editor.plugins.parameters') }}</n-button>
                 <div class="plugin-manager__slot-tools">
                   <n-button size="small" quaternary :disabled="busy || index === 0" :title="t('editor.plugins.moveUp')" :aria-label="t('editor.plugins.moveUp')" @click="movePlugin(slot.id, -1)"><template #icon><n-icon :component="ArrowUpOutline" /></template></n-button>
                   <n-button size="small" quaternary :disabled="busy || index === chain.length - 1" :title="t('editor.plugins.moveDown')" :aria-label="t('editor.plugins.moveDown')" @click="movePlugin(slot.id, 1)"><template #icon><n-icon :component="ArrowDownOutline" /></template></n-button>
@@ -592,16 +615,19 @@ async function toggleEditor(slotId: string) {
                 </div>
               </div>
               <p v-if="unavailablePlugins.some(item => item.slotId === slot.id)" class="plugin-panel__warning">{{ t('editor.plugins.unavailableBypassed') }} {{ unavailablePlugins.find(item => item.slotId === slot.id)?.message }}</p>
-              <EditorPluginParameters v-if="parameterSlotId === slot.id" :session="session" :slot-id="slot.id" :disabled="busy || unavailablePlugins.some(item => item.slotId === slot.id)" />
             </div>
             </div>
+            <section v-if="parameterSlot" id="plugin-parameter-dock" class="plugin-manager__parameter-dock" :aria-label="t('editor.plugins.parameters')">
+              <div class="plugin-manager__parameter-heading"><strong>{{ t('editor.plugins.parameters') }} · {{ parameterSlot.name || parameterSlot.pluginId }}</strong><n-button size="tiny" quaternary :aria-label="t('editor.plugins.closeParameters')" @click="parameterSlotId = null"><template #icon><n-icon :component="CloseOutline" /></template></n-button></div>
+              <EditorPluginParameters :key="parameterSlot.id" :session="session" :slot-id="parameterSlot.id" :disabled="busy || unavailablePlugins.some(item => item.slotId === parameterSlot?.id)" />
+            </section>
           </section>
         </div>
         <template v-if="operationError" #footer>
-          <n-alert type="error" :show-icon="false">
+          <n-alert :type="dialogPending ? 'warning' : 'error'" :show-icon="false">
             {{ operationError }}
-            <p class="plugin-panel__hint">{{ t('editor.plugins.recoveryHint') }}</p>
-            <n-button v-if="editor.pluginStateError" size="small" :disabled="busy" @click="run(async () => { await editor.retryPluginStateSave() })">{{ t('editor.plugins.retrySave') }}</n-button>
+            <p v-if="!dialogPending" class="plugin-panel__hint">{{ t('editor.plugins.recoveryHint') }}</p>
+            <n-button v-if="editor.pluginStateError && !dialogPending" size="small" :disabled="busy" @click="run(async () => { await editor.retryPluginStateSave() })">{{ t('editor.plugins.retrySave') }}</n-button>
             <n-popconfirm v-if="editor.pluginStateUnavailable" v-model:show="reloadConfirmOpen" :to="managerCard?.$el"
               :positive-text="t('common.confirm')" :negative-text="t('common.cancel')"
               :positive-button-props="{ onKeydown: guardConfirmationKeys }" :negative-button-props="{ onKeydown: guardConfirmationKeys }"
@@ -620,40 +646,53 @@ async function toggleEditor(slotId: string) {
 .plugin-panel { min-width: 0; padding: 12px 14px; border-bottom: 1px solid var(--outline); }
 .plugin-panel__hint, .plugin-panel__warning { margin: 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .plugin-panel__warning { color: var(--warning, var(--on-surface-muted)); }
-.plugin-manager { width: min(1080px, calc(100vw - 40px)); height: min(640px, calc(100dvh - 120px)); max-height: calc(100dvh - 120px); margin: 96px auto 24px; align-self: flex-start; min-width: 0; border: 1px solid var(--outline-strong); box-shadow: var(--shadow-soft); }
-.plugin-manager :deep(.n-card-header) { padding: 15px 20px; border-bottom: 1px solid var(--outline); }
+.plugin-manager { width: min(1060px, calc(100vw - 40px)); height: min(600px, calc(100dvh - 128px)); max-height: calc(100dvh - 128px); margin: 96px auto 24px; align-self: flex-start; min-width: 0; border: 1px solid var(--outline-strong); box-shadow: var(--shadow-soft); }
+.plugin-manager :deep(.n-card-header) { padding: 13px 16px; border-bottom: 1px solid var(--outline); }
 .plugin-manager :deep(.plugin-manager__content) { display: flex; flex-direction: column; padding: 0; min-height: 0; overflow: hidden; }
 .plugin-manager :deep(.plugin-manager__error) { padding: 12px 20px; max-height: 25dvh; overflow: auto; border-top: 1px solid var(--outline); }
-.plugin-manager__heading { display: grid; gap: 3px; }
+.plugin-manager__heading { display: flex; align-items: center; gap: 16px; min-width: 0; }
 .plugin-manager__heading > strong { font-size: 16px; font-weight: 600; }
-.plugin-manager__heading > span { font-size: 12px; font-weight: 400; color: var(--on-surface-muted); }
+.plugin-manager__target { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.plugin-manager__target > label { flex-shrink: 0; font-size: 11px; color: var(--on-surface-muted); }
+.plugin-manager__target > .n-select { width: 200px; max-width: 25vw; }
+.plugin-manager__library-actions { display: flex; align-items: center; gap: 2px; }
+.plugin-manager__source-count { margin-left: 5px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
+.plugin-manager__source-manager { display: flex; flex-direction: column; width: min(360px, calc(100vw - 64px)); max-height: min(400px, calc(100dvh - 220px)); color: var(--on-surface); background: var(--surface-1); border: 1px solid var(--outline-strong); border-radius: 6px; box-shadow: var(--shadow-soft); }
+.plugin-manager__source-manager > .plugin-manager__source-toolbar { flex-shrink: 0; padding: 10px 12px; border-bottom: 1px solid var(--outline); }
+.plugin-manager__source-content { display: grid; gap: 14px; min-height: 0; padding: 12px; overflow: auto; }
+.plugin-manager__scan-details { color: var(--on-surface-muted); font-size: 11px; }
+.plugin-manager__scan-details > summary { cursor: pointer; }
+.plugin-manager__scan-details[open] { max-height: 110px; overflow: auto; }
+.plugin-manager__scan-details p { margin-top: 5px; font-size: 11px; }
+.plugin-manager__scan-feedback { flex-shrink: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface-muted); font-size: 11px; }
+.plugin-manager__scan-warning { align-self: flex-start; }
+.plugin-manager__editing-hint { max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-manager__parameter-dock { display: flex; flex-direction: column; flex: 0 1 250px; min-height: 0; max-height: 55%; padding-top: 10px; border-top: 1px solid var(--outline-strong); }
+.plugin-manager__parameter-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-shrink: 0; margin-bottom: 8px; }
+.plugin-manager__parameter-heading > strong { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 500; }
+.plugin-manager__parameter-dock > .plugin-parameters { flex: 1; min-height: 0; }
+.plugin-manager__chain-count { flex-shrink: 0; font-size: 11px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
 .plugin-manager__badge { padding: 3px 7px; border-radius: 4px; background: var(--surface-2); font-size: 11px; color: var(--on-surface-muted); }
-.plugin-manager__steps { display: flex; gap: 24px; flex-shrink: 0; margin: 0; padding: 12px 20px; border-bottom: 1px solid var(--outline); list-style: none; }
-.plugin-manager__steps > li { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--on-surface-muted); }
-.plugin-manager__steps > li > span { display: grid; place-items: center; width: 21px; height: 21px; border: 1px solid var(--outline-strong); border-radius: 50%; font-variant-numeric: tabular-nums; }
-.plugin-manager__steps > li[aria-current="step"] { color: var(--primary); font-weight: 600; }
-.plugin-manager__steps > li[aria-current="step"] > span, .plugin-manager__step--done > span { background: var(--primary-soft); border-color: var(--primary-border); color: var(--primary); }
-.plugin-manager__body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
-.plugin-manager__chain, .plugin-manager__library { display: flex; flex-direction: column; align-items: stretch; gap: 12px; min-width: 0; min-height: 0; padding: 18px 20px; overflow: hidden; }
-.plugin-manager__library--scan-controls { overflow-y: auto; }
-.plugin-manager__library--scan-controls > * { flex-shrink: 0; }
-.plugin-manager__library--scan-controls .plugin-manager__catalog { min-height: 120px; }
-.plugin-manager__scan-progress { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--outline); border-radius: 6px; background: var(--surface-2); }
+.plugin-manager__body { display: grid; grid-template-columns: minmax(280px, 33%) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+.plugin-manager__chain, .plugin-manager__library { display: flex; flex-direction: column; align-items: stretch; gap: 9px; min-width: 0; min-height: 0; padding: 12px 14px; overflow: hidden; }
+.plugin-manager__scan-progress { display: grid; flex-shrink: 0; gap: 6px; padding: 10px; border: 1px solid var(--outline); border-radius: 6px; background: var(--surface-2); }
 .plugin-manager__scan-progress-heading { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; }
 .plugin-manager__scan-progress-heading > span { color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
-.plugin-manager__scan-current, .plugin-manager__blacklist-entry > span { display: grid; gap: 3px; min-width: 0; }
+.plugin-manager__scan-current { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.plugin-manager__scan-current > strong { min-width: 0; }
+.plugin-manager__scan-current > small { flex-shrink: 0; }
+.plugin-manager__blacklist-entry > span { display: grid; gap: 3px; min-width: 0; }
 .plugin-manager__scan-current > *, .plugin-manager__blacklist-entry > span > * { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
 .plugin-manager__scan-current > small, .plugin-manager__blacklist-entry small { color: var(--on-surface-muted); font-size: 11px; }
 .plugin-manager__scan-control-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .plugin-manager__blacklist { font-size: 12px; }
 .plugin-manager__blacklist > summary { cursor: pointer; color: var(--on-surface-muted); }
 .plugin-manager__blacklist > p, .plugin-manager__blacklist-list { margin-top: 8px; }
-.plugin-manager__blacklist-list { display: grid; gap: 9px; max-height: 110px; overflow: auto; }
+.plugin-manager__blacklist-list { display: grid; gap: 9px; }
 .plugin-manager__blacklist-entry { display: flex; gap: 8px; align-items: center; }
 .plugin-manager__blacklist-entry > span { flex: 1; }
-.plugin-manager__chain { background: color-mix(in srgb, var(--surface-2) 24%, transparent); border-left: 1px solid var(--outline); }
-.plugin-manager__target-label { margin-bottom: -6px; color: var(--on-surface-muted); font-size: 11px; }
-.plugin-manager__feedback { margin: 0; padding: 8px 10px; border-radius: 5px; background: var(--primary-softer); color: var(--primary-strong); font-size: 12px; line-height: 1.6; }
+.plugin-manager__chain { background: var(--surface-1); border-left: 1px solid var(--outline); }
+.plugin-manager__feedback { flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; padding: 6px 8px; border-radius: 5px; background: var(--primary-softer); color: var(--primary-strong); font-size: 12px; line-height: 1.6; }
 .plugin-manager__section-heading, .plugin-manager__slot-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .plugin-manager__section-heading { justify-content: space-between; min-height: 28px; flex-shrink: 0; }
 .plugin-manager__section-heading > div { display: flex; align-items: center; gap: 8px; }
@@ -664,8 +703,9 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__empty > .n-icon { margin-bottom: 3px; color: var(--primary); }
 .plugin-manager__empty > strong { color: var(--on-surface); font-size: 13px; font-weight: 500; }
 .plugin-manager__empty > p { max-width: 270px; margin: 0; font-size: 12px; line-height: 1.7; text-wrap: pretty; }
-.plugin-manager__slots { display: grid; align-content: start; gap: 10px; min-height: 0; overflow: auto; }
-.plugin-panel__slot { display: grid; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--outline-strong); border-radius: 8px; background: var(--surface-1); }
+.plugin-manager__slots { display: grid; flex: 1; align-content: start; gap: 6px; min-height: 0; overflow: auto; }
+.plugin-panel__slot { display: grid; gap: 5px; min-width: 0; padding: 10px; border: 1px solid var(--outline); border-radius: 5px; background: var(--surface-1); }
+.plugin-panel__slot--parameters { border-color: var(--primary-border); }
 .plugin-panel__slot--bypassed { border-style: dashed; }
 .plugin-panel__slot--bypassed .plugin-manager__slot-heading > strong { color: var(--on-surface-muted); }
 .plugin-manager__slot-number { display: grid; place-items: center; width: 23px; height: 23px; border-radius: 5px; background: var(--surface-2); flex-shrink: 0; }
@@ -675,13 +715,12 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__slot-actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .plugin-manager__slot-tools { display: flex; align-items: center; gap: 2px; margin-left: auto; }
 .plugin-manager__slot-tools :deep(.n-button) { width: 27px; padding: 0; }
-.plugin-panel__slot :deep(.plugin-parameters) { padding-top: 12px; border-top: 1px solid var(--outline); }
-.plugin-manager__sources { display: grid; gap: 8px; flex-shrink: 0; padding-bottom: 12px; border-bottom: 1px solid var(--outline); }
-.plugin-manager__sources--empty { padding: 12px; border: 1px solid var(--primary-border); border-radius: 7px; background: var(--primary-softer); }
+.plugin-manager__sources { display: grid; gap: 8px; }
+
 .plugin-manager__source-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .plugin-manager__source-toolbar > strong { font-size: 12px; font-weight: 500; }
 .plugin-manager__source-toolbar > span { color: var(--on-surface-muted); font-size: 11px; }
-.plugin-manager__directories { display: grid; gap: 4px; max-height: 72px; overflow: auto; }
+.plugin-manager__directories { display: grid; gap: 6px; }
 .plugin-panel__directory { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .plugin-panel__directory > span { display: grid; flex: 1; min-width: 0; line-height: 1.6; }
 .plugin-panel__directory strong, .plugin-panel__directory small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -689,7 +728,7 @@ async function toggleEditor(slotId: string) {
 .plugin-panel__directory small { color: var(--on-surface-muted); font-size: 11px; }
 .plugin-panel__directory .plugin-manager__au-source-hint { white-space: normal; }
 .plugin-manager__scan-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-.plugin-panel__scan-failures { flex-shrink: 0; max-height: 90px; overflow: auto; padding: 8px; border-radius: 6px; background: color-mix(in srgb, var(--warning) 9%, transparent); color: var(--on-surface-muted); font-size: 12px; overflow-wrap: anywhere; }
+.plugin-panel__scan-failures { flex-shrink: 0; padding: 8px; border-radius: 6px; background: color-mix(in srgb, var(--warning) 9%, transparent); color: var(--on-surface-muted); font-size: 12px; overflow-wrap: anywhere; }
 .plugin-panel__scan-failures summary { cursor: pointer; margin-top: 6px; }
 .plugin-panel__scan-failures p { margin: 8px 0 0; }
 .plugin-panel__scan-failures span { display: block; font-weight: 600; }
@@ -697,27 +736,25 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__relocation > p { margin: 0; flex: 1; font-size: 12px; line-height: 1.6; }
 .plugin-manager__catalog { flex: 1; min-height: 0; overflow: auto; }
 .plugin-manager__group-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
-.plugin-manager__group-controls > span { font-size: 11px; color: var(--on-surface-muted); }
+.plugin-manager__group-controls :deep(.n-radio-group) { display: flex; width: 100%; }
+.plugin-manager__group-controls :deep(.n-radio-button) { flex: 1; padding: 0 5px; text-align: center; font-size: 11px; }
 .plugin-manager__group { padding-top: 2px; }
 .plugin-manager__group + .plugin-manager__group { margin-top: 10px; }
 .plugin-manager__group-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 10px 8px; color: var(--on-surface-muted); }
 .plugin-manager__group-heading > strong { min-width: 0; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__group-heading > span { font-size: 10px; font-variant-numeric: tabular-nums; }
-.plugin-manager__plugin { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; margin: 0 0 4px; padding: 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; transition: background 120ms, border-color 120ms; }
+.plugin-manager__plugin { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; margin: 0 0 3px; padding: 8px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; transition: background 120ms, border-color 120ms; }
 .plugin-manager__plugin:hover:not(:disabled) { background: var(--surface-2); }
 .plugin-manager__plugin--selected, .plugin-manager__plugin--selected:hover:not(:disabled) { background: var(--primary-softer); border-color: var(--primary-border); }
 .plugin-manager__plugin:disabled { cursor: default; opacity: .5; }
-.plugin-manager__plugin-icon { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 6px; background: var(--surface-2); flex-shrink: 0; color: var(--on-surface-muted); }
-.plugin-manager__plugin--selected .plugin-manager__plugin-icon { color: var(--primary); background: var(--primary-soft); }
 .plugin-manager__plugin-info { display: grid; gap: 3px; min-width: 0; flex: 1; }
 .plugin-manager__plugin-info > strong { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__plugin-info > small { color: var(--on-surface-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__plugin-info > .plugin-manager__plugin-identity { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
 .plugin-manager__empty--library { min-height: 100%; padding: 12px; }
 .plugin-manager__plugin:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
-.plugin-manager__library-footer { display: grid; flex-shrink: 0; gap: 10px; padding-top: 12px; border-top: 1px solid var(--outline); }
+.plugin-manager__library-footer { display: grid; flex-shrink: 0; gap: 6px; padding-top: 8px; border-top: 1px solid var(--outline); }
 .plugin-manager__library-footer > .plugin-panel__hint { font-size: 11px; }
-.plugin-manager__add-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
 .plugin-manager__selection { display: grid; gap: 3px; min-width: 0; }
 .plugin-manager__selection > strong { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__selection > span { font-size: 11px; color: var(--on-surface-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

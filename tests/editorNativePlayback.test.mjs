@@ -13,6 +13,7 @@ const code = ts.transpileModule(source.statements.filter(item => !ts.isImportDec
 }).outputText
 const flush = async () => { await nextTick(); await new Promise(resolve => setImmediate(resolve)) }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
+class PluginHostDialogPendingError extends Error {}
 function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCapabilities = { recording: true } } = {}) {
   const playback = useEditorPlaybackStore(createPinia())
   const editor = reactive({ session: { id: 'project', tracks: [], sources: [], masterVolume: 1, masterPan: 0,
@@ -22,6 +23,7 @@ function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCa
   let timerId = 0
   const backend = { position: 0, playing: false, playEnds: false, error: undefined }
   const create = vm.runInNewContext(`${code}\nuseEditorNativePlayback`, {
+    PluginHostDialogPendingError,
     computed, watch, hasEditorPlugins, pluginProjectSignature, useEditorPlaybackStore: () => playback,
     pluginHostCapabilities: async () => hostCapabilities,
     i18n: { global: { t: key => key } },
@@ -32,6 +34,7 @@ function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCa
     unloadPluginSession: async projectId => { calls.push(['unload', projectId]) },
     pluginHostRequest: async request => {
       calls.push([request.op, request.projectId, request])
+      if (backend.dialogPending) throw new PluginHostDialogPendingError('Waiting for a plugin dialog')
       if (request.op === 'play') { backend.playing = !backend.playEnds; backend.position = backend.playEnds ? 10 : request.position }
       if (request.op === 'pause') { if (pauseGate) await pauseGate.promise; backend.playing = false }
       if (request.op === 'seek') backend.position = request.position
@@ -60,6 +63,34 @@ test('native transport sends control messages and applies host meters without PC
   assert.equal(env.playback.currentTime, 0)
   assert.ok(env.calls.some(call => call[0] === 'play' && call[2].position === 2))
   assert.ok(env.calls.every(call => !call[2] || !('pcm' in call[2])))
+})
+test('a plugin dialog retains playback polling and recovers without a transport error', async t => {
+  const env = environment(t)
+  await env.native.play(2)
+  env.backend.dialogPending = true
+  await env.poll()
+  assert.equal(env.playback.status, 'playing')
+  assert.equal(env.playback.error, null)
+  assert.ok(env.timers.size)
+  env.backend.dialogPending = false
+  env.backend.position = 4
+  await env.poll()
+  assert.equal(env.playback.currentTime, 4)
+  assert.equal(env.playback.error, null)
+})
+test('pause during a plugin dialog recovers to the actual host status', async t => {
+  const env = environment(t)
+  await env.native.play(2)
+  env.backend.dialogPending = true
+  env.native.pause()
+  await flush()
+  assert.equal(env.playback.error, null)
+  assert.ok(env.timers.size)
+  // The retained pause completes in the helper before the next status request is sent.
+  env.backend.dialogPending = false; env.backend.playing = false
+  await env.poll()
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.playback.error, null)
 })
 test('pause cancels pending startup before the old request can start audio', async t => {
   const gate = deferred()

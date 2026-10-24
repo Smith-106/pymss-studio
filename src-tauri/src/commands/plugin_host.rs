@@ -13,6 +13,9 @@ use std::time::Duration;
 use tauri::{AppHandle, State};
 
 mod blacklist;
+mod dialogs;
+#[cfg(test)]
+mod dialog_tests;
 mod scan_control;
 mod scan_pipeline;
 #[cfg(test)]
@@ -345,6 +348,8 @@ enum HostRequestError {
     Operation(String),
     /// Local validation rejected a request before it was written to the child.
     Request(String),
+    /// A live helper awaits explicit user interaction; one response is still outstanding.
+    DialogPending(String),
     /// The process or JSON-lines channel can no longer be trusted.
     Transport(String),
 }
@@ -358,7 +363,7 @@ impl HostRequestError {
 impl std::fmt::Display for HostRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            Self::Operation(message) | Self::Request(message) | Self::Transport(message) => message,
+            Self::Operation(message) | Self::Request(message) | Self::DialogPending(message) | Self::Transport(message) => message,
         };
         formatter.write_str(message)
     }
@@ -370,6 +375,9 @@ struct HostProcess {
     input: Option<mpsc::SyncSender<(Vec<u8>, mpsc::SyncSender<Result<(), String>>)>>,
     responses: mpsc::Receiver<Result<Value, String>>,
     sequence: u64,
+    pending: Option<dialogs::Pending>,
+    completed_session_id: Option<String>,
+    live_closed: bool,
     #[cfg(windows)]
     _job: ProcessJob,
 }
@@ -464,6 +472,9 @@ impl HostProcess {
             input: Some(input),
             responses,
             sequence: 0,
+            pending: None,
+            completed_session_id: None,
+            live_closed: false,
             #[cfg(windows)]
             _job: job,
         })
@@ -471,9 +482,15 @@ impl HostProcess {
 
     fn request(
         &mut self,
-        mut request: Value,
+        request: Value,
         timeout: Duration,
     ) -> Result<Value, HostRequestError> {
+        let (id, started) = self.send_request(request, timeout)?;
+        let response = self.receive(timeout.saturating_sub(started.elapsed()))?;
+        decode_response(response, id)
+    }
+
+    fn send_request(&mut self, mut request: Value, timeout: Duration) -> Result<(u64, std::time::Instant), HostRequestError> {
         self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
             HostRequestError::Transport("Audio host request sequence exhausted".into())
         })?;
@@ -500,8 +517,77 @@ impl HostProcess {
                 )
             })?
             .map_err(HostRequestError::Transport)?;
-        let response = self.receive(timeout.saturating_sub(started.elapsed()))?;
-        decode_response(response, id)
+        Ok((id, started))
+    }
+
+    fn request_live(&mut self, request: Value, timeout: Duration) -> Result<Value, HostRequestError> {
+        self.request_live_with(request, timeout, &mut dialogs::owned_dialog)
+    }
+
+    fn request_live_with(&mut self, request: Value, timeout: Duration, detector: &mut impl FnMut(u32) -> Option<String>) -> Result<Value, HostRequestError> {
+        self.finish_pending_with(detector)?;
+        let operation = request.get("op").and_then(Value::as_str).unwrap_or("").to_owned();
+        if self.live_closed {
+            return if matches!(operation.as_str(), "unload" | "shutdown") { Ok(json!({"closed":true})) }
+                else { Err(HostRequestError::Operation("The previous request closed the audio session. Reload the project before retrying".into())) };
+        }
+        let (id, started) = self.send_request(request, timeout)?;
+        self.pending = Some(dialogs::Pending::new(id, operation, started, timeout));
+        self.receive_live_with(detector)
+    }
+
+    fn finish_pending_with(&mut self, detector: &mut impl FnMut(u32) -> Option<String>) -> Result<(), HostRequestError> {
+        if self.pending.is_some() { self.receive_live_with(detector)?; }
+        Ok(())
+    }
+
+    fn receive_live_with(&mut self, detector: &mut impl FnMut(u32) -> Option<String>) -> Result<Value, HostRequestError> {
+        loop {
+            // Always consume a completed response before inspecting windows. A dialog may
+            // outlive its SDK call, and a dead helper must never be retained on that evidence.
+            let response = match self.responses.try_recv() {
+                Ok(value) => Some(value),
+                Err(mpsc::TryRecvError::Disconnected) => return Err(HostRequestError::Transport("The audio host response pipe closed".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(response) = response { return self.complete_live(response); }
+            if self.pending.as_ref().is_some_and(dialogs::Pending::is_suspended) {
+                if let Some(title) = detector(self.control.pid) {
+                    return Err(HostRequestError::DialogPending(dialogs::message(&title)));
+                }
+            }
+            let remaining = self.pending.as_mut().expect("a live request is outstanding").remaining();
+            if remaining.is_zero() {
+                if let Some(title) = detector(self.control.pid) {
+                    self.pending.as_mut().expect("a live request is outstanding").suspend();
+                    return Err(HostRequestError::DialogPending(dialogs::message(&title)));
+                }
+                return Err(HostRequestError::Transport("The audio host timed out and was terminated".into()));
+            }
+            // Give normal fast RPCs a chance to complete even if a plugin also owns a modeless
+            // dialog. A real modal blocks the UI dispatch and leaves this response outstanding.
+            match self.responses.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(value) => return self.complete_live(value),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HostRequestError::Transport("The audio host response pipe closed".into())),
+            }
+            if let Some(title) = detector(self.control.pid) {
+                self.pending.as_mut().expect("a live request is outstanding").suspend();
+                return Err(HostRequestError::DialogPending(dialogs::message(&title)));
+            }
+        }
+    }
+
+    fn complete_live(&mut self, response: Result<Value, String>) -> Result<Value, HostRequestError> {
+        let pending = self.pending.take().expect("a live request is outstanding");
+        let result = decode_response(response.map_err(HostRequestError::Transport)?, pending.id);
+        if let Ok(value) = &result {
+            if matches!(pending.operation.as_str(), "shutdown" | "unload") { self.live_closed = true; }
+            if let Some(id) = value.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                self.completed_session_id = Some(id.to_owned());
+            }
+        }
+        result
     }
 
     fn receive(&self, timeout: Duration) -> Result<Value, HostRequestError> {
@@ -612,20 +698,48 @@ fn request_session(
         Some("shutdown" | "unload")
     );
     let result = match session.process.as_mut() {
-        Some(process) => process.request(request, timeout),
+        Some(process) => process.request_live(request, timeout),
         None => Err(HostRequestError::Transport(
             "The audio host session is closed".into(),
         )),
     };
-    if result.as_ref().is_err_and(|error| error.is_fatal()) || (result.is_ok() && closing) {
+    reconcile_live_session(session, pid, result.as_ref().is_err_and(HostRequestError::is_fatal) || (result.is_ok() && closing));
+    result
+}
+
+fn reconcile_live_session(session: &mut Session, pid: &ProcessLease, closing: bool) {
+    let completed = session.process.as_mut().map(|process| (process.live_closed, process.completed_session_id.take()));
+    if closing || completed.as_ref().is_some_and(|(closed, _)| *closed) {
         close_session(session, pid);
-    } else if let Ok(response) = &result {
-        if let Some(id) = response.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
-            // Latency recovery can replace the native instance without a load/update command.
-            session.native_session_id = Some(id.to_owned());
+    } else if let Some((_, Some(id))) = completed {
+        // Deferred load/update and latency-recovery replies carry the same authoritative ID.
+        session.native_session_id = Some(id);
+    }
+}
+
+fn prepare_live_load_with(session: &mut Session, pid: &ProcessLease, generation: u64, detector: &mut impl FnMut(u32) -> Option<String>) -> Result<(), HostRequestError> {
+    let mut result = match session.process.as_mut() {
+        Some(process) => process.finish_pending_with(detector),
+        None => Ok(()),
+    };
+    if result.is_ok() {
+        if let Some(title) = session.process.as_ref().and_then(|process| detector(process.control.pid)) {
+            // A dialog can also originate in a plugin window message, outside any RPC.
+            result = Err(HostRequestError::DialogPending(dialogs::message(&title)));
         }
     }
-    result
+    let fatal = result.as_ref().is_err_and(HostRequestError::is_fatal);
+    reconcile_live_session(session, pid, fatal);
+    if let Err(error) = result {
+        if !fatal {
+            // Declining a replacement while a dialog is open must not invalidate the retained
+            // graph's subsequent status/save requests. Older queued requests stay superseded.
+            session.generation = generation;
+        }
+        return Err(error);
+    }
+    close_session(session, pid);
+    Ok(())
 }
 
 fn require_generation(state: &PluginHostState, generation: u64) -> Result<(), String> {
@@ -904,7 +1018,8 @@ pub async fn plugin_host_request(
             return Err("The audio host session belongs to another project or is closed".into());
         }
         if op == "load" {
-            close_session(&mut session, &state.session_pid);
+            prepare_live_load_with(&mut session, &state.session_pid, generation, &mut dialogs::owned_dialog)
+                .map_err(|error| error.to_string())?;
         }
         if op == "load" || op == "update" {
             prepare_session_request(&mut session, &state.session_pid, op == "load", || {

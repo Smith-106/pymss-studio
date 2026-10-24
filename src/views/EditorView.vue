@@ -6,6 +6,7 @@ import { useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { FolderOpenOutline, MusicalNotesOutline, OptionsOutline } from '@vicons/ionicons5'
 import { useEditorStore } from '@/stores/editor'
+import { currentPluginSession } from '@/utils/pluginHost'
 import { useTaskStore } from '@/stores/task'
 import { useSettingsStore } from '@/stores/settings'
 import EditorAssetPanel from '@/components/editor/EditorAssetPanel.vue'
@@ -391,7 +392,8 @@ async function save() {
 }
 
 watch(() => editor.pluginStateError, error => {
-  if (error) message.error(error, { duration: 10000 })
+  const host = currentPluginSession()
+  if (error && !(host?.project === editor.session && host.interactionRequired)) message.error(error, { duration: 10000 })
 })
 
 onBeforeRouteLeave(async () => {

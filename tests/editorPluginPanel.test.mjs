@@ -27,7 +27,8 @@ function environment(t, { scanControl = false } = {}) {
     failures: [], scanned: 1, cached: 0,
   } }
   const context = vm.createContext({
-    computed, ref, watch, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
+    PluginHostDialogPendingError: class PluginHostDialogPendingError extends Error {},
+    computed, ref, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
     useEditorStore: () => ({
       async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise },
       setPluginChain(trackId, chain) {
@@ -728,4 +729,47 @@ test('null and terminal scan status cleanly gate controls without completing the
   await scanning
   assert.equal(env.read('busy'), false)
   assert.equal(env.timers.size, 0)
+})
+
+test('generic parameters stay collapsed until requested and follow slot IDs across reordering', async t => {
+  const env = environment(t)
+  assert.equal(env.read('parameterSlotId'), null)
+  assert.equal(env.read('parameterSlot'), undefined)
+  env.trigger('parameters')
+  assert.equal(env.read('parameterSlotId'), 'b')
+  assert.equal(env.read('parameterSlot').id, 'b')
+  env.props.session.pluginChain = [env.props.session.pluginChain[1], env.props.session.pluginChain[0]]
+  await flush()
+  assert.equal(env.read('parameterSlot').id, 'b')
+  env.props.session.pluginChain.splice(0, 1)
+  await flush()
+  assert.equal(env.read('parameterSlotId'), null)
+  assert.equal(env.read('parameterSlot'), undefined)
+  env.call('toggleParameters', 'no-longer-present')
+  assert.equal(env.read('parameterSlotId'), null)
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('source management consumes Escape before the modeless workbench and never cancels background scanning', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  env.controls.scanGate = deferred()
+  const scanning = env.call('scan')
+  await flush()
+  env.call('openManager')
+  env.set('sourcesOpen', true)
+  let prevented = false, stopped = false
+  env.call('onManagerKeyCapture', { key: 'Escape', defaultPrevented: false, preventDefault() { prevented = true }, stopPropagation() { stopped = true } })
+  assert.equal(prevented, true)
+  assert.equal(stopped, true)
+  assert.equal(env.read('sourcesOpen'), false)
+  assert.equal(env.read('managerOpen'), true)
+  assert.equal(env.read('scanning'), true)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_scan').length, 0)
+  env.call('closeManager')
+  assert.equal(env.read('sourcesOpen'), false)
+  assert.equal(env.read('scanning'), true)
+  env.controls.scanGate.resolve()
+  await scanning
 })

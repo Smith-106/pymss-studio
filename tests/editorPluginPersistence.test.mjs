@@ -30,6 +30,7 @@ function environment(t,{builtinEffects}={}){
       const request=args.request
       if(request.op==='update'&&controls.updateError)throw new Error('Plugin Missing Effect [missing] could not be loaded')
       if(request.op==='load'){controls.projectId=request.projectId;controls.states=Object.fromEntries([...(request.project.pluginChain||[]),...request.project.tracks.flatMap(track=>track.pluginChain||[])].map(slot=>[slot.id,slot.state||'sha256:initial']))}
+      if(controls.dialogPending&&request.op!=='load')throw new Error('PLUGIN_HOST_DIALOG_PENDING: The plugin is waiting for its dialog')
       if(request.op==='status'&&controls.statusError)throw new Error('The audio host session is closed')
       if(request.op==='snapshot'){
         const result={...status(),states:controls.partialSnapshot?{}:Object.fromEntries(Object.entries(controls.states).filter(([id])=>!controls.omittedSlots.includes(id)))}
@@ -75,11 +76,56 @@ function environment(t,{builtinEffects}={}){
 }
 afterEach(async()=>{
   for(const env of environments.splice(0)){
-    env.controls.snapshotError=false;env.controls.statusError=false;env.controls.updateError=false;env.controls.saveError=false;env.controls.partialSnapshot=false;env.controls.omittedSlots=[];env.controls.snapshotGate=null;env.controls.parameterGate=null
+    env.controls.dialogPending=false;env.controls.snapshotError=false;env.controls.statusError=false;env.controls.updateError=false;env.controls.saveError=false;env.controls.partialSnapshot=false;env.controls.omittedSlots=[];env.controls.snapshotGate=null;env.controls.parameterGate=null
     const current=host.currentPluginSession()
     if(current){await host.snapshotPluginStates(current.project,{force:true});await host.unloadPluginSession(current.project.id)}
     env.editor.$dispose();env.t.mock.timers.reset()
   }
+})
+
+test('native dialog wait retains the live graph and resumes observation and autosave after dismissal',async t=>{
+ const env=environment(t)
+ await host.openPluginEditor(env.editor.session,'slot')
+ await env.tick(900)
+ env.calls.length=0
+ env.controls.dialogPending=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}),host.PluginHostDialogPendingError)
+ assert.equal(host.currentPluginSession().interactionRequired,true)
+ assert.equal(host.currentPluginSession().unavailable,false)
+ assert.equal(env.editor.pluginStateUnavailable,false)
+ assert.match(env.editor.pluginStateError,/waiting for a dialog/)
+ assert.equal(env.editor.lastError,null)
+ assert.doesNotMatch(env.editor.pluginStateError,/state.*failed/i)
+ await assert.rejects(env.editor.capturePluginState(env.editor.session,true),host.PluginHostDialogPendingError)
+ assert.equal(env.editor.lastError,null)
+ env.editor.scheduleSave()
+ await env.tick(420)
+ assert.equal(env.editor.lastError,null)
+ assert.equal(env.saved().length,0)
+ assert.equal(env.editor.session.pluginChain[0].state,'sha256:initial')
+ env.controls.dialogPending=false
+ env.controls.states.slot='sha256:after-dialog';env.controls.revision++
+ await env.tick(1000)
+ assert.equal(host.currentPluginSession().interactionRequired,false)
+ assert.equal(env.editor.pluginStateError,null)
+ assert.equal(env.editor.pluginStateDirty,true)
+ await env.tick(900)
+ assert.equal(env.editor.pluginStateError,null)
+ assert.equal(env.editor.session.pluginChain[0].state,'sha256:after-dialog')
+ assert.equal(env.saved().at(-1).args.project.pluginChain[0].state,'sha256:after-dialog')
+ assert.equal(env.calls.filter(call=>['load','update','unload'].includes(call.args?.request?.op)).length,0)
+})
+
+test('a real host failure after a pending dialog still marks the graph unavailable',async t=>{
+ const env=environment(t)
+ await host.openPluginEditor(env.editor.session,'slot')
+ env.controls.dialogPending=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}),host.PluginHostDialogPendingError)
+ env.controls.dialogPending=false;env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}),/session is closed/)
+ assert.equal(host.currentPluginSession().interactionRequired,false)
+ assert.equal(host.currentPluginSession().unavailable,true)
+ assert.equal(env.editor.pluginStateUnavailable,true)
 })
 
 test('native window edits autosave without starting playback and unchanged revisions do not recapture',async t=>{
