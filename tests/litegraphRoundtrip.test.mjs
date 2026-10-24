@@ -134,6 +134,19 @@ test('separate nodes shrink after switching from six stems to two', () => {
   assert.equal(node.outputs.length, 4)
 })
 
+test('legacy audio preview nodes are hidden from creation menus but remain importable', () => {
+  assert.equal(NODE_SPECS.PreviewAudio.hidden, true)
+  const preview = LiteGraph.registered_node_types.PreviewAudio
+  assert.equal(preview.skip_list, true)
+  assert.equal(Object.keys(LiteGraph.registered_node_types).includes('PreviewAudio'), false)
+  const graph = load({ nodes: [{ id: 1, type: 'PreviewAudio', pos: [10, 20], size: [200, 80],
+    inputs: [{ name: 'audio', type: 'AUDIO', link: null }], outputs: [], widgets_values: [] }], links: [] })
+  assert.equal(graph.nodes[0].type, 'PreviewAudio')
+  const exported = exportGraph(graph)
+  assert.equal(exported.nodes[0].type, 'PreviewAudio')
+  assert.deepEqual(exported.nodes[0].inputs.map(input => input.name), ['audio'])
+})
+
 test('separate stem changes preserve matching links and drop only removed stems', () => {
   const graph = new LGraph()
   const separate = LiteGraph.createNode('mss_separate')

@@ -16,10 +16,11 @@ import {
 import { useTaskStore, type SeparationJob, type SeparationTask } from '@/stores/task'
 import { useEditorStore, type OrphanedEditorProject } from '@/stores/editor'
 import { usePagedSelection } from '@/composables/usePagedSelection'
+import { resultType, RESULT_TYPE_KEYS, type ResultType } from '@/utils/resultType'
 import { NCheckbox, useDialog, useMessage } from 'naive-ui'
 
 type ResultSort = 'time_desc' | 'time_asc' | 'name_asc' | 'name_desc'
-type ResultGroup = SeparationJob & { items: SeparationTask[] }
+type ResultGroup = SeparationJob & { items: SeparationTask[]; resultType: ResultType }
 
 const { t } = useI18n()
 const task = useTaskStore()
@@ -28,6 +29,12 @@ const message = useMessage()
 const dialog = useDialog()
 
 const search = ref('')
+const typeFilter = ref<ResultType | 'all'>('all')
+const typeOptions = computed(() => [
+  { label: t('results.typeAll'), value: 'all' },
+  ...Object.entries(RESULT_TYPE_KEYS).filter(([value]) => value !== 'unknown' || resultGroups.value.some(group => group.resultType === 'unknown'))
+    .map(([value, key]) => ({ label: t(key), value })),
+])
 const sortBy = ref<ResultSort>('time_desc')
 const expandedIds = ref<string[]>([])
 const orphanedEditorProjects = ref<OrphanedEditorProject[]>([])
@@ -42,11 +49,12 @@ const sortOptions = [
 ]
 
 const resultGroups = computed<ResultGroup[]>(() => {
-  return task.resultJobs.map((job) => ({ ...job, items: job.tasks }))
+  return task.resultJobs.map((job) => ({ ...job, items: job.tasks, resultType: resultType(job.primary) }))
 })
 const filteredResults = computed(() => {
   const keyword = search.value.trim().toLowerCase()
   const list = resultGroups.value.filter((group) => {
+    if (typeFilter.value !== 'all' && group.resultType !== typeFilter.value) return false
     if (!keyword) return true
     const haystack = [
       group.id,
@@ -108,7 +116,7 @@ let resultDragSelection: ResultDragSelection | null = null
 let resultDragTimer: ReturnType<typeof setTimeout> | null = null
 let suppressNextResultClick = false
 
-watch([search, sortBy, pageSize], () => {
+watch([search, sortBy, typeFilter, pageSize], () => {
   page.value = 1
 })
 
@@ -121,7 +129,7 @@ function getFileName(path: string) {
 }
 
 function getGroupTitle(group: ResultGroup) {
-  if (group.inputCount === 1) return getFileName(group.primary.input)
+  if (group.inputCount === 1) return getFileName(group.primary.input) || group.model
   return t('results.groupTitle', { count: group.inputCount, name: getFileName(group.primary.input) })
 }
 
@@ -143,10 +151,6 @@ async function openInEditor(item: SeparationTask) {
 }
 
 // 删除结果时回收当前结果对应的输出文件；分层输出的结果目录仅在已空时清理。
-function trashTargets(item: SeparationTask) {
-  return task.resultTrashTargets(item)
-}
-
 function trashEmptyDirs(item: SeparationTask) {
   return task.resultTrashEmptyDirs(item)
 }
@@ -157,6 +161,22 @@ function groupTaskIds(group: ResultGroup) {
 
 function groupTaskIdTitle(group: ResultGroup) {
   return groupTaskIds(group).join('\n')
+}
+
+function removalItems(ids: string[]) {
+  try { return task.getRemovalTasks(ids) }
+  catch (error) { message.warning(String(error instanceof Error ? error.message : error)); return null }
+}
+
+async function removeResultRecords(items: SeparationTask[]) {
+  if (!await cleanupLinkedEditorProjects(items)) return false
+  try {
+    await task.removeResults(items.map(item => item.id))
+    return true
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : t('results.removeRecordsFailed'))
+    return false
+  }
 }
 
 async function cleanupLinkedEditorProjects(items: SeparationTask[]) {
@@ -251,12 +271,7 @@ function handleCleanupOrphanedEditorProjects() {
 }
 
 function trashTargetsForItems(items: SeparationTask[]) {
-  const seen = new Set<string>()
-  return items.flatMap((item) => trashTargets(item)).filter((path) => {
-    if (seen.has(path)) return false
-    seen.add(path)
-    return true
-  })
+  return task.resultTrashTargetsForTasks(items)
 }
 
 function trashEmptyDirsForItems(items: SeparationTask[]) {
@@ -297,6 +312,8 @@ function confirmRemoveListOnly(failedCount: number, totalCount: number, mode: Re
 
 function handleRemoveResult(group: ResultGroup) {
   const ids = groupTaskIds(group)
+  const items = removalItems(ids)
+  if (!items?.length) return
   const deleteFiles = ref(false)
   dialog.warning({
     title: t('results.removeTitle'),
@@ -313,29 +330,29 @@ function handleRemoveResult(group: ResultGroup) {
     positiveButtonProps: { type: 'error' },
     onPositiveClick: async () => {
       const finishRemove = async () => {
-        if (!await cleanupLinkedEditorProjects(group.items)) return false
-        task.removeResults(ids)
-        return true
+        return removeResultRecords(items)
       }
       if (!deleteFiles.value) {
-        if (!await finishRemove()) return
+        if (!await finishRemove()) return false
         message.success(t('results.removeSuccess'))
         return
       }
-      if (!await ensureLinkedEditorProjectsClosed(group.items)) return false
+      if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(group.items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
-        if (!await finishRemove()) return
-        message.warning(t('results.removeNoFilesSingle'))
+        if (!await finishRemove()) return false
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesSingle'))
         return
       }
 
       try {
-        const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(group.items))
+        const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
-          if (!await finishRemove()) return
-          message.success(t('results.removeFilesSuccessSingle'))
+          if (!await finishRemove()) return false
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessSingle'))
           return
         }
 
@@ -344,11 +361,11 @@ function handleRemoveResult(group: ResultGroup) {
           message.warning(t('results.removeFilesKeptSingle'))
           return
         }
-        if (!await finishRemove()) return
+        if (!await finishRemove()) return false
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'single')
@@ -356,7 +373,7 @@ function handleRemoveResult(group: ResultGroup) {
           message.error(error instanceof Error ? error.message : t('results.removeFilesFailed'))
           return
         }
-        if (!await finishRemove()) return
+        if (!await finishRemove()) return false
         message.warning(t('results.removeFilesAllFailedListOnly'))
       }
     },
@@ -368,7 +385,8 @@ function handleRemoveSelected() {
   if (!ids.length) return
   const groups = resultGroups.value.filter((group) => ids.includes(group.id))
   const taskIds = groups.flatMap(groupTaskIds)
-  const items = groups.flatMap(group => group.items)
+  const items = removalItems(taskIds)
+  if (!items?.length) return
   const deleteFiles = ref(false)
   dialog.warning({
     title: t('results.removeSelectedTitle'),
@@ -385,9 +403,8 @@ function handleRemoveSelected() {
     positiveButtonProps: { type: 'error' },
     onPositiveClick: async () => {
       const finishRemove = async (silent = false) => {
-        if (!await cleanupLinkedEditorProjects(items)) return false
-        const removed = task.removeResults(taskIds)
-        if (!silent && removed > 0) {
+        if (!await removeResultRecords(items)) return false
+        if (!silent) {
           message.success(t('results.removeSelectedSuccess', { count: ids.length }))
         }
         selectedResultIds.value = []
@@ -396,23 +413,24 @@ function handleRemoveSelected() {
       }
 
       if (!deleteFiles.value) {
-        await finishRemove()
-        return
+        return await finishRemove() ? undefined : false
       }
       if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
-        if (!await finishRemove(true)) return
-        message.warning(t('results.removeNoFilesMultiple'))
+        if (!await finishRemove(true)) return false
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesMultiple'))
         return
       }
 
       try {
         const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
-          if (!await finishRemove(true)) return
-          message.success(t('results.removeFilesSuccessMultiple'))
+          if (!await finishRemove(true)) return false
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessMultiple'))
           return
         }
 
@@ -421,11 +439,11 @@ function handleRemoveSelected() {
           message.warning(t('results.removeFilesKeptMultiple'))
           return
         }
-        if (!await finishRemove(true)) return
+        if (!await finishRemove(true)) return false
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'multiple')
@@ -433,7 +451,7 @@ function handleRemoveSelected() {
           message.error(error instanceof Error ? error.message : t('results.removeFilesFailed'))
           return
         }
-        if (!await finishRemove(true)) return
+        if (!await finishRemove(true)) return false
         message.warning(t('results.removeFilesAllFailedListOnly'))
       }
     },
@@ -443,7 +461,8 @@ function handleRemoveSelected() {
 function handleClearResults() {
   const groups = [...resultGroups.value]
   if (!groups.length) return
-  const items = groups.flatMap(group => group.items)
+  const items = removalItems(groups.flatMap(groupTaskIds))
+  if (!items?.length) return
   const deleteFiles = ref(false)
   dialog.warning({
     title: t('results.clearTitle'),
@@ -459,11 +478,9 @@ function handleClearResults() {
     negativeText: t('common.cancel'),
     positiveButtonProps: { type: 'error' },
     onPositiveClick: async () => {
-      const itemIds = items.map((item) => item.id)
       const finishClear = async (silent = false) => {
-        if (!await cleanupLinkedEditorProjects(items)) return false
-        const removed = task.clearResults(itemIds)
-        if (!silent && removed > 0) {
+        if (!await removeResultRecords(items)) return false
+        if (!silent) {
           message.success(t('results.clearSuccess', { count: groups.length }))
         }
         selectedResultIds.value = []
@@ -472,23 +489,24 @@ function handleClearResults() {
       }
 
       if (!deleteFiles.value) {
-        await finishClear()
-        return
+        return await finishClear() ? undefined : false
       }
       if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
-        if (!await finishClear(true)) return
-        message.warning(t('results.removeNoFilesMultiple'))
+        if (!await finishClear(true)) return false
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesMultiple'))
         return
       }
 
       try {
         const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
-          if (!await finishClear(true)) return
-          message.success(t('results.removeFilesSuccessMultiple'))
+          if (!await finishClear(true)) return false
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessMultiple'))
           return
         }
 
@@ -497,11 +515,11 @@ function handleClearResults() {
           message.warning(t('results.removeFilesKeptMultiple'))
           return
         }
-        if (!await finishClear(true)) return
+        if (!await finishClear(true)) return false
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'multiple')
@@ -509,7 +527,7 @@ function handleClearResults() {
           message.error(error instanceof Error ? error.message : t('results.removeFilesFailed'))
           return
         }
-        if (!await finishClear(true)) return
+        if (!await finishClear(true)) return false
         message.warning(t('results.removeFilesAllFailedListOnly'))
       }
     },
@@ -767,6 +785,7 @@ function formatDurationMs(value: number | undefined) {
         <template #prefix><n-icon :component="SearchOutline" /></template>
       </n-input>
 
+      <n-select v-model:value="typeFilter" class="results-toolbar__type" size="small" :options="typeOptions" :aria-label="t('results.typeFilter')" />
       <n-select
         v-model:value="sortBy"
         class="results-toolbar__sort"
@@ -779,13 +798,13 @@ function formatDurationMs(value: number | undefined) {
       <span class="results-toolbar__count">{{ filteredResults.length }} / {{ resultGroups.length }}</span>
     </div>
 
-    <div v-if="!task.resultTasks.length" class="results-empty">
+    <div v-if="!task.resultTasks.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="FolderOutline" size="46" />
       <strong>{{ t('results.empty') }}</strong>
       <span>{{ t('results.emptyHint') }}</span>
     </div>
 
-    <div v-else-if="!filteredResults.length" class="results-empty">
+    <div v-else-if="!filteredResults.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="SearchOutline" size="42" />
       <strong>{{ t('results.noMatchTitle') }}</strong>
       <span>{{ t('results.noMatchHint') }}</span>
@@ -796,7 +815,7 @@ function formatDurationMs(value: number | undefined) {
         v-for="item in pagedResults"
         :id="resultCardId(item)"
         :key="item.id"
-        class="result-row"
+        class="result-row" data-guide="result-item"
         :class="{ 'result-row--selected': selectedResultSet.has(item.id) }"
       >
         <button
@@ -825,6 +844,7 @@ function formatDurationMs(value: number | undefined) {
           <span class="result-row__body">
             <strong data-result-text>{{ getGroupTitle(item) }}</strong>
             <span class="result-row__meta">
+              <span data-result-text class="result-row__type">{{ t(RESULT_TYPE_KEYS[item.resultType]) }}</span>
               <span data-result-text class="result-row__model" :title="groupTaskIdTitle(item)">{{ item.model }}</span>
               <span data-result-text>{{ item.inputCount }} {{ t('results.inputUnit') }}</span>
               <span data-result-text>{{ item.outputCount }} {{ t('results.stemUnit') }}</span>
@@ -843,7 +863,7 @@ function formatDurationMs(value: number | undefined) {
           </span>
         </button>
 
-        <div v-if="!selecting" class="result-row__actions">
+        <div v-if="!selecting" class="result-row__actions" data-guide="result-actions">
           <n-button v-if="item.inputCount === 1" size="small" type="primary" @click.stop="openInEditor(item.primary)">
             <template #icon><n-icon :component="ColorWandOutline" /></template>
             {{ t('results.openInEditor') }}
@@ -969,7 +989,7 @@ function formatDurationMs(value: number | undefined) {
 
 .results-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 210px auto;
+  grid-template-columns: minmax(0, 1fr) 160px 190px auto;
   align-items: center;
   gap: 10px;
   padding: 10px;
@@ -1022,6 +1042,8 @@ function formatDurationMs(value: number | undefined) {
     linear-gradient(180deg, color-mix(in srgb, var(--primary-soft) 10%, transparent), transparent 58%),
     color-mix(in srgb, var(--surface-1) 74%, transparent);
 }
+
+.result-row__type { padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--primary-soft) 50%, transparent); color: var(--primary-strong); font-size: 10px; white-space: nowrap; }
 
 .result-row--selected:hover {
   border-color: color-mix(in srgb, var(--primary-border) 88%, transparent);

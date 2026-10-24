@@ -1,22 +1,41 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod commands;
+mod automatic_report;
+mod diagnostic_context;
+mod diagnostic_report;
 mod error;
+mod log_record;
 mod model_dir_migration;
 mod plugin_views;
+#[cfg(any(target_os = "macos", test))]
+mod macos_update;
+#[cfg(any(target_os = "linux", test))]
+mod linux_update;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_startup;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_stream;
 mod python;
+mod rba;
 mod session_log;
 mod single_instance;
 mod state;
 mod storage;
 mod terminal;
 mod update_manager;
+mod update_sources;
+mod workflow_editors;
 
 use state::AppState;
 use tauri::{Emitter, Manager};
 
 
 fn main() {
+    terminal::attach_parent();
+    if session_log::configure_startup_logging(std::env::args_os().skip(1)) {
+        session_log::early("DEBUG", "app.debug", "Verbose logging enabled by --debug");
+    }
     if let Some(code) = update_manager::run_helper_from_args() {
         std::process::exit(code);
     }
@@ -33,11 +52,10 @@ fn main() {
             // A mutex failure is rare (for example, a restricted user
             // session). Keep the application usable, while making the loss
             // of single-instance enforcement visible in diagnostics.
-            eprintln!("Unable to create the single-instance mutex: {error}");
+            crate::session_log::early("WARN", "app.diagnostic", &format!("Unable to create the single-instance mutex: {error}"));
             None
         }
     };
-    terminal::attach_parent();
 
     let builder = tauri::Builder::default()
         .register_uri_scheme_protocol("pymss-plugin", |ctx, request| {
@@ -56,6 +74,7 @@ fn main() {
                 && (window.label().starts_with("workflow-node-editor")
                     || window.label().starts_with("workflow-simple-editor"))
             {
+                workflow_editors::release_window(window.app_handle(), window.label());
                 let event = if window.label().starts_with("workflow-simple-editor") {
                     "pymss://workflow-simple-editor-closed"
                 } else {
@@ -68,7 +87,8 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .manage(AppState::new());
+        .manage(AppState::new())
+        .manage(workflow_editors::WorkflowEditors::default());
 
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -76,10 +96,12 @@ fn main() {
     builder
         .setup(|app| {
             let _ = session_log::init_session_log(app.handle());
+            python::worker::recover_audio_output_temps(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_cmd::cancel_task,
+            commands::app_cmd::write_frontend_log,
             commands::app_cmd::close_current_window,
             commands::app_cmd::minimize_current_window,
             commands::app_cmd::toggle_maximize_current_window,
@@ -99,8 +121,11 @@ fn main() {
             commands::app_cmd::editor_project_exists,
             commands::app_cmd::export_editor_mix,
             commands::app_cmd::start_editor_mix_export,
+            commands::app_cmd::append_editor_export_render_chunk,
+            commands::app_cmd::cleanup_editor_export_render,
             commands::app_cmd::cancel_editor_mix_export,
             commands::app_cmd::start_audio_tool,
+            commands::tempo_key::start_tempo_key_analysis,
             commands::app_cmd::start_operation_task,
             commands::app_cmd::list_operations,
             commands::app_cmd::list_nodes,
@@ -131,9 +156,13 @@ fn main() {
             commands::app_cmd::debug_log_clear,
             commands::app_cmd::debug_log_create_report,
             commands::app_cmd::debug_log_info,
+            commands::app_cmd::debug_editor_playback,
+            commands::app_cmd::editor_preview_chunk,
             commands::app_cmd::debug_log_read,
             commands::app_cmd::check_managed_update,
             commands::app_cmd::start_managed_update,
+            commands::app_cmd::confirm_managed_update_startup,
+            commands::app_cmd::get_managed_update_state,
             commands::app_cmd::debug_runtime_override_active,
             commands::app_cmd::debug_runtime_pointers,
             commands::app_cmd::debug_runtime_restore_file,
@@ -146,6 +175,7 @@ fn main() {
             commands::app_cmd::pick_model_weights_file,
             commands::app_cmd::pick_model_config_file,
             commands::app_cmd::load_app_store,
+            commands::app_cmd::get_workflow_editors,
             commands::app_cmd::mutate_workflow_store,
             commands::app_cmd::load_editor_project,
             commands::app_cmd::relink_editor_sources,
@@ -192,6 +222,11 @@ fn main() {
             commands::app_cmd::delete_runtime,
             commands::app_cmd::worker_health,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Pymss Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building Pymss Studio")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                session_log::finish_automatic_reports(app);
+            }
+        });
 }

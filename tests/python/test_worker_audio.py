@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import builtins
+import math
+import shutil
+import subprocess
+import sys
 import unittest
 import tempfile
 from pathlib import Path
@@ -13,10 +18,66 @@ if __package__:
 else:
     import _bootstrap as _worker_test_bootstrap
 
-from worker_audio import _DiskMixBuffer, _apply_track_effects, cmd_export_editor_mix
+from worker_audio import _DiskMixBuffer, _apply_track_effects, _read_audio, _resample_audio, cmd_export_editor_mix
 
 
 class EditorEffectTests(unittest.TestCase):
+    def test_pcm_read_preserves_stereo_samples_without_loading_librosa(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            source = Path(temp_value) / 'stereo.wav'
+            samples = np.array([[0.1, -0.3], [0.5, -0.2], [-0.4, 0.7]], dtype=np.float32)
+            sf.write(source, samples, 44100, subtype='FLOAT')
+            original_import = builtins.__import__
+
+            def guard_import(name, *args, **kwargs):
+                if name.split('.')[0] in {'librosa', 'numba'}:
+                    raise AssertionError('PCM audio must not initialize librosa or Numba')
+                return original_import(name, *args, **kwargs)
+
+            with mock.patch('builtins.__import__', side_effect=guard_import):
+                audio, rate = _read_audio(source)
+            self.assertEqual(rate, 44100)
+            self.assertEqual(audio.dtype, np.float32)
+            np.testing.assert_array_equal(audio, samples.T)
+
+    def test_pcm_read_resamples_mono_without_loading_librosa(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            source = Path(temp_value) / 'mono.wav'
+            samples = (np.sin(np.arange(4001) * 2 * np.pi * 440 / 40000) * .4).astype(np.float32)
+            sf.write(source, samples, 40000, subtype='FLOAT')
+            original_import = builtins.__import__
+
+            def guard_import(name, *args, **kwargs):
+                if name.split('.')[0] in {'librosa', 'numba'}:
+                    raise AssertionError('PCM resampling must not initialize librosa or Numba')
+                return original_import(name, *args, **kwargs)
+
+            with mock.patch('builtins.__import__', side_effect=guard_import):
+                audio, rate = _read_audio(source, 44100)
+            self.assertEqual(rate, 44100)
+            self.assertEqual(audio.shape, (1, math.ceil(len(samples) * 44100 / 40000)))
+            self.assertEqual(audio.dtype, np.float32)
+            self.assertTrue(np.isfinite(audio).all())
+            self.assertLessEqual(float(np.max(np.abs(audio))), .41)
+
+    def test_resampling_preserves_stereo_polarity_and_rounded_duration(self) -> None:
+        signal = (np.sin(np.arange(4001) * 2 * np.pi * 440 / 40000) * .4).astype(np.float32)
+        audio = np.stack([signal, -signal])
+        rendered = _resample_audio(audio, 40000, 44100)
+        self.assertEqual(rendered.shape, (2, math.ceil(len(signal) * 44100 / 40000)))
+        np.testing.assert_allclose(rendered[0], -rendered[1], atol=1e-6)
+
+    def test_read_keeps_decoder_fallback_for_unsupported_formats(self) -> None:
+        decoder = mock.Mock()
+        samples = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+        decoder.load.return_value = (samples, 22050)
+        with mock.patch('soundfile.read', side_effect=RuntimeError('Unsupported format')), \
+                mock.patch.dict(sys.modules, {'librosa': decoder}):
+            audio, rate = _read_audio(Path('source.m4a'), 22050)
+        decoder.load.assert_called_once_with('source.m4a', sr=22050, mono=False)
+        self.assertEqual(rate, 22050)
+        np.testing.assert_array_equal(audio, samples.reshape(1, -1))
+
     def _export_payload(self, root: Path, source: Path, *, name: str = "effects") -> dict:
         return {
             "project": {
@@ -211,6 +272,27 @@ class EditorEffectTests(unittest.TestCase):
             _rendered, sample_rate = sf.read(root / "output" / "rates_44100.flac")
             self.assertEqual(sample_rate, 44100)
 
+    def test_pre_rendered_float_audio_preserves_samples_and_original_auto_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / 'rendered.wav'
+            signal = np.sin(np.arange(9600) * 2 * np.pi * 440 / 48000).astype(np.float32) * .1
+            samples = np.stack([signal, -signal], axis=1)
+            sf.write(source, samples, 48000, subtype='FLOAT')
+            payload = self._export_payload(root, source, name='native')
+            payload['project']['assets'][0].update(sampleRate=48000, channels=2)
+            payload['project']['tracks'][0]['effects'] = {}
+            payload['audioParams'] = {'wavBitDepth': 'FLOAT', 'peakProtection': False}
+            with mock.patch('worker_audio.emit'):
+                self.assertEqual(cmd_export_editor_mix(payload), 0)
+            actual, rate = sf.read(root / 'output/native_mix.wav', dtype='float32', always_2d=True)
+            self.assertEqual(rate, 48000)
+            np.testing.assert_array_equal(actual, samples)
+            payload['project']['sourceSampleRate'] = 44100
+            with mock.patch('worker_audio.emit'):
+                self.assertEqual(cmd_export_editor_mix(payload), 0)
+            self.assertEqual(sf.info(root / 'output/native_mix_2.wav').samplerate, 44100)
+
     def test_peak_protection_is_optional_and_reports_its_adjustment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value)
@@ -239,14 +321,146 @@ class EditorEffectTests(unittest.TestCase):
             self.assertLess(protected_events[-1]["peakAdjustmentDb"], 0)
             self.assertFalse(raw_events[-1]["peakProtectionApplied"])
 
+            payload['fileName'] = 'peak_default.wav'
+            payload['audioParams'].pop('peakProtection')
+            with mock.patch('worker_audio.emit'):
+                self.assertEqual(cmd_export_editor_mix(payload), 0)
+            unchanged, _ = sf.read(root / 'output/peak_default.wav')
+            np.testing.assert_array_equal(unchanged, raw)
+
             payload["fileName"] = "peak_pcm.wav"
             payload["audioParams"] = {"wavBitDepth": "PCM_24", "peakProtection": False}
             pcm_events: list[dict] = []
+            with mock.patch('worker_audio.emit'), mock.patch('worker_audio.emit_error', return_value=1) as error:
+                self.assertEqual(cmd_export_editor_mix(payload), 1)
+            self.assertEqual(error.call_args.args[0], 'EDITOR_EXPORT_PEAK_EXCEEDED')
+            self.assertFalse((root / 'output/peak_pcm.wav').exists())
+            payload['audioParams']['peakProtection'] = True
             with mock.patch("worker_audio.emit", side_effect=lambda kind, value, **_kwargs: pcm_events.append(value) if kind == "editor_mix_exported" else None):
                 self.assertEqual(cmd_export_editor_mix(payload), 0)
             pcm, _sample_rate = sf.read(root / "output" / "peak_pcm.wav")
             self.assertLessEqual(float(np.max(np.abs(pcm))), 0.981)
             self.assertTrue(pcm_events[-1]["peakProtectionApplied"])
+
+    def test_export_mix_uses_only_audible_tracks_and_preserves_their_set_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            voice, background = root / 'voice.wav', root / 'background.wav'
+            sf.write(voice, np.tile([.2, .4], (200, 1)), 1000, subtype='FLOAT')
+            sf.write(background, np.full(200, .1, dtype=np.float32), 1000, subtype='FLOAT')
+            payload = self._export_payload(root, voice, name='audible')
+            payload['audioParams'] = {'wavBitDepth': 'FLOAT'}
+            project = payload['project']
+            project['masterVolume'], project['masterPan'] = 1.25, -.2
+            project['assets'][0]['channels'] = 2
+            project['tracks'][0]['effects'] = {}
+            project['assets'].append({'id': 'bg', 'path': str(background), 'duration': .2, 'sampleRate': 1000, 'channels': 1})
+            project['assets'].append({'id': 'original', 'path': str(root / 'missing-original.wav'), 'duration': .2, 'sampleRate': 1000, 'channels': 1})
+            project['tracks'].append({'id': 'bg', 'sourceId': 'bg', 'volume': 1, 'pan': 0, 'muted': False, 'solo': False})
+            project['tracks'].append({'id': 'original', 'sourceId': 'original', 'volume': 1, 'muted': True, 'solo': False})
+            with mock.patch('worker_audio.emit'):
+                self.assertEqual(cmd_export_editor_mix(payload), 0)
+            rendered, _ = sf.read(root / 'output/audible_mix.wav', dtype='float32', always_2d=True)
+            np.testing.assert_allclose(rendered, np.tile([.375, .5], (200, 1)), atol=1e-7)
+
+            project['tracks'][0]['solo'] = True
+            payload['fileName'] = 'solo.wav'
+            with mock.patch('worker_audio.emit'):
+                self.assertEqual(cmd_export_editor_mix(payload), 0)
+            rendered, _ = sf.read(root / 'output/solo.wav', dtype='float32', always_2d=True)
+            np.testing.assert_allclose(rendered, np.tile([.25, .4], (200, 1)), atol=1e-7)
+
+            project['tracks'][0]['solo'] = False
+            project['tracks'][2]['solo'] = True
+            with mock.patch('worker_audio.emit'), mock.patch('worker_audio.emit_error', return_value=1):
+                self.assertEqual(cmd_export_editor_mix(payload), 1)
+
+    def test_inaudible_multichannel_tracks_do_not_change_export_channels_or_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "mono.wav"
+            sf.write(source, np.full(200, .1, dtype=np.float32), 1000, subtype="FLOAT")
+            payload = self._export_payload(root, source, name="mono")
+            payload["audioParams"] = {"wavBitDepth": "FLOAT"}
+            project = payload["project"]
+            project["tracks"][0]["effects"] = {}
+            # An offline excluded source must never be decoded, even when its
+            # metadata advertises more channels and a higher sample rate.
+            project["assets"].append({"id": "surround", "path": str(root / "offline.wav"),
+                                      "sampleRate": 96000, "channels": 6, "duration": 1})
+            for index, state in enumerate(({"muted": True}, {"volume": 0}, {"solo": False})):
+                with self.subTest(state=state):
+                    project["tracks"][0]["solo"] = index == 2
+                    project["tracks"] = project["tracks"][:1] + [{
+                        "id": "excluded", "sourceId": "surround", "volume": 1,
+                        "muted": False, "solo": False, **state,
+                    }]
+                    payload["fileName"] = f"excluded_{index}"
+                    with mock.patch("worker_audio.emit"):
+                        self.assertEqual(cmd_export_editor_mix(payload), 0)
+                    actual, rate = sf.read(root / "output" / f"excluded_{index}.wav", dtype="float32", always_2d=True)
+                    self.assertEqual(rate, 1000)
+                    self.assertEqual(actual.shape, (200, 1))
+                    np.testing.assert_array_equal(actual[:, 0], np.full(200, .1, dtype=np.float32))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for preview downmix parity")
+    def test_multichannel_export_matches_preview_downmix_and_pan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "surround.wav"
+            samples = np.zeros((9600, 6), dtype=np.float32)
+            time = np.arange(len(samples)) / 48000
+            # Center and surround content must remain audible after the stereo downmix.
+            samples[:, 2] = .1 * np.sin(2 * np.pi * 440 * time)
+            samples[:, 4] = .05 * np.sin(2 * np.pi * 880 * time)
+            samples[:, 5] = .03 * np.sin(2 * np.pi * 660 * time)
+            sf.write(source, samples, 48000, subtype="FLOAT")
+            reference = subprocess.run([
+                shutil.which("ffmpeg"), "-nostdin", "-v", "error", "-threads", "1",
+                "-i", str(source), "-map", "0:a:0", "-vn", "-ar", "48000", "-ac", "2",
+                "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+            ], check=True, capture_output=True)
+            expected = np.frombuffer(reference.stdout, dtype="<f4").reshape(-1, 2)
+            self.assertGreater(float(np.max(np.abs(expected))), .01)
+            for pan in (0, -1, 1):
+                with self.subTest(pan=pan):
+                    payload = self._export_payload(root, source)
+                    payload["project"]["assets"][0].update(sampleRate=48000, channels=6)
+                    payload["project"]["tracks"][0].update(effects={}, pan=pan)
+                    payload["audioParams"] = {"wavBitDepth": "FLOAT"}
+                    payload["fileName"] = f"surround_{pan}"
+                    events = []
+                    with mock.patch("worker_audio.emit", side_effect=lambda kind, value, **_: events.append(value) if kind == "editor_mix_exported" else None):
+                        self.assertEqual(cmd_export_editor_mix(payload), 0)
+                    actual, rate = sf.read(root / "output" / f"surround_{pan}.wav", dtype="float32", always_2d=True)
+                    self.assertEqual(rate, 48000)
+                    self.assertEqual(actual.shape, expected.shape)
+                    gains = [1 if pan <= 0 else 1 - pan, 1 if pan >= 0 else 1 + pan]
+                    np.testing.assert_allclose(actual, expected * gains, atol=1e-7)
+                    self.assertEqual(events[-1]["channels"], 2)
+
+    def test_multichannel_decode_failure_never_falls_back_to_surround_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            source = root / "surround.wav"
+            sf.write(source, np.zeros((100, 6), dtype=np.float32), 48000, subtype="FLOAT")
+            for executable, status, data, message in (
+                (None, 0, b"", "FFmpeg is required"),
+                ("ffmpeg", 1, b"", "decoder failed"),
+                ("ffmpeg", 0, b"bad", "invalid stereo PCM"),
+            ):
+                with self.subTest(message=message):
+                    payload = self._export_payload(root, source)
+                    payload["project"]["assets"][0].update(sampleRate=48000, channels=6)
+                    payload["project"]["tracks"][0]["effects"] = {}
+                    result = subprocess.CompletedProcess([], status, data, b"decoder failed")
+                    with mock.patch("worker_audio.shutil.which", return_value=executable), \
+                            mock.patch("worker_audio.subprocess.run", return_value=result), \
+                            mock.patch("worker_audio.emit"), \
+                            mock.patch("worker_audio.emit_error", return_value=1) as error:
+                        self.assertEqual(cmd_export_editor_mix(payload), 1)
+                    self.assertIn(message, error.call_args.args[1])
+                    self.assertEqual(list((root / "output").iterdir()), [])
 
     def test_export_fades_match_the_linear_preview_curve(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

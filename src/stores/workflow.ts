@@ -1,7 +1,9 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
+import { isWorkflowEditorSnapshot, workflowEditorFor, WorkflowEditorInUseError, type WorkflowEditorSnapshot, type WorkflowEditorRecord } from '@/utils/workflowEditorState'
 import {
   detectWorkflowFormat,
   normalizeGraphWorkflowDefinition,
@@ -9,6 +11,8 @@ import {
   WORKFLOW_FORMAT_VERSION,
   type WorkflowFormat,
 } from '@/workflows/formats'
+
+const studioLog = createLogger('ui.stores.workflow')
 
 export type WorkflowEntry = {
   id: string
@@ -67,6 +71,7 @@ type WorkflowStoreMutation = {
 
 type WorkflowMutationResponse = {
   state: StoredWorkflowState
+  editorSnapshot?: WorkflowEditorSnapshot
   conflict?: {
     workflowId: string
     expectedUpdatedAt: number
@@ -116,6 +121,33 @@ export const useWorkflowStore = defineStore('workflow', () => {
   const selectedWorkflowId = ref('')
   const nodeEditorOpenWorkflowId = ref('')
   const simpleEditorOpenWorkflowId = ref('')
+  const editorSnapshot = ref<WorkflowEditorSnapshot | null>(null)
+  const openedEditors = computed<WorkflowEditorRecord[]>(() => editorSnapshot.value?.editors || [
+    ...(nodeEditorOpenWorkflowId.value ? [{ label: `workflow-node-editor-${nodeEditorOpenWorkflowId.value}`, workflowId: nodeEditorOpenWorkflowId.value === '__new__' ? '' : nodeEditorOpenWorkflowId.value, kind: 'advanced' as const }] : []),
+    ...(simpleEditorOpenWorkflowId.value ? [{ label: `workflow-simple-editor-${simpleEditorOpenWorkflowId.value}`, workflowId: simpleEditorOpenWorkflowId.value === '__new__' ? '' : simpleEditorOpenWorkflowId.value, kind: 'simple' as const }] : []),
+  ])
+  const hasAnyEditorOpen = computed(() => openedEditors.value.length > 0)
+
+  function applyEditorSnapshot(value: unknown) {
+    if (!isWorkflowEditorSnapshot(value) || (editorSnapshot.value && value.revision <= editorSnapshot.value.revision)) return false
+    editorSnapshot.value = { revision: value.revision, editors: value.editors.map(editor => ({ ...editor })) }
+    nodeEditorOpenWorkflowId.value = value.editors.filter(editor => editor.kind === 'advanced').at(-1)?.workflowId || (value.editors.some(editor => editor.kind === 'advanced') ? '__new__' : '')
+    simpleEditorOpenWorkflowId.value = value.editors.filter(editor => editor.kind === 'simple').at(-1)?.workflowId || (value.editors.some(editor => editor.kind === 'simple') ? '__new__' : '')
+    return true
+  }
+
+  async function refreshEditorWindows() {
+    if (isTauriRuntime()) applyEditorSnapshot(await invoke('get_workflow_editors'))
+  }
+
+  function recordEditorOpened(result: unknown, kind: 'simple' | 'advanced', workflowId: string) {
+    const snapshot = (result as { editorSnapshot?: unknown } | null)?.editorSnapshot
+    if (isWorkflowEditorSnapshot(snapshot)) { applyEditorSnapshot(snapshot); return }
+    if (kind === 'simple') markSimpleEditorOpen(workflowId)
+    else markNodeEditorOpen(workflowId)
+  }
+
+  function editorFor(workflowId: string) { return workflowEditorFor(openedEditors.value, workflowId) }
   const initialized = ref(false)
   const isSaving = ref(false)
   const selectedWorkflow = computed(() => workflows.value.find(item => item.id === selectedWorkflowId.value) || null)
@@ -187,7 +219,14 @@ export const useWorkflowStore = defineStore('workflow', () => {
 
   async function mutateStoredState(mutation: WorkflowStoreMutation): Promise<WorkflowMutationResponse> {
     if (isTauriRuntime()) {
-      return invoke<WorkflowMutationResponse>('mutate_workflow_store', { payload: mutation })
+      try {
+        const response = await invoke<WorkflowMutationResponse>('mutate_workflow_store', { payload: mutation })
+        if (response.editorSnapshot) applyEditorSnapshot(response.editorSnapshot)
+        return response
+      } catch (error) {
+        if (String(error).includes('WORKFLOW_EDITOR_IN_USE')) throw new WorkflowEditorInUseError()
+        throw error
+      }
     }
 
     const current = await readStoredState(true)
@@ -328,14 +367,17 @@ export const useWorkflowStore = defineStore('workflow', () => {
     }
   }
 
-  function handleEditorClosed(kind: 'advanced' | 'simple') {
-    if (kind === 'advanced') markNodeEditorClosed()
-    else markSimpleEditorClosed()
+  function handleEditorClosed(kind: 'advanced' | 'simple', _label?: string) {
+    const registryRefresh = editorSnapshot.value ? refreshEditorWindows() : Promise.resolve()
+    if (!editorSnapshot.value) {
+      if (kind === 'advanced') markNodeEditorClosed()
+      else markSimpleEditorClosed()
+    }
     editorCloseRefreshGeneration += 1
     if (!editorCloseRefreshPromise) {
       editorCloseRefreshPromise = refreshAfterEditorClosed()
     }
-    return editorCloseRefreshPromise
+    return editorSnapshot.value ? Promise.all([registryRefresh, editorCloseRefreshPromise]).then(([, selected]) => selected) : editorCloseRefreshPromise
   }
 
   async function saveWorkflow(input: SaveWorkflowInput) {
@@ -444,7 +486,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
         )
       }
     }).catch((error) => {
-      console.warn('Failed to persist workflow selection:', error)
+      studioLog.warn('Failed to persist workflow selection:', error)
     })
   }
 
@@ -469,6 +511,12 @@ export const useWorkflowStore = defineStore('workflow', () => {
     selectedWorkflowId,
     nodeEditorOpenWorkflowId,
     simpleEditorOpenWorkflowId,
+    openedEditors,
+    hasAnyEditorOpen,
+    applyEditorSnapshot,
+    refreshEditorWindows,
+    recordEditorOpened,
+    editorFor,
     selectedWorkflow,
     initialized,
     isSaving,

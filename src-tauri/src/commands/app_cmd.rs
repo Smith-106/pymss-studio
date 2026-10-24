@@ -5,13 +5,14 @@ use crate::model_dir_migration::{
     StartModelDirMigrationRequest,
 };
 use crate::python::worker::{
-    cleanup_editor_export_temp_files, editor_export_task_token, run_worker_once,
-    run_worker_with_payload, spawn_worker_background,
+    bundled_bin_dirs, cleanup_editor_export_temp_files, editor_export_task_token, run_worker_once,
+    run_worker_with_payload, spawn_worker_background, kill_process_tree,
 };
 use crate::session_log::{self, DebugLogContent, DebugLogInfo, DebugLogReport};
 use crate::state::{AppState, ProxySettings};
 use crate::storage;
 use crate::update_manager;
+use crate::workflow_editors::{self, RegistrySnapshot, WorkflowEditorKind, WorkflowEditors};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,24 +93,6 @@ struct DebugRuntimeBackup {
 
 const DEBUG_RUNTIME_MAX_FILE_BYTES: usize = 256 * 1024;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .creation_flags(0x08000000)
-        .status();
-}
-
-#[cfg(not(windows))]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("pkill")
-        .args(["-TERM", "-P", &pid.to_string()])
-        .status();
-}
-
 #[tauri::command]
 pub fn get_build_info() -> BuildInfo {
     BuildInfo {
@@ -136,8 +119,9 @@ pub async fn check_managed_update(
     app: AppHandle,
     channel: update_manager::UpdateChannel,
     endpoint_override: Option<String>,
+    source: Option<update_manager::UpdateSource>,
 ) -> AppResult<Option<update_manager::ManagedUpdateInfo>> {
-    update_manager::check(&app, channel, endpoint_override).await
+    update_manager::check(&app, channel, endpoint_override, source.unwrap_or_default()).await
 }
 
 #[tauri::command]
@@ -146,8 +130,29 @@ pub async fn start_managed_update(
     channel: update_manager::UpdateChannel,
     endpoint_override: Option<String>,
     expected_version: String,
+    source: Option<update_manager::UpdateSource>,
 ) -> AppResult<()> {
-    update_manager::start(&app, channel, endpoint_override, expected_version).await
+    update_manager::start(&app, channel, endpoint_override, expected_version, source.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub fn get_managed_update_state() -> Value {
+    serde_json::json!({ "restartRequired": update_manager::restart_required() })
+}
+
+#[tauri::command]
+pub fn confirm_managed_update_startup(window: tauri::WebviewWindow) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    if window.label() == "main" {
+        crate::macos_update::confirm_startup(window.app_handle())?;
+    }
+    #[cfg(target_os = "linux")]
+    if window.label() == "main" {
+        crate::linux_update::confirm_startup(window.app_handle())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = window;
+    Ok(())
 }
 
 #[tauri::command]
@@ -156,9 +161,27 @@ pub async fn worker_health(app: AppHandle) -> AppResult<Value> {
 }
 
 #[tauri::command]
+pub async fn debug_editor_playback(app: AppHandle, snapshot: Value) -> AppResult<()> {
+    if session_log::developer_mode_enabled() {
+        session_log::append(&app, "DEBUG", "editor.playback", vec![("snapshot", snapshot.to_string())]);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn debug_log_info(app: AppHandle) -> AppResult<DebugLogInfo> {
     require_runtime_debug_developer_mode(&app)?;
     session_log::info(&app)
+}
+
+#[tauri::command]
+pub fn write_frontend_log(app: AppHandle, window: tauri::WebviewWindow, record: Value) -> AppResult<()> {
+    let mut record = crate::log_record::LogRecord::from_payload(&record)
+        .ok_or_else(|| AppError::Worker("Invalid frontend log record".into()))?;
+    record.source = "studio".into();
+    record.context.insert("windowLabel".into(), Value::String(window.label().into()));
+    session_log::append_record(&app, record);
+    Ok(())
 }
 
 #[tauri::command]
@@ -517,8 +540,8 @@ pub async fn runtime_env_sizes(app: AppHandle) -> AppResult<Value> {
 }
 
 #[tauri::command]
-pub async fn runtime_core_versions(app: AppHandle) -> AppResult<Value> {
-    run_worker_with_payload(&app, "runtime_core_versions", None)
+pub async fn runtime_core_versions(app: AppHandle, payload: Option<Value>) -> AppResult<Value> {
+    run_worker_with_payload(&app, "runtime_core_versions", payload)
 }
 
 #[tauri::command]
@@ -572,12 +595,21 @@ pub async fn manage_optional_runtime_package(
     Ok(serde_json::json!({ "taskId": task_id, "started": true }))
 }
 
+fn require_windows_runtime_management() -> AppResult<()> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err(AppError::Worker("runtime management is only available on Windows".into()))
+    }
+}
+
 #[tauri::command]
 pub async fn start_runtime_install(
     app: AppHandle,
     state: State<'_, AppState>,
     payload: Value,
 ) -> AppResult<Value> {
+    require_windows_runtime_management()?;
     if let Ok(tasks) = state.tasks.lock() {
         if tasks.keys().any(|id| id.starts_with("runtime_install_")) {
             return Err(AppError::Worker("runtime installation is already running".into()));
@@ -622,11 +654,13 @@ pub async fn cancel_runtime_core_update(
 
 #[tauri::command]
 pub async fn activate_runtime(app: AppHandle, payload: Value) -> AppResult<Value> {
+    require_windows_runtime_management()?;
     run_worker_with_payload(&app, "activate_runtime", Some(payload))
 }
 
 #[tauri::command]
 pub async fn delete_runtime(app: AppHandle, payload: Value) -> AppResult<Value> {
+    require_windows_runtime_management()?;
     run_worker_with_payload(&app, "delete_runtime", Some(payload))
 }
 
@@ -756,6 +790,7 @@ pub async fn debug_runtime_pointers(app: AppHandle) -> AppResult<DebugRuntimePoi
 
 #[tauri::command]
 pub async fn debug_runtime_write_file(app: AppHandle, payload: DebugRuntimeWriteRequest) -> AppResult<DebugRuntimePointersPayload> {
+    require_windows_runtime_management()?;
     require_runtime_debug_developer_mode(&app)?;
     if payload.content.len() > DEBUG_RUNTIME_MAX_FILE_BYTES {
         return Err(AppError::Worker("runtime debug file is too large".into()));
@@ -773,6 +808,7 @@ pub async fn debug_runtime_write_file(app: AppHandle, payload: DebugRuntimeWrite
 
 #[tauri::command]
 pub async fn debug_runtime_restore_file(app: AppHandle, payload: DebugRuntimeRestoreRequest) -> AppResult<DebugRuntimePointersPayload> {
+    require_windows_runtime_management()?;
     require_runtime_debug_developer_mode(&app)?;
     let (path, _kind, _source) = resolve_debug_runtime_path(&app, &payload.path)?;
     let backup_path = debug_runtime_backup_path(&path)?;
@@ -824,6 +860,7 @@ fn validate_debug_runtime_override(backend: &str, python_path: &str) -> AppResul
 
 #[tauri::command]
 pub async fn debug_runtime_override_active(app: AppHandle, payload: DebugActiveRuntimeOverrideRequest) -> AppResult<DebugRuntimePointersPayload> {
+    require_windows_runtime_management()?;
     require_runtime_debug_developer_mode(&app)?;
     let (backend, python_path) = validate_debug_runtime_override(&payload.backend, &payload.python_path)?;
     let path = storage::active_runtime_file(&app)?;
@@ -903,6 +940,9 @@ pub async fn load_app_store(app: AppHandle, name: String) -> AppResult<Value> {
 
 #[tauri::command]
 pub async fn save_app_store(app: AppHandle, name: String, data: Value) -> AppResult<()> {
+    if name == "workflow-state" {
+        return Err(AppError::Worker("workflow-state requires mutate_workflow_store".into()));
+    }
     session_log::append(
         &app,
         "DEBUG",
@@ -919,7 +959,12 @@ pub async fn save_app_store(app: AppHandle, name: String, data: Value) -> AppRes
 }
 
 #[tauri::command]
-pub async fn mutate_workflow_store(app: AppHandle, payload: Value) -> AppResult<Value> {
+pub async fn mutate_workflow_store(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    editors: State<'_, WorkflowEditors>,
+    payload: Value,
+) -> AppResult<Value> {
     session_log::append(
         &app,
         "DEBUG",
@@ -933,7 +978,25 @@ pub async fn mutate_workflow_store(app: AppHandle, payload: Value) -> AppResult<
                 .to_string(),
         )],
     );
-    storage::mutate_workflow_store(&app, &payload)
+    // Ownership validation, persistence, and first-save identity adoption are
+    // one operation. Opening a second editor cannot slip between those steps.
+    let (mut response, changed, snapshot) = {
+        let mut registry = editors.registry();
+        let (response, changed) = registry.mutate(window.label(), &payload, || {
+            storage::mutate_workflow_store(&app, &payload)
+        })?;
+        (response, changed, registry.snapshot())
+    };
+    response["editorSnapshot"] = serde_json::to_value(&snapshot)?;
+    if let Some(snapshot) = changed {
+        workflow_editors::emit_snapshot(&app, &snapshot);
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub fn get_workflow_editors(editors: State<'_, WorkflowEditors>) -> RegistrySnapshot {
+    editors.registry().snapshot()
 }
 
 fn value_type(value: &Value) -> &'static str {
@@ -970,8 +1033,19 @@ fn safe_file_name(value: &str) -> String {
     }
 }
 
+fn validate_editor_project_id(project_id: &str) -> AppResult<&str> {
+    if project_id.is_empty()
+        || matches!(project_id, "." | "..")
+        || project_id.ends_with('.')
+        || safe_file_name(project_id) != project_id
+    {
+        return Err(AppError::Worker("invalid editor project id".into()));
+    }
+    Ok(project_id)
+}
+
 fn editor_project_dir(app: &AppHandle, project_id: &str) -> AppResult<PathBuf> {
-    Ok(editor_projects_root(app)?.join(safe_file_name(project_id)))
+    Ok(editor_projects_root(app)?.join(validate_editor_project_id(project_id)?))
 }
 
 fn editor_project_id_for_task_id(task_id: &str) -> String {
@@ -1070,12 +1144,43 @@ pub struct OrphanedEditorProject {
     name: String,
 }
 
-fn remove_editor_project_dirs(root: &Path, project_ids: &[String]) -> EditorProjectCleanupResult {
+fn remove_editor_project_dirs(root: &Path, project_ids: &[String], task_ids: &[String]) -> EditorProjectCleanupResult {
     let mut result = EditorProjectCleanupResult::default();
+    let task_ids: std::collections::HashSet<&str> = task_ids.iter().map(|task_id| task_id.trim()).filter(|task_id| !task_id.is_empty()).collect();
     for project_id in project_ids {
-        let project_dir = root.join(safe_file_name(project_id));
-        if !project_dir.exists() {
-            result.missing_project_ids.push(project_id.clone());
+        if validate_editor_project_id(project_id).is_err() {
+            result.failed_project_ids.push(project_id.clone());
+            continue;
+        }
+        let project_dir = root.join(project_id);
+        let metadata = match std::fs::symlink_metadata(&project_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                result.missing_project_ids.push(project_id.clone());
+                continue;
+            }
+            Err(_) => {
+                result.failed_project_ids.push(project_id.clone());
+                continue;
+            }
+        };
+        if !metadata.is_dir() || is_link_metadata(&metadata) {
+            result.failed_project_ids.push(project_id.clone());
+            continue;
+        }
+        let project_path = project_dir.join("project.json");
+        let project = std::fs::symlink_metadata(&project_path)
+            .ok()
+            .filter(|metadata| metadata.is_file() && !is_link_metadata(metadata))
+            .and_then(|_| std::fs::read_to_string(&project_path).ok())
+            .and_then(|content| serde_json::from_str::<Value>(&content).ok());
+        let owned = project.as_ref().is_some_and(|project| {
+            project.get("id").and_then(Value::as_str) == Some(project_id.as_str())
+                && project.get("sourceTaskId").and_then(Value::as_str)
+                    .is_some_and(|task_id| !task_id.is_empty() && task_ids.contains(task_id))
+        });
+        if !owned {
+            result.failed_project_ids.push(project_id.clone());
             continue;
         }
         match std::fs::remove_dir_all(project_dir) {
@@ -1291,31 +1396,16 @@ fn write_editor_project(app: &AppHandle, project: &Value) -> AppResult<Value> {
         .ok_or_else(|| AppError::Worker("missing editor project id".into()))?;
     let dir = editor_project_dir(app, project_id)?;
     storage::write_json_file(&dir.join("project.json"), project)?;
+    session_log::record_editor_project(project);
     Ok(project.clone())
 }
 
 
 #[tauri::command]
 pub async fn close_current_window(window: tauri::WebviewWindow) -> AppResult<()> {
-    let label = window.label().to_string();
-    let app_handle = window.app_handle().clone();
     window
         .destroy()
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    if label.starts_with("workflow-node-editor") {
-        let _ = app_handle.emit_to(
-            "main",
-            "pymss://workflow-node-editor-closed",
-            serde_json::json!({ "label": label }),
-        );
-    } else if label.starts_with("workflow-simple-editor") {
-        let _ = app_handle.emit_to(
-            "main",
-            "pymss://workflow-simple-editor-closed",
-            serde_json::json!({ "label": label }),
-        );
-    }
-    Ok(())
+        .map_err(|error| AppError::Worker(error.to_string()))
 }
 
 #[tauri::command]
@@ -1358,93 +1448,127 @@ pub async fn start_drag_current_window(window: tauri::WebviewWindow) -> AppResul
 }
 
 #[tauri::command]
-pub async fn open_workflow_node_editor_window(app: AppHandle, payload: Value) -> AppResult<Value> {
-    let workflow_id = payload
-        .get("workflowId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let new_workflow = payload
-        .get("newWorkflow")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let label = if workflow_id.trim().is_empty() {
-        "workflow-node-editor-new".to_string()
-    } else {
-        format!("workflow-node-editor-{}", safe_file_name(&workflow_id))
-    };
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.set_focus();
-        return Ok(
-            serde_json::json!({ "workflowId": workflow_id, "label": label, "opened": true, "reused": true }),
-        );
-    }
-
-    let url = if workflow_id.trim().is_empty() {
-        if new_workflow {
-            "index.html#/workflow-node-editor?new=1".to_string()
-        } else {
-            "index.html#/workflow-node-editor".to_string()
-        }
-    } else {
-        format!("index.html#/workflow-node-editor?workflowId={}", workflow_id)
-    };
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
-        .title("Pymss Studio Workflow Node Editor")
-        .inner_size(1440.0, 900.0)
-        .min_inner_size(1180.0, 720.0)
-        .resizable(true)
-        .minimizable(true)
-        .maximizable(true)
-        .closable(true)
-        .decorations(cfg!(target_os = "macos"))
-        .visible(false)
-        .focused(true)
-        .on_page_load(|window, payload| {
-            if payload.event() == PageLoadEvent::Finished {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        })
-        .build()
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    Ok(
-        serde_json::json!({ "workflowId": workflow_id, "label": label, "opened": true, "reused": false }),
-    )
+pub async fn open_workflow_node_editor_window(
+    app: AppHandle,
+    editors: State<'_, WorkflowEditors>,
+    payload: Value,
+) -> AppResult<Value> {
+    open_workflow_editor_window(app, editors, payload, WorkflowEditorKind::Advanced).await
 }
 
 #[tauri::command]
-pub async fn open_workflow_simple_editor_window(app: AppHandle, payload: Value) -> AppResult<Value> {
+pub async fn open_workflow_simple_editor_window(
+    app: AppHandle,
+    editors: State<'_, WorkflowEditors>,
+    payload: Value,
+) -> AppResult<Value> {
+    open_workflow_editor_window(app, editors, payload, WorkflowEditorKind::Simple).await
+}
+
+async fn open_workflow_editor_window(
+    app: AppHandle,
+    editors: State<'_, WorkflowEditors>,
+    payload: Value,
+    kind: WorkflowEditorKind,
+) -> AppResult<Value> {
+    let _application_access = crate::python::worker::acquire_application_operation()?;
+    let _creation_guard = editors.creation_gate.lock().await;
     let workflow_id = payload
         .get("workflowId")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or("")
         .to_string();
     let new_workflow = payload
         .get("newWorkflow")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let label = if workflow_id.trim().is_empty() {
-        "workflow-simple-editor-new".to_string()
-    } else {
-        format!("workflow-simple-editor-{}", safe_file_name(&workflow_id))
+
+    let (prefix, route, title) = match kind {
+        WorkflowEditorKind::Simple => (
+            "workflow-simple-editor",
+            "workflow-simple-editor",
+            "Pymss Studio Simple Workflow Editor",
+        ),
+        WorkflowEditorKind::Advanced => (
+            "workflow-node-editor",
+            "workflow-node-editor",
+            "Pymss Studio Workflow Node Editor",
+        ),
     };
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.set_focus();
-        return Ok(serde_json::json!({ "workflowId": workflow_id, "label": label, "opened": true, "reused": true }));
-    }
-    let url = if workflow_id.trim().is_empty() {
+    let base_label = if workflow_id.is_empty() {
+        format!("{prefix}-new")
+    } else {
+        format!("{prefix}-{}", safe_file_name(&workflow_id))
+    };
+    // Window labels remain fixed after saving a new workflow or a copy. An
+    // occupied old label must not cause a different workflow to be reused.
+    let (label, snapshot) = loop {
+        let existing = editors.registry().editor_for_request(&workflow_id, kind);
+        if let Some(existing) = existing {
+            if let Some(window) = app.get_webview_window(&existing.label) {
+                let snapshot = {
+                    let registry = editors.registry();
+                    if registry.editor_for_request(&workflow_id, kind).as_ref() != Some(&existing) {
+                        continue;
+                    }
+                    registry.snapshot()
+                };
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+                return Ok(serde_json::json!({
+                    "workflowId": existing.workflow_id,
+                    "label": existing.label,
+                    "kind": existing.kind,
+                    "opened": true,
+                    "reused": true,
+                    "editorSnapshot": snapshot,
+                }));
+            }
+            let changed = editors.registry().release(&existing.label);
+            if let Some(snapshot) = changed {
+                workflow_editors::emit_snapshot(&app, &snapshot);
+            }
+            continue;
+        }
+
+        let mut sequence = 0u64;
+        let label = loop {
+            let base = if sequence == 0 {
+                base_label.clone()
+            } else {
+                format!("{base_label}-{sequence}")
+            };
+            let candidate = editors.registry().next_available_label(&base);
+            if app.get_webview_window(&candidate).is_none() {
+                break candidate;
+            }
+            sequence += 1;
+        };
+        let snapshot = {
+            let mut registry = editors.registry();
+            // A first save can adopt this ID after our initial lookup.
+            if registry.editor_for_request(&workflow_id, kind).is_some() {
+                continue;
+            }
+            registry.reserve(&label, &workflow_id, kind)?
+        };
+        break (label, snapshot);
+    };
+    workflow_editors::emit_snapshot(&app, &snapshot);
+
+    let url = if workflow_id.is_empty() {
         if new_workflow {
-            "index.html#/workflow-simple-editor?new=1".to_string()
+            format!("index.html#/{route}?new=1")
         } else {
-            "index.html#/workflow-simple-editor".to_string()
+            format!("index.html#/{route}")
         }
     } else {
         let encoded_id: String = url::form_urlencoded::byte_serialize(workflow_id.as_bytes()).collect();
-        format!("index.html#/workflow-simple-editor?workflowId={}", encoded_id)
+        format!("index.html#/{route}?workflowId={encoded_id}")
     };
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
-        .title("Pymss Studio Simple Workflow Editor")
+    let result = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title(title)
         .inner_size(1440.0, 900.0)
         .min_inner_size(1180.0, 720.0)
         .resizable(true)
@@ -1460,34 +1584,57 @@ pub async fn open_workflow_simple_editor_window(app: AppHandle, payload: Value) 
                 let _ = window.set_focus();
             }
         })
-        .build()
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    Ok(serde_json::json!({ "workflowId": workflow_id, "label": label, "opened": true, "reused": false }))
+        .build();
+    if let Err(error) = result {
+        let changed = editors.registry().release(&label);
+        if let Some(snapshot) = changed {
+            workflow_editors::emit_snapshot(&app, &snapshot);
+        }
+        return Err(AppError::Worker(error.to_string()));
+    }
+    // The page may have acquired a formal ID or already closed while build()
+    // returned. Read its current ownership; do not restore the initial entry.
+    let snapshot = editors.registry().snapshot();
+    let current_workflow_id = snapshot.editors.iter()
+        .find(|editor| editor.label == label)
+        .map(|editor| editor.workflow_id.as_str())
+        .unwrap_or(&workflow_id);
+    Ok(serde_json::json!({
+        "workflowId": current_workflow_id,
+        "label": label,
+        "kind": kind,
+        "opened": true,
+        "reused": false,
+        "editorSnapshot": snapshot,
+    }))
 }
 
 #[tauri::command]
-pub async fn open_editor_window(app: AppHandle, payload: Value) -> AppResult<Value> {
+pub async fn open_editor_window(
+    app: AppHandle,
+    editors: State<'_, WorkflowEditors>,
+    payload: Value,
+) -> AppResult<Value> {
     let project_id = payload
         .get("projectId")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Worker("missing projectId".into()))?
         .to_string();
-    let label = format!("editor-{}", safe_file_name(&project_id));
+    validate_editor_project_id(&project_id)?;
+    let _application_access = crate::python::worker::acquire_application_operation()?;
+    let _creation_guard = editors.creation_gate.lock().await;
+    let label = format!("editor-{project_id}");
     if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.emit(
-            "pymss://editor-open-project",
-            serde_json::json!({ "projectId": project_id, "label": label }),
-        );
+        let _ = window.unminimize();
         let _ = window.set_focus();
         return Ok(
             serde_json::json!({ "projectId": project_id, "label": label, "opened": true, "reused": true }),
         );
     }
 
-    let url = format!(
-        "index.html#/editor?projectId={}&windowLabel={}",
-        project_id, label
-    );
+    let encoded_id: String = url::form_urlencoded::byte_serialize(project_id.as_bytes()).collect();
+    let encoded_label: String = url::form_urlencoded::byte_serialize(label.as_bytes()).collect();
+    let url = format!("index.html#/editor?projectId={encoded_id}&windowLabel={encoded_label}");
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
         .title("Pymss Studio Editor")
         .inner_size(1440.0, 900.0)
@@ -1743,7 +1890,7 @@ pub async fn delete_editor_projects_for_tasks(
     }
 
     let root = editor_projects_root(&app)?;
-    Ok(remove_editor_project_dirs(&root, &project_ids))
+    Ok(remove_editor_project_dirs(&root, &project_ids, &task_ids))
 }
 
 #[tauri::command]
@@ -1770,10 +1917,9 @@ pub async fn delete_orphaned_editor_projects(
     active_task_ids: Vec<String>,
 ) -> AppResult<EditorProjectCleanupResult> {
     let root = editor_projects_root(&app)?;
-    let project_ids: Vec<String> = orphaned_editor_projects(&root, &active_task_ids)?
-        .into_iter()
-        .map(|project| project.project_id)
-        .collect();
+    let projects = orphaned_editor_projects(&root, &active_task_ids)?;
+    let project_ids: Vec<String> = projects.iter().map(|project| project.project_id.clone()).collect();
+    let task_ids: Vec<String> = projects.iter().map(|project| project.source_task_id.clone()).collect();
     let blocked_project_ids = open_editor_project_ids(&app, &project_ids);
     if !blocked_project_ids.is_empty() {
         return Ok(EditorProjectCleanupResult {
@@ -1781,7 +1927,7 @@ pub async fn delete_orphaned_editor_projects(
             ..EditorProjectCleanupResult::default()
         });
     }
-    Ok(remove_editor_project_dirs(&root, &project_ids))
+    Ok(remove_editor_project_dirs(&root, &project_ids, &task_ids))
 }
 
 #[tauri::command]
@@ -1840,6 +1986,64 @@ pub async fn import_editor_assets(
 #[tauri::command]
 pub async fn get_audio_metadata(app: AppHandle, payload: Value) -> AppResult<Value> {
     run_worker_with_payload(&app, "audio_metadata", Some(payload))
+}
+
+const EDITOR_PREVIEW_CHUNK_SECONDS: u64 = 4;
+
+fn decode_editor_preview_chunk(ffmpeg: &Path, path: &Path, index: u64, sample_rate: u32, channels: u32) -> AppResult<Vec<u8>> {
+    if !(8_000..=192_000).contains(&sample_rate) || !(1..=2).contains(&channels) || index > 216_000 {
+        return Err(AppError::Worker("Invalid preview chunk parameters".into()));
+    }
+    if !path.is_absolute() || !path.is_file() {
+        return Err(AppError::Worker("Preview audio file is unavailable".into()));
+    }
+    let mut command = Command::new(ffmpeg);
+    let start = index * EDITOR_PREVIEW_CHUNK_SECONDS;
+    let warm_start = start.saturating_sub(1);
+    // Warm compressed decoders before the boundary, preserve original stream
+    // timestamps, and trim there. A direct input seek can discard AAC priming
+    // samples twice or begin MP3 decoding without its previous-frame state.
+    command.args(["-nostdin", "-v", "error", "-threads", "1", "-copyts", "-start_at_zero"]);
+    // Even an input seek to zero can reapply MP4/AAC priming. The first chunk
+    // must follow the normal decode path from the beginning.
+    if start > 0 { command.arg("-ss").arg(warm_start.to_string()); }
+    command.arg("-i").arg(path)
+        .args(["-map", "0:a:0", "-vn", "-af"])
+        // Reset the warmup window's timestamps before resampling, keeping its
+        // phase on the same sample grid as a full decode (including MP4/AAC).
+        // Trim AFTER resampling so both boundaries retain neighboring samples.
+        .arg(format!("atrim=start={warm_start},asetpts=PTS-{warm_start}/TB,aresample={sample_rate}:first_pts=0,atrim=start={}:duration={EDITOR_PREVIEW_CHUNK_SECONDS},asetpts=PTS-STARTPTS", start - warm_start))
+        .arg("-t").arg(EDITOR_PREVIEW_CHUNK_SECONDS.to_string())
+        .arg("-ar").arg(sample_rate.to_string())
+        .arg("-ac").arg(channels.to_string())
+        .args(["-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(AppError::Worker(format!("Preview decode failed: {}", String::from_utf8_lossy(&output.stderr))));
+    }
+    let frame_bytes = channels as usize * 4;
+    let limit = EDITOR_PREVIEW_CHUNK_SECONDS as usize * sample_rate as usize * frame_bytes;
+    if output.stdout.len() > limit || output.stdout.len() % frame_bytes != 0 {
+        return Err(AppError::Worker("Invalid decoded preview chunk".into()));
+    }
+    Ok(output.stdout)
+}
+
+#[tauri::command]
+pub async fn editor_preview_chunk(app: AppHandle, path: String, index: u64, sample_rate: u32, channels: u32) -> AppResult<tauri::ipc::Response> {
+    let ffmpeg_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let ffmpeg = bundled_bin_dirs(&app)?.into_iter()
+        .map(|dir| dir.join(ffmpeg_name)).find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(ffmpeg_name));
+    let data = tauri::async_runtime::spawn_blocking(move || {
+        decode_editor_preview_chunk(&ffmpeg, Path::new(&path), index, sample_rate, channels)
+    }).await.map_err(|error| AppError::Worker(error.to_string()))??;
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[tauri::command]
@@ -1927,6 +2131,7 @@ pub async fn load_editor_project(app: AppHandle, project_id: String) -> AppResul
     if enrich_editor_project_sources(&mut project) {
         write_editor_project(&app, &project)?;
     }
+    session_log::record_editor_project(&project);
     Ok(project)
 }
 
@@ -2093,6 +2298,142 @@ pub async fn export_editor_mix(app: AppHandle, payload: Value) -> AppResult<Valu
     run_worker_with_payload(&app, "export_editor_mix", Some(payload))
 }
 
+fn editor_export_render_dir(app: &AppHandle, project_id: &str, task_id: &str) -> AppResult<PathBuf> {
+    if !task_id.starts_with("editor_export_") || task_id.len() > 96
+        || !task_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return Err(AppError::Worker("invalid editor export task id".into()));
+    }
+    Ok(editor_project_dir(app, project_id)?.join(".export-render").join(task_id))
+}
+
+fn float_wav_header(frames: u32, sample_rate: u32, channels: u16) -> AppResult<[u8; 44]> {
+    if frames == 0 || !(8_000..=192_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
+        return Err(AppError::Worker("invalid rendered audio parameters".into()));
+    }
+    let size = frames.checked_mul(u32::from(channels) * 4)
+        .filter(|size| *size <= u32::MAX - 36)
+        .ok_or_else(|| AppError::Worker("rendered audio is too large".into()))?;
+    let mut header = [0u8; 44];
+    header[..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(size + 36).to_le_bytes());
+    header[8..16].copy_from_slice(b"WAVEfmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&3u16.to_le_bytes());
+    header[22..24].copy_from_slice(&channels.to_le_bytes());
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&(sample_rate * u32::from(channels) * 4).to_le_bytes());
+    header[32..34].copy_from_slice(&(channels * 4).to_le_bytes());
+    header[34..36].copy_from_slice(&32u16.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&size.to_le_bytes());
+    Ok(header)
+}
+
+fn append_rendered_audio(path: &Path, header: &[u8; 44], offset: u64, bytes: &[u8]) -> AppResult<bool> {
+    let size = u64::from(u32::from_le_bytes(header[40..44].try_into().unwrap()));
+    let alignment = u64::from(u16::from_le_bytes(header[32..34].try_into().unwrap()));
+    if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 || offset % alignment != 0
+        || bytes.len() as u64 % alignment != 0 || offset.saturating_add(bytes.len() as u64) > size {
+        return Err(AppError::Worker("invalid rendered audio chunk".into()));
+    }
+    let mut file = if offset == 0 {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(header)?;
+        file
+    } else {
+        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        if file.metadata()?.len() != 44 + offset {
+            return Err(AppError::Worker("rendered audio chunk is out of order".into()));
+        }
+        use std::io::Read;
+        let mut actual_header = [0u8; 44];
+        (&file).read_exact(&mut actual_header)?;
+        if actual_header != *header {
+            return Err(AppError::Worker("rendered audio format changed".into()));
+        }
+        file
+    };
+    file.write_all(bytes)?;
+    let complete = offset + bytes.len() as u64 == size;
+    if complete { file.sync_all()?; }
+    Ok(complete)
+}
+
+fn cleanup_stale_editor_renders(
+    root: &Path,
+    now: std::time::SystemTime,
+    active: &std::collections::HashSet<String>,
+) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let cutoff = now.checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut removed = 0;
+    for entry in entries.take(256) {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("editor_export_") || active.contains(&name)
+            || !entry.file_type()?.is_dir() || entry.metadata()?.modified()? > cutoff {
+            continue;
+        }
+        let mut recently_written = false;
+        for file in std::fs::read_dir(entry.path())? {
+            if std::fs::symlink_metadata(file?.path())?.modified()? > cutoff {
+                recently_written = true;
+                break;
+            }
+        }
+        if !recently_written {
+            std::fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub async fn append_editor_export_render_chunk(
+    app: AppHandle, state: State<'_, AppState>, project_id: String, task_id: String, clip_index: u32,
+    sample_rate: u32, channels: u16, frames: u32, offset: u64, data_base64: String,
+) -> AppResult<Option<Value>> {
+    if data_base64.len() > 3 * 1024 * 1024 {
+        return Err(AppError::Worker("rendered audio chunk is too large".into()));
+    }
+    let directory = editor_export_render_dir(&app, &project_id, &task_id)?;
+    let header = float_wav_header(frames, sample_rate, channels)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data_base64)
+        .map_err(|error| AppError::Worker(format!("invalid rendered audio: {error}")))?;
+    let mut active = state.tasks.lock().map(|tasks| tasks.keys().cloned().collect::<std::collections::HashSet<_>>())
+        .unwrap_or_default();
+    active.insert(task_id);
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<Option<Value>> {
+        if offset == 0 {
+            if let Err(error) = cleanup_stale_editor_renders(directory.parent().unwrap(), std::time::SystemTime::now(), &active) {
+                crate::session_log::early("WARN", "editor.exportCache", &format!("Unable to clean stale export audio: {error}"));
+            }
+        }
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("clip_{clip_index}.wav"));
+        if !append_rendered_audio(&path, &header, offset, &bytes)? { return Ok(None); }
+        Ok(Some(serde_json::json!({ "path": path.to_string_lossy(),
+            "duration": f64::from(frames) / f64::from(sample_rate),
+            "sampleRate": sample_rate, "channels": channels })))
+    }).await.map_err(|error| AppError::Worker(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn cleanup_editor_export_render(app: AppHandle, project_id: String, task_id: String) -> AppResult<()> {
+    let directory = editor_export_render_dir(&app, &project_id, &task_id)?;
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[tauri::command]
 pub async fn start_editor_mix_export(
     app: AppHandle,
@@ -2218,6 +2559,9 @@ pub async fn cancel_task(
     {
         return Ok(false);
     }
+    if super::tempo_key::cancel_native_task(&state, &task_id) {
+        return Ok(true);
+    }
     let child = state
         .tasks
         .lock()
@@ -2261,6 +2605,7 @@ pub async fn cancel_task(
             if cancelled_task_id.starts_with("plugin_manage_") {
                 continue;
             }
+            session_log::append(&app, "INFO", "task.cancelled", vec![("taskId", cancelled_task_id.clone()), ("message", "Task cancelled".into())]);
             let _ = app.emit(
                 "pymss://worker-event",
                 serde_json::json!({
@@ -2334,7 +2679,11 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn normalize_path_key(value: &str) -> String {
-    value.replace('\\', "/").to_ascii_lowercase()
+    if cfg!(windows) {
+        value.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
 }
 
 fn normalized_relative_path(path: &Path) -> Option<String> {
@@ -3097,7 +3446,17 @@ fn is_ignored_empty_dir_file(path: &Path) -> bool {
         .is_some_and(|name| name == ".DS_Store")
 }
 
+fn is_link_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 fn is_effectively_empty_dir(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() || is_link_metadata(&metadata) {
+        return false;
+    }
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => return false,
@@ -3107,13 +3466,19 @@ fn is_effectively_empty_dir(path: &Path) -> bool {
             return false;
         };
         let child = entry.path();
-        if child.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&child) else {
+            return false;
+        };
+        if is_link_metadata(&metadata) {
+            return false;
+        }
+        if metadata.is_dir() {
             if !is_effectively_empty_dir(&child) {
                 return false;
             }
             continue;
         }
-        if !child.is_file() || !is_ignored_empty_dir_file(&child) {
+        if !metadata.is_file() || !is_ignored_empty_dir_file(&child) {
             return false;
         }
     }
@@ -3125,7 +3490,7 @@ fn normalize_trash_empty_dirs(paths: Vec<String>) -> Vec<String> {
     let mut dirs: Vec<String> = paths
         .into_iter()
         .filter(|path| !path.trim().is_empty())
-        .filter(|path| seen.insert(path.to_lowercase()))
+        .filter(|path| seen.insert(normalize_path_key(path)))
         .collect();
     dirs.sort_by_key(|path| {
         std::cmp::Reverse(Path::new(path).components().count())
@@ -3139,9 +3504,17 @@ pub async fn move_paths_to_trash(paths: Vec<String>, empty_dirs: Option<Vec<Stri
     let mut failed = Vec::new();
     for path in paths {
         let target = Path::new(&path);
+        if !target.is_absolute() {
+            failed.push(path);
+            continue;
+        }
         // 已不存在的路径视为已删除，无需报错
         if !target.exists() {
             trashed.push(path);
+            continue;
+        }
+        if !target.is_file() {
+            failed.push(path);
             continue;
         }
         match trash::delete(target) {
@@ -3155,7 +3528,7 @@ pub async fn move_paths_to_trash(paths: Vec<String>, empty_dirs: Option<Vec<Stri
             trashed.push(path);
             continue;
         }
-        if !target.is_dir() {
+        if !target.is_absolute() || target.parent().is_none() || !target.is_dir() {
             continue;
         }
         if !is_effectively_empty_dir(target) {
@@ -3181,6 +3554,34 @@ mod tests {
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("pymss-studio-{name}-{unique}"))
+    }
+
+    #[test]
+    fn editor_project_id_validation_preserves_normal_project_identity() {
+        for project_id in [
+            "edit_task_1720000000000_abc12",
+            "edit_blank_1720000000000",
+            "project-with.dots",
+        ] {
+            assert_eq!(validate_editor_project_id(project_id).unwrap(), project_id);
+        }
+        let longest_id = "a".repeat(96);
+        assert_eq!(validate_editor_project_id(&longest_id).unwrap(), longest_id);
+    }
+
+    #[test]
+    fn editor_project_id_validation_rejects_path_and_label_aliases() {
+        for project_id in [
+            "", " ", ".", "..", "../project", "project/name", "project\\name",
+            "project:name", "project?name", "project.", "_project", "project_", "目录",
+        ] {
+            assert!(validate_editor_project_id(project_id).is_err(), "accepted {project_id}");
+        }
+        let long_a = format!("{}a", "x".repeat(96));
+        let long_b = format!("{}b", "x".repeat(96));
+        assert_eq!(safe_file_name(&long_a), safe_file_name(&long_b));
+        assert!(validate_editor_project_id(&long_a).is_err());
+        assert!(validate_editor_project_id(&long_b).is_err());
     }
 
     #[test]
@@ -3271,6 +3672,53 @@ mod tests {
     }
 
     #[test]
+    fn editor_export_render_preserves_float_samples_and_chunk_order() {
+        let root = temp_test_dir("export-render");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("clip.wav");
+        let header = float_wav_header(2, 48_000, 2).unwrap();
+        assert_eq!(u16::from_le_bytes(header[20..22].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(header[34..36].try_into().unwrap()), 32);
+        let first: Vec<u8> = [1.25f32, -1.75].into_iter().flat_map(f32::to_le_bytes).collect();
+        let second: Vec<u8> = [0.123456f32, -0.000001].into_iter().flat_map(f32::to_le_bytes).collect();
+        assert!(!append_rendered_audio(&path, &header, 0, &first).unwrap());
+        assert!(append_rendered_audio(&path, &header, 0, &first).is_err());
+        assert!(append_rendered_audio(&path, &header, 16, &second).is_err());
+        assert!(append_rendered_audio(&path, &header, 8, &second).unwrap());
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..44], &header);
+        assert_eq!(&bytes[44..52], first.as_slice());
+        assert_eq!(&bytes[52..60], second.as_slice());
+        assert!(append_rendered_audio(&path, &header, 16, &first).is_err());
+        assert!(float_wav_header(u32::MAX, 48_000, 2).is_err());
+        assert!(float_wav_header(10, 1, 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_export_render_cleanup_keeps_active_and_recently_written_files() {
+        let root = temp_test_dir("export-render-cleanup");
+        let stale = root.join("editor_export_stale");
+        let active_dir = root.join("editor_export_active");
+        let recent = root.join("editor_export_recent");
+        let unrelated = root.join("user_files");
+        for path in [&stale, &active_dir, &recent, &unrelated] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("clip.wav"), b"audio").unwrap();
+        }
+        let future = SystemTime::now() + std::time::Duration::from_secs(48 * 60 * 60);
+        fs::File::options().write(true).open(recent.join("clip.wav")).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(future)).unwrap();
+        let protected = std::collections::HashSet::from(["editor_export_active".to_string()]);
+        assert_eq!(cleanup_stale_editor_renders(&root, future, &protected).unwrap(), 1);
+        assert!(!stale.exists());
+        assert!(active_dir.join("clip.wav").exists());
+        assert!(recent.join("clip.wav").exists());
+        assert!(unrelated.join("clip.wav").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recording_id_validation_rejects_path_components() {
         assert!(validate_recording_id("recording_1720000000000").is_ok());
         assert!(validate_recording_id("../recording_1720000000000").is_err());
@@ -3318,10 +3766,15 @@ mod tests {
         let recordings = root.join(&existing_id).join("recordings");
         fs::create_dir_all(&recordings).expect("create editor project directory");
         fs::write(recordings.join("take.wav"), b"audio").expect("write editor recording");
+        fs::write(
+            root.join(&existing_id).join("project.json"),
+            r#"{"id":"edit_existing","sourceTaskId":"existing"}"#,
+        ).expect("write editor project ownership");
 
         let result = remove_editor_project_dirs(
             &root,
             &[existing_id.clone(), missing_id.clone()],
+            &["existing".to_string()],
         );
 
         assert_eq!(result.deleted_project_ids, vec![existing_id.clone()]);
@@ -3364,5 +3817,165 @@ mod tests {
         assert_eq!(projects[0].project_id, "edit_orphan");
         assert_eq!(projects[0].source_task_id, "task-orphan");
         fs::remove_dir_all(&root).expect("remove orphaned project test root");
+    }
+
+    #[test]
+    fn editor_project_cleanup_rejects_lossy_task_id_collisions_and_unknown_ownership() {
+        let root = temp_test_dir("editor-project-ownership");
+        let project_id = editor_project_id_for_task_id("a:b");
+        assert_eq!(project_id, editor_project_id_for_task_id("a/b"));
+        let project_dir = root.join(&project_id);
+        fs::create_dir_all(&project_dir).expect("create project directory");
+        let project_path = project_dir.join("project.json");
+        fs::write(&project_path, r#"{"id":"edit_a_b","sourceTaskId":"a:b"}"#).unwrap();
+        let result = remove_editor_project_dirs(&root, &[project_id.clone()], &["a/b".to_string()]);
+        assert_eq!(result.failed_project_ids, vec![project_id.clone()]);
+        assert!(project_dir.is_dir());
+        for content in [r#"{"id":"edit_a_b"}"#, r#"{"id":"other","sourceTaskId":"a:b"}"#, "invalid"] {
+            fs::write(&project_path, content).unwrap();
+            let result = remove_editor_project_dirs(&root, &[project_id.clone()], &["a:b".to_string()]);
+            assert_eq!(result.failed_project_ids, vec![project_id.clone()]);
+            assert!(project_dir.is_dir());
+        }
+        fs::write(&project_path, r#"{"id":"edit_a_b","sourceTaskId":"a:b"}"#).unwrap();
+        let result = remove_editor_project_dirs(&root, &[project_id.clone()], &[" a:b ".to_string()]);
+        assert_eq!(result.deleted_project_ids, vec![project_id]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_path_keys_preserve_posix_case_and_literal_backslashes() {
+        if cfg!(windows) {
+            assert_eq!(normalize_path_key("C:\\Audio\\Song.wav"), normalize_path_key("c:/audio/song.wav"));
+        } else {
+            assert_ne!(normalize_path_key("/audio/Foo.wav"), normalize_path_key("/audio/foo.wav"));
+            assert_ne!(normalize_path_key("/audio/a\\b.wav"), normalize_path_key("/audio/a/b.wav"));
+            assert_eq!(normalize_trash_empty_dirs(vec!["/audio/Foo".into(), "/audio/foo".into()]).len(), 2);
+        }
+    }
+
+    #[test]
+    fn empty_directory_checks_do_not_follow_links_or_directory_cycles() {
+        let root = temp_test_dir("empty-directory-links");
+        fs::create_dir_all(&root).unwrap();
+        assert!(is_effectively_empty_dir(&root));
+        fs::write(root.join(".DS_Store"), b"metadata").unwrap();
+        assert!(is_effectively_empty_dir(&root));
+        let link = root.join("loop");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let status = std::process::Command::new("cmd.exe")
+                .raw_arg(format!("/c mklink /J \"{}\" \"{}\"", link.display(), root.display()))
+                .output().expect("create directory junction");
+            assert!(status.status.success());
+        }
+        assert!(!is_effectively_empty_dir(&link));
+        assert!(!is_effectively_empty_dir(&root));
+        let result = remove_editor_project_dirs(&root, &["loop".to_string()], &["task".to_string()]);
+        assert_eq!(result.failed_project_ids, vec!["loop".to_string()]);
+        assert!(root.is_dir());
+        #[cfg(unix)]
+        fs::remove_file(&link).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(&link).unwrap();
+        assert!(is_effectively_empty_dir(&root));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn invalid_requests_are_rejected_before_spawning() {
+        for (rate, channels, index) in [(0, 2, 0), (48_000, 3, 0), (48_000, 2, u64::MAX)] {
+            assert!(decode_editor_preview_chunk(Path::new("not-a-program"), Path::new("/missing"), index, rate, channels).is_err());
+        }
+        assert!(decode_editor_preview_chunk(Path::new("not-a-program"), Path::new("relative.wav"), 0, 48_000, 2).is_err());
+    }
+
+    fn preview_wave_fixture(rate: u32) -> PathBuf {
+        let mut pcm = Vec::new();
+        for frame in 0..rate * 9 {
+            let sample = ((frame % 997) as i16 - 498) * 40;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+            pcm.extend_from_slice(&(-sample).to_le_bytes());
+        }
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(pcm.len() as u32 + 36).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 4).to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        let path = temp_test_dir("preview-chunks").with_extension("wav");
+        std::fs::write(&path, wav).unwrap();
+        path
+    }
+
+    #[test]
+    fn consecutive_chunks_match_a_full_decode_without_missing_or_repeating_samples() {
+        let ffmpeg = Path::new("ffmpeg");
+        if Command::new(ffmpeg).arg("-version").output().is_err() {
+            eprintln!("FFmpeg not on PATH; skipping native codec check");
+            return;
+        }
+        for source_rate in [44_100, 48_000, 96_000] {
+            let path = preview_wave_fixture(source_rate);
+            for rate in [44_100, 48_000] {
+                let full = Command::new(ffmpeg).args(["-v", "error", "-i"]).arg(&path)
+                    .arg("-ar").arg(rate.to_string())
+                    .args(["-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"]).output().unwrap();
+                let pieces: Vec<_> = (0..3).map(|index| decode_editor_preview_chunk(ffmpeg, &path, index, rate, 2).unwrap()).collect();
+                assert!(full.status.success());
+                assert_eq!(pieces[0].len(), rate as usize * 4 * 2 * 4);
+                assert_eq!(pieces[2].len(), rate as usize * 2 * 4);
+                assert_eq!(pieces.concat(), full.stdout, "resampling {source_rate} to {rate} changed chunk samples");
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn compressed_preview_chunks_keep_gapless_timing_and_sample_alignment() {
+        let ffmpeg = Path::new("ffmpeg");
+        if Command::new(ffmpeg).arg("-version").output().is_err() {
+            eprintln!("FFmpeg not on PATH; skipping compressed codec check");
+            return;
+        }
+        let wave = preview_wave_fixture(44_100);
+        for (codec, extension) in [("libmp3lame", "mp3"), ("aac", "m4a"), ("aac", "aac"), ("libopus", "opus")] {
+            let encoded = wave.with_extension(extension);
+            let mut encoder = Command::new(ffmpeg);
+            encoder.args(["-v", "error", "-y", "-i"]).arg(&wave).arg("-c:a").arg(codec);
+            // Make the AAC fixture deterministic, without random perceptual noise.
+            if codec == "aac" { encoder.args(["-aac_pns", "0"]); }
+            let encoded_result = encoder.arg(&encoded).output().unwrap();
+            if !encoded_result.status.success() {
+                eprintln!("Encoder {codec} unavailable; skipping its fixture");
+                continue;
+            }
+            for rate in [44_100, 48_000] {
+                let full = Command::new(ffmpeg).args(["-v", "error", "-threads", "1", "-i"]).arg(&encoded)
+                    .arg("-ar").arg(rate.to_string())
+                    .args(["-ac", "2", "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"])
+                    .output().unwrap();
+                assert!(full.status.success());
+                let pieces: Vec<_> = (0..3).map(|index| decode_editor_preview_chunk(ffmpeg, &encoded, index, rate, 2).unwrap()).collect();
+                let joined = pieces.concat();
+                assert_eq!(joined.len(), full.stdout.len(), "{extension} at {rate} lost samples at a chunk boundary");
+                let max_error = joined.chunks_exact(4).zip(full.stdout.chunks_exact(4))
+                    .map(|(a, b)| (f32::from_le_bytes(a.try_into().unwrap()) - f32::from_le_bytes(b.try_into().unwrap())).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max_error < 0.00001, "{extension} at {rate} chunk alignment error: {max_error}");
+            }
+            fs::remove_file(&encoded).unwrap();
+        }
+        fs::remove_file(wave).unwrap();
     }
 }

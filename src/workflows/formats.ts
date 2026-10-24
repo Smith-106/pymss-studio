@@ -79,6 +79,7 @@ export function isGraphWorkflowDefinition(definition: unknown): definition is Re
  */
 export function hasInvalidSimpleStructure(definition: Record<string, unknown>): boolean {
   if (!Array.isArray(definition.steps)) return true
+  if (definition.version != null && definition.version !== WORKFLOW_FORMAT_VERSION) return true
   if (definition.ensembles != null && !Array.isArray(definition.ensembles)) return true
   if (definition.studio != null && !isRecord(definition.studio)) return true
   if (isRecord(definition.studio)) {
@@ -88,10 +89,14 @@ export function hasInvalidSimpleStructure(definition: Record<string, unknown>): 
   }
   if (definition.defaults != null && !isRecord(definition.defaults)) return true
   const defaults = isRecord(definition.defaults) ? definition.defaults : {}
+  if (['device', 'output_format'].some(key => defaults[key] != null && typeof defaults[key] !== 'string')) return true
   if (defaults.inference_params != null && !isRecord(defaults.inference_params)) return true
   if (isRecord(defaults.inference_params) && hasInvalidSimpleInferenceNumbers(defaults.inference_params)) return true
   const hasInvalidStep = (definition.steps as unknown[]).some((value) => {
     if (!isRecord(value)) return true
+    if (['id', 'model', 'input'].some(key => value[key] != null && typeof value[key] !== 'string')) return true
+    if (value.stems != null && typeof value.stems !== 'string'
+      && (!Array.isArray(value.stems) || value.stems.some(stem => typeof stem !== 'string'))) return true
     if (value.inference_params != null && !isRecord(value.inference_params)) return true
     if (isRecord(value.inference_params) && hasInvalidSimpleInferenceNumbers(value.inference_params)) return true
     if (value.save != null && !isRecord(value.save)) return true

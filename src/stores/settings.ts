@@ -1,5 +1,6 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import {
   applyTheme,
@@ -19,12 +20,17 @@ import {
 } from '@/utils/appZoom'
 import { normalizeLocaleSetting, setLocale, type LocaleSetting } from '@/i18n'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
+import { isMainTaskOwner } from '@/utils/taskOwner'
+import { requestEditorExportPreference, type EditorExportPreference } from '@/utils/editorExportPreferences'
 import {
   DEFAULT_CONCURRENT_SEPARATIONS,
   MAX_CONCURRENT_SEPARATIONS,
   normalizeConcurrentSeparations,
 } from '@/features/tasks/concurrency'
 import type { EnvInfo } from '@/stores/app'
+import { normalizeBeginnerGuideProgress, type BeginnerGuideProgress } from '@/features/onboarding/guide'
+
+const studioLog = createLogger('ui.stores.settings')
 
 type AppPathsPayload = {
   dataRoot: string
@@ -103,16 +109,20 @@ type StoredSettings = {
   m4aCodec?: string
   startupOnboardingSeen?: boolean
   startupOnboardingSeenVersion?: string
+  beginnerGuideInvitationSeen?: boolean
+  beginnerGuideProgress?: BeginnerGuideProgress
   proxyMode?: ProxyMode
   proxyUrl?: string
   proxyBypass?: string
   updateChannel?: UpdateChannel
+  updateSource?: UpdateSource
   updateEndpointOverride?: string
 }
 
 export type ProxyMode = 'system' | 'none' | 'custom'
 export type DownloadMethod = 'aria2c' | 'urllib'
 export type UpdateChannel = 'stable' | 'prerelease'
+export type UpdateSource = 'auto' | 'github' | 'modelscope'
 
 const DEFAULT_LOCALE: LocaleSetting = 'system'
 const DEFAULT_DOWNLOAD_SOURCE = 'modelscope'
@@ -147,6 +157,11 @@ const DEFAULT_FLAC_BIT_DEPTH = 'PCM_24'
 const DEFAULT_MP3_BIT_RATE = '320k'
 const DEFAULT_M4A_BIT_RATE = '512k'
 const DEFAULT_M4A_CODEC = 'aac'
+
+function normalizeMp3BitRate(value: unknown): string {
+  const rate = String(value || '').trim().toLowerCase()
+  return ['128k', '192k', '256k', '320k'].includes(rate) ? rate : DEFAULT_MP3_BIT_RATE
+}
 
 function normalizeM4aCodec(value: unknown): string {
   return String(value || '').trim().toLowerCase() === 'aac' ? 'aac' : DEFAULT_M4A_CODEC
@@ -222,7 +237,7 @@ function compatibleRuntimeDeviceSelection(selected: string, env?: EnvInfo | null
   const kind = selected.split(':')[0]
   if (kind === 'cuda' || kind === 'rocm') return env.torchBackend === 'cuda' || env.torchBackend === 'rocm' ? selected : 'auto'
   if (kind === 'mps') return env.mpsAvailable ? selected : 'auto'
-  if (kind === 'mlx') return env.mlxAvailable || env.mpsAvailable ? selected : 'auto'
+  if (kind === 'mlx') return env.mlxAvailable ? selected : 'auto'
   return selected
 }
 
@@ -252,8 +267,11 @@ export const useSettingsStore = defineStore('settings', () => {
   const proxyUrl = ref(DEFAULT_PROXY_URL)
   const proxyBypass = ref('')
   const updateChannel = ref<UpdateChannel>(DEFAULT_UPDATE_CHANNEL)
+  const updateSource = ref<UpdateSource>('auto')
   const updateEndpointOverride = ref('')
   const startupOnboardingSeen = ref(false)
+  const beginnerGuideInvitationSeen = ref(false)
+  const beginnerGuideProgress = ref(normalizeBeginnerGuideProgress(null))
   const modelDirMigrationState = ref<ModelDirMigrationState>(createEmptyModelDirMigrationState())
 
   const dataRoot = computed(() => appPaths.value?.dataRoot || '')
@@ -281,18 +299,22 @@ export const useSettingsStore = defineStore('settings', () => {
     clearInputAfterSubmit: clearInputAfterSubmit.value,
     wavBitDepth: wavBitDepth.value,
     flacBitDepth: flacBitDepth.value,
-    mp3BitRate: mp3BitRate.value,
+    mp3BitRate: normalizeMp3BitRate(mp3BitRate.value),
     m4aBitRate: m4aBitRate.value,
     m4aCodec: m4aCodec.value,
     startupOnboardingSeen: startupOnboardingSeen.value,
+    beginnerGuideInvitationSeen: beginnerGuideInvitationSeen.value,
+    beginnerGuideProgress: beginnerGuideProgress.value,
     proxyMode: proxyMode.value,
     proxyUrl: proxyUrl.value,
     proxyBypass: proxyBypass.value,
     updateChannel: updateChannel.value,
+    updateSource: updateSource.value,
     updateEndpointOverride: updateEndpointOverride.value.trim() || undefined,
   }))
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  let persistErrorReported = false
   let scaleApplyTimer: ReturnType<typeof setTimeout> | null = null
 
   // 防抖应用缩放：滑块位于它自身控制的 WebView 内，立即 setZoom 会在交互过程中
@@ -301,16 +323,22 @@ export const useSettingsStore = defineStore('settings', () => {
     if (scaleApplyTimer) clearTimeout(scaleApplyTimer)
     scaleApplyTimer = setTimeout(() => {
       scaleApplyTimer = null
-      void applyScaleFactor(value).catch((error) => console.warn('Failed to apply scale factor', error))
+      void applyScaleFactor(value).catch((error) => studioLog.warn('Failed to apply scale factor', error))
     }, 140)
   }
 
   function queuePersist() {
-    if (!initialized.value) return
+    if (!initialized.value || !isMainTaskOwner()) return
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
       saveTimer = null
-      void saveAppStore('app-settings', persistable.value)
+      void saveAppStore('app-settings', persistable.value).then(() => {
+        persistErrorReported = false
+      }).catch((error) => {
+        if (persistErrorReported) return
+        persistErrorReported = true
+        studioLog.warn('Failed to persist app settings', error)
+      })
     }, 80)
   }
 
@@ -338,7 +366,7 @@ export const useSettingsStore = defineStore('settings', () => {
     clearInputAfterSubmit.value = stored?.clearInputAfterSubmit ?? DEFAULT_CLEAR_INPUT_AFTER_SUBMIT
     wavBitDepth.value = stored?.wavBitDepth || DEFAULT_WAV_BIT_DEPTH
     flacBitDepth.value = stored?.flacBitDepth || DEFAULT_FLAC_BIT_DEPTH
-    mp3BitRate.value = stored?.mp3BitRate || DEFAULT_MP3_BIT_RATE
+    mp3BitRate.value = normalizeMp3BitRate(stored?.mp3BitRate)
     m4aBitRate.value = stored?.m4aBitRate || DEFAULT_M4A_BIT_RATE
     m4aCodec.value = normalizeM4aCodec(stored?.m4aCodec)
     proxyMode.value = (stored?.proxyMode && ['system', 'none', 'custom'].includes(stored.proxyMode))
@@ -347,20 +375,24 @@ export const useSettingsStore = defineStore('settings', () => {
     proxyUrl.value = stored?.proxyUrl || DEFAULT_PROXY_URL
     proxyBypass.value = stored?.proxyBypass || ''
     updateChannel.value = stored?.updateChannel === 'prerelease' ? 'prerelease' : DEFAULT_UPDATE_CHANNEL
+    updateSource.value = stored?.updateSource === 'github' || stored?.updateSource === 'modelscope' ? stored.updateSource : 'auto'
     updateEndpointOverride.value = String(stored?.updateEndpointOverride || '').trim()
     startupOnboardingSeen.value = stored?.startupOnboardingSeen === true
       || String(stored?.startupOnboardingSeenVersion || '').trim().length > 0
-    const shouldPersistNormalizedOnboarding =
+    beginnerGuideInvitationSeen.value = stored?.beginnerGuideInvitationSeen === true
+    beginnerGuideProgress.value = normalizeBeginnerGuideProgress(stored?.beginnerGuideProgress)
+    const shouldPersistNormalizedSettings =
       !stored
       || typeof stored.startupOnboardingSeen !== 'boolean'
       || String(stored.startupOnboardingSeenVersion || '').trim().length > 0
+      || (stored.mp3BitRate !== undefined && stored.mp3BitRate !== mp3BitRate.value)
 
     applyTheme(themeMode.value, themeAccent.value)
-    await applyScaleFactor(scaleFactor.value).catch((error) => console.warn('Failed to apply scale factor', error))
+    await applyScaleFactor(scaleFactor.value).catch((error) => studioLog.warn('Failed to apply scale factor', error))
     setLocale(locale.value)
     initialized.value = true
-    if (shouldPersistNormalizedOnboarding) queuePersist()
-    await syncProxyToBackend().catch((error) => console.warn('Failed to sync proxy settings', error))
+    if (shouldPersistNormalizedSettings) queuePersist()
+    await syncProxyToBackend().catch((error) => studioLog.warn('Failed to sync proxy settings', error))
   }
 
   watch(themeMode, (value) => {
@@ -385,11 +417,11 @@ export const useSettingsStore = defineStore('settings', () => {
     queuePersist()
   })
   watch(developerMode, async () => {
-    if (!initialized.value) return
+    if (!initialized.value || !isMainTaskOwner()) return
     try {
       await saveAppStore('app-settings', persistable.value)
     } catch (error) {
-      console.warn('Failed to persist app settings', error)
+      studioLog.warn('Failed to persist app settings', error)
     }
   })
   watch(
@@ -411,7 +443,10 @@ export const useSettingsStore = defineStore('settings', () => {
       proxyUrl,
       proxyBypass,
       updateChannel,
+      updateSource,
       updateEndpointOverride,
+      beginnerGuideInvitationSeen,
+      beginnerGuideProgress,
     ],
     () => queuePersist(),
     { deep: true },
@@ -420,12 +455,12 @@ export const useSettingsStore = defineStore('settings', () => {
   watch(
     [proxyMode, proxyUrl, proxyBypass],
     () => {
-      void syncProxyToBackend().catch((error) => console.warn('Failed to sync proxy settings', error))
+      void syncProxyToBackend().catch((error) => studioLog.warn('Failed to sync proxy settings', error))
     },
   )
 
   async function syncProxyToBackend() {
-    if (!initialized.value || !isTauriRuntime()) return
+    if (!initialized.value || !isTauriRuntime() || !isMainTaskOwner()) return
     await invoke('update_proxy_settings', {
       payload: {
         mode: proxyMode.value,
@@ -464,7 +499,7 @@ export const useSettingsStore = defineStore('settings', () => {
         options.push({ label: `${gpuName} ${id}`, value: `${gpuKind}:${id}`, type: gpuKind, deviceIds: [id] })
       }
     }
-    if (env?.mlxAvailable || env?.mpsAvailable) options.push({ label: 'Apple MLX', value: 'mlx', type: 'mlx', deviceIds: [0] })
+    if (env?.mlxAvailable) options.push({ label: 'Apple MLX', value: 'mlx', type: 'mlx', deviceIds: [0] })
     if (env?.mpsAvailable) options.push({ label: 'Apple MPS', value: 'mps', type: 'mps', deviceIds: [0] })
     return options
   }
@@ -496,7 +531,7 @@ export const useSettingsStore = defineStore('settings', () => {
     return {
       wav_bit_depth: wavBitDepth.value,
       flac_bit_depth: flacBitDepth.value,
-      mp3_bit_rate: mp3BitRate.value,
+      mp3_bit_rate: normalizeMp3BitRate(mp3BitRate.value),
       m4a_bit_rate: m4aBitRate.value,
       m4a_codec: m4aCodec.value,
     }
@@ -521,12 +556,12 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       await modelStore.loadModels()
     } catch (error) {
-      console.warn('Failed to refresh models after model directory change', error)
+      studioLog.warn('Failed to refresh models after model directory change', error)
     }
     try {
       await modelStore.loadModelStorageSummary({ force: true })
     } catch (error) {
-      console.warn('Failed to refresh model storage after model directory change', error)
+      studioLog.warn('Failed to refresh model storage after model directory change', error)
     }
     const selectedModelName = modelStore.selectedModel
     if (selectedModelName) {
@@ -778,7 +813,7 @@ export const useSettingsStore = defineStore('settings', () => {
         conflict: null,
         resolvingConflict: false,
       }
-      await finalizeModelDirSwitch(taskId, payload)
+      if (isMainTaskOwner()) await finalizeModelDirSwitch(taskId, payload)
       return
     }
 
@@ -807,7 +842,7 @@ export const useSettingsStore = defineStore('settings', () => {
       // model directory now points at files the migration has moved away. Rebase them.
       // Fire-and-forget: a failure here leaves those models showing as missing with a relink
       // action, which must not turn a completed migration into a failed one.
-      if (payload.sourceModelDir && payload.targetModelDir) {
+      if (isMainTaskOwner() && payload.sourceModelDir && payload.targetModelDir) {
         void invoke('remap_custom_model_paths', {
           payload: { fromRoot: payload.sourceModelDir, toRoot: payload.targetModelDir },
         }).then(() => import('@/stores/model'))
@@ -850,7 +885,27 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function markStartupOnboardingCompleted() {
+    if (beginnerGuideProgress.value.status === 'unseen') beginnerGuideProgress.value = { status: 'pending', step: 0 }
     startupOnboardingSeen.value = true
+    if (isMainTaskOwner()) await saveAppStore('app-settings', persistable.value)
+  }
+
+  async function saveEditorExportPreference(preference: EditorExportPreference) {
+    const allowed = preference.format === 'wav' ? ['PCM_16', 'PCM_24', 'FLOAT']
+      : preference.format === 'flac' ? ['PCM_16', 'PCM_24'] : []
+    if (!allowed.includes(preference.bitDepth)) throw new Error('Invalid export bit depth')
+    if (!initialized.value) throw new Error('Settings are not initialized')
+    const owner = isMainTaskOwner()
+    if (!owner) await requestEditorExportPreference(preference)
+    if (preference.format === 'wav') wavBitDepth.value = preference.bitDepth
+    else flacBitDepth.value = preference.bitDepth
+    if (!owner) return
+    // Flush the main window's current settings before acknowledging the export.
+    await nextTick()
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+    }
     await saveAppStore('app-settings', persistable.value)
   }
 
@@ -891,11 +946,15 @@ export const useSettingsStore = defineStore('settings', () => {
     proxyUrl,
     proxyBypass,
     updateChannel,
+    updateSource,
     updateEndpointOverride,
     startupOnboardingSeen,
+    beginnerGuideInvitationSeen,
+    beginnerGuideProgress,
     modelDirMigrationState,
     initialize,
     markStartupOnboardingCompleted,
+    saveEditorExportPreference,
     pickModelDir,
     pickOutputDir,
     pickFolder,

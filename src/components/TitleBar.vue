@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -9,6 +11,8 @@ import AppBrandMark from '@/components/AppBrandMark.vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
 import { runWindowCloseGuards } from '@/utils/windowCloseGuards'
+
+const studioLog = createLogger('ui.components.TitleBar')
 
 const route = useRoute()
 const { t } = useI18n()
@@ -23,7 +27,7 @@ const closeInProgress = ref(false)
 const allowForcedClose = ref(false)
 const closeDialogOpen = ref(false)
 
-const pageTitle = computed(() => t(`nav.${String(route.name || 'home')}`))
+const pageTitle = computed(() => t(`nav.${String(route.name || 'home').startsWith('workflow-') ? 'workflows' : String(route.name || 'home')}`))
 const isMainWindow = computed(() => !appWindow || appWindow.label === 'main')
 const runningTaskCount = computed(() => task.runningTasks.length)
 const closeDisabled = computed(() => settings.isModelDirMigrating || closeInProgress.value)
@@ -42,8 +46,8 @@ async function minimize() {
   try {
     await invoke('minimize_current_window')
   } catch (error) {
-    console.warn('[title-bar] minimize_current_window failed', error)
-    appWindow.minimize().catch(innerError => console.warn('[title-bar] appWindow.minimize failed', innerError))
+    studioLog.warn('[title-bar] minimize_current_window failed', error)
+    appWindow.minimize().catch(innerError => studioLog.warn('[title-bar] appWindow.minimize failed', innerError))
   }
 }
 async function toggleMaximize() {
@@ -51,8 +55,8 @@ async function toggleMaximize() {
   try {
     isMaximized.value = await invoke<boolean>('toggle_maximize_current_window')
   } catch (error) {
-    console.warn('[title-bar] toggle_maximize_current_window failed', error)
-    appWindow.toggleMaximize().then(refreshMaximized).catch(innerError => console.warn('[title-bar] appWindow.toggleMaximize failed', innerError))
+    studioLog.warn('[title-bar] toggle_maximize_current_window failed', error)
+    appWindow.toggleMaximize().then(refreshMaximized).catch(innerError => studioLog.warn('[title-bar] appWindow.toggleMaximize failed', innerError))
   }
 }
 
@@ -61,7 +65,7 @@ async function performWindowClose() {
   try {
     await runWindowCloseGuards()
   } catch (error) {
-    console.warn('[title-bar] window close guard failed', error)
+    studioLog.warn('[title-bar] window close guard failed', error)
     return false
   }
   allowForcedClose.value = true
@@ -185,8 +189,8 @@ function startDrag(event: MouseEvent) {
   if (event.detail > 1) { void toggleMaximize(); return }
   if (!appWindow) return
   invoke('start_drag_current_window').catch((error) => {
-    console.warn('[title-bar] start_drag_current_window failed', error)
-    appWindow.startDragging().catch(innerError => console.warn('[title-bar] appWindow.startDragging failed', innerError))
+    studioLog.warn('[title-bar] start_drag_current_window failed', error)
+    appWindow.startDragging().catch(innerError => studioLog.warn('[title-bar] appWindow.startDragging failed', innerError))
   })
 }
 

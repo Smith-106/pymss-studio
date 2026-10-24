@@ -28,12 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from worker_protocol import emit, emit_error
-
-
-def _normalize_output_dir(value: Any) -> str:
-    text = str(value or "").strip()
-    return text or "results"
+from worker_protocol import emit, emit_error, task_logging
+from worker_paths import normalize_output_dir as _normalize_output_dir
 
 
 def _normalize_output_layout(value: Any) -> str:
@@ -197,9 +193,11 @@ def _apply_runtime_device(dag: Any, payload: dict[str, Any], *, simple: bool) ->
         widgets[ids_index] = ",".join(str(index) for index in ids)
 
 
-def _emit_progress(task_id: str) -> Any:
+def _emit_progress(task_id: str, log_scope: Any = None) -> Any:
     """Forward native overall progress and display only audio-second counters."""
     def cb(event: dict[str, Any]) -> None:
+        if log_scope is not None:
+            log_scope.track(event)
         fraction = float(event.get("overall_fraction") or 0)
         if not math.isfinite(fraction):
             fraction = 0
@@ -207,11 +205,150 @@ def _emit_progress(task_id: str) -> Any:
             "stage": "separating", "message": event.get("message") or "Running workflow",
             "progress": 35 + int(min(1, max(0, fraction)) * 55),
         }
+        if event.get("node_id") is not None:
+            payload.update(nodeId=str(event["node_id"]), nodeType=event.get("node_type"),
+                           nodeProgress=event.get("node_fraction"), overallFraction=fraction)
+        for source, target in (("audio_index", "audioIndex"), ("audio_count", "audioCount"), ("unit", "unit")):
+            if event.get(source) is not None:
+                payload[target] = event[source]
         if event.get("unit") == "seconds" and event.get("done") is not None and event.get("total") is not None:
             payload.update(done=event["done"], total=event["total"])
         emit("task_progress", payload, task_id=task_id)
 
     return cb
+
+
+def _emit_execution(task_id: str, log_scope: Any = None) -> Any:
+    """Forward native lifecycle events without deriving state from progress."""
+    def cb(event: dict[str, Any]) -> None:
+        if log_scope is not None:
+            log_scope.track(event)
+        fields = {
+            "event": "event", "version": "version", "node_id": "nodeId", "node_type": "nodeType",
+            "node_fraction": "nodeProgress", "overall_fraction": "overallFraction",
+            "node_index": "nodeIndex", "node_count": "nodeCount", "message": "message",
+            "error_type": "errorType", "audio_index": "audioIndex", "audio_count": "audioCount",
+            "done": "done", "total": "total", "unit": "unit",
+        }
+        emit("workflow_execution", {target: event[source] for source, target in fields.items() if source in event},
+             task_id=task_id)
+
+    return cb
+
+
+def _prepare_workbench_outputs(dag: Any, targets: dict[str, str]) -> dict[str, str]:
+    """Give each native save node a private destination without changing its filename logic."""
+    import pymss.graph as graph
+    next_link = max((link.link_id for node in dag.nodes for link in node.inputs
+                     if link is not None and isinstance(link.link_id, int)), default=0) + 1
+    dynamic_folders: dict[str, str] = {}
+    for index, node in enumerate(list(dag.nodes)):
+        if str(node.id) not in targets:
+            continue
+        folder = f"studio_save_{index}"
+        widgets = list(node.data.get("widgets_values") or [])
+        if node.type == "pymss_save_audio":
+            # Older Studio graphs omitted the folder port as well as its widget.
+            # Resolve named ports before introducing the runtime folder override.
+            raw_inputs = (node.data.get("raw") or {}).get("inputs") or []
+            names = [port.name for port in node.signature.inputs]
+            if raw_inputs and names:
+                aligned: list[Any] = [None] * max(len(names), len(node.inputs))
+                for old_slot, link in enumerate(node.inputs):
+                    if link is None:
+                        continue
+                    raw = raw_inputs[old_slot] if old_slot < len(raw_inputs) else {}
+                    name = raw.get("name") if isinstance(raw, dict) else None
+                    new_slot = names.index(name) if name in names else old_slot
+                    link.target_slot = new_slot
+                    aligned[new_slot] = link
+                node.inputs = aligned
+            if len(widgets) > 1 and str(widgets[1]).isdigit():
+                widgets.insert(1, folder)
+            else:
+                while len(widgets) < 2:
+                    widgets.append("")
+                widgets[1] = folder
+            if len(node.inputs) > 3:
+                node.inputs[3] = None
+        elif node.type in {"SaveAudio", "SaveAudioMP3", "SaveAudioOpus", "SaveAudioAdvanced"}:
+            original = widgets[0] if widgets else "audio"
+            if len(node.inputs) > 1 and node.inputs[1] is not None:
+                dynamic_folders[str(node.id)] = folder
+                previous = node.inputs[1]
+                concat_id = f"studio:output-prefix:{node.id}"
+                if any(str(item.id) == concat_id for item in dag.nodes):
+                    raise RuntimeError("Workflow uses a reserved output helper id")
+                dag.nodes.append(graph.DAGNode(
+                    id=concat_id, type="StringConcatenate", inputs=[None, graph.DAGLink(
+                        link_id=next_link, source_node_id=previous.source_node_id,
+                        source_slot=previous.source_slot, target_node_id=concat_id, target_slot=1, type=graph.STRING,
+                    ), None], data={"widgets_values": [folder + "/", "", ""]},
+                ))
+                node.inputs[1] = graph.DAGLink(
+                    link_id=next_link + 1, source_node_id=concat_id, source_slot=0,
+                    target_node_id=node.id, target_slot=1, type=graph.STRING,
+                )
+                next_link += 2
+            else:
+                while not widgets:
+                    widgets.append("")
+                widgets[0] = folder + "/" + str(original or "audio")
+        else:
+            raise RuntimeError(f"Unsupported workbench output node: {node.type}")
+        node.data["widgets_values"] = widgets
+    return dynamic_folders
+
+
+class WorkbenchPublishError(RuntimeError):
+    def __init__(self, message: str, node_id: str, outputs: list[dict[str, Any]]):
+        super().__init__(message)
+        self.node_id = node_id
+        self.outputs = outputs
+
+
+def _emit_workflow_failure(task_id: str, exc: Exception) -> int:
+    if isinstance(exc, WorkbenchPublishError):
+        emit("error", {"code": "WORKFLOW_RUN_FAILED", "message": str(exc), "detail": traceback.format_exc(),
+                       "nodeId": exc.node_id, "outputs": exc.outputs,
+                       "files": [item["path"] for item in exc.outputs]}, task_id=task_id)
+        return 1
+    return emit_error("WORKFLOW_RUN_FAILED", str(exc), traceback.format_exc(), task_id=task_id)
+
+
+def _publish_workbench_outputs(saved_paths: list[str], records: list[Any | None],
+                               metadata: list[dict[str, str]], targets: dict[str, str], root: Path,
+                               dynamic_folders: dict[str, str] | None = None) -> list[str]:
+    if len(records) != len(saved_paths) or any(record is None for record in records):
+        raise RuntimeError("Workflow output records are required for node directory routing")
+    names = {item["node_id"]: item.get("filename", "") for item in metadata}
+    resolved_root = root.resolve()
+    sources = [Path(path).resolve() for path in saved_paths]
+    if len(set(sources)) != len(sources) or any(not source.is_relative_to(resolved_root) or not source.is_file() for source in sources):
+        raise RuntimeError("Workflow returned an invalid or duplicate private output")
+    destinations = []
+    for record in records:
+        node_id = str(record.node_id)
+        directory = targets.get(node_id)
+        if not directory:
+            raise RuntimeError(f"Missing output binding for node: {node_id}")
+        destinations.append(Path(_normalize_output_dir(directory)))
+    finalized = []
+    published: list[dict[str, Any]] = []
+    for source, record, target in zip(sources, records, destinations):
+        staging_folder = (dynamic_folders or {}).get(str(record.node_id))
+        if staging_folder and source.parent.name.startswith(staging_folder + "_"):
+            relative_folder = source.parent.name[len(staging_folder) + 1:]
+            if relative_folder and relative_folder not in {".", ".."}:
+                target = target / relative_folder
+        filename = names.get(str(record.node_id)) or source.name
+        try:
+            files = _finalize_simple_output_paths([str(source)], [{"filename": filename}], target, source_root=root)
+        except Exception as exc:
+            raise WorkbenchPublishError(str(exc), str(record.node_id), published) from exc
+        finalized.extend(files)
+        published.extend({"nodeId": str(record.node_id), "path": path, "stem": record.stem or Path(path).stem} for path in files)
+    return finalized
 
 
 def _workflow_task_output_dir(output_dir: str, input_path: str, output_layout: str) -> Path:
@@ -1000,8 +1137,19 @@ def _finalize_ensemble_output(saved: Any, *, payload: dict[str, Any], input_path
     }
 
 
-def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
-               inputs: dict[str, str] | None, output_dir: str, output_layout: str) -> dict[str, Any]:
+def _workflow_separator_factory(**kwargs: Any) -> Any:
+    from worker_infer import _studio_separator_type
+
+    separator_type = _studio_separator_type()
+    model_path = kwargs.pop("model_path", None)
+    if model_path:
+        kwargs.pop("model_dir", None)
+        return separator_type(model_path=model_path, **kwargs)
+    model_name = kwargs.pop("model_name")
+    return separator_type.from_model_name(model_name, **kwargs)
+
+
+def _workflow_graph() -> Any:
     try:
         import pymss.graph as graph
     except (ImportError, ModuleNotFoundError) as exc:
@@ -1010,6 +1158,13 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         ) from exc
     if getattr(graph, "PROGRESS_EVENT_VERSION", 0) < 1:
         raise RuntimeError("This pymss runtime does not support structured workflow progress. Update the runtime core in Settings and retry.")
+    return graph
+
+
+def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
+               inputs: dict[str, str] | None, output_dir: str, output_layout: str,
+               *, separator_cache: Any = None) -> dict[str, Any]:
+    graph = _workflow_graph()
 
     # Activate marketplace plugins so plugin-contributed graph node types are
     # registered (graph node registry and plugin nodes share one pool). Readers
@@ -1022,11 +1177,16 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         import sys
         print(f"[workflow] plugin nodes unavailable: {exc}", file=sys.stderr)
 
-    runtime_payload, runtime_inputs = _prepare_legacy_global_input(payload, input_path, inputs)
+    workbench = payload.get("workbench") is True
+    output_targets = _normalize_inputs(payload.get("workbenchOutputs")) if workbench else {}
+    if workbench:
+        runtime_payload, runtime_inputs = payload, dict(inputs or {})
+    else:
+        runtime_payload, runtime_inputs = _prepare_legacy_global_input(payload, input_path, inputs)
     primary = input_path or (list(runtime_inputs.values())[0] if runtime_inputs else "")
     workflow_definition = runtime_payload.get("workflow")
     simple_definition = workflow_definition if isinstance(workflow_definition, dict) and "steps" in workflow_definition else None
-    ensemble_stem = _ensemble_output_stem(workflow_definition)
+    ensemble_stem = None if workbench else _ensemble_output_stem(workflow_definition)
     started_at = datetime.now()
     if isinstance(workflow_definition, dict) and "steps" in workflow_definition:
         runtime_payload = {
@@ -1090,12 +1250,15 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         dag = graph.load_comfy_file(workflow_path)
 
     _apply_runtime_device(dag, payload, simple=simple_definition is not None)
+    dynamic_folders: dict[str, str] = {}
+    if workbench:
+        dynamic_folders = _prepare_workbench_outputs(dag, output_targets)
     task_output_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[str] = []
     output_records: list[Any | None] = []
     with ExitStack() as cleanup:
         graph_output_dir = task_output_dir
-        if simple_definition is not None:
+        if workbench or simple_definition is not None:
             # Never let pymss write a simple-workflow output directly into the
             # shared destination.  Publishing below atomically claims the
             # final filename, including when multiple workers finish together.
@@ -1109,13 +1272,26 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
                 prefix=".pymss-ensemble-", dir=task_output_dir,
             )))
         node_results: dict[int, Any] = {}
+        from worker_workflow_logs import workflow_logging
+
+        log_scope = cleanup.enter_context(workflow_logging(
+            task_id, batch=isinstance(payload.get("tasks"), list) and bool(payload["tasks"]),
+        ))
+        if separator_cache is None:
+            separator_cache = cleanup.enter_context(graph.SeparatorCache(factory=_workflow_separator_factory))
+        # Negotiate the optional kernel protocol once. Published runtimes retain
+        # their existing progress API; errors from the new API never trigger a retry.
+        callbacks = {"execution_event_callback": _emit_execution(task_id, log_scope)} \
+            if fmt != "yaml" and getattr(graph, "EXECUTION_EVENT_VERSION", 0) >= 1 \
+            else {"progress_event_callback": _emit_progress(task_id, log_scope)}
         saved = graph.run_dag(
             dag,
             output_dir=graph_output_dir,
             input_path=input_path,
             inputs=runtime_inputs or None,
             node_results=node_results,
-            progress_event_callback=_emit_progress(task_id),
+            **callbacks,
+            logger=log_scope.logger,
             device=_resolve_device(payload),
             model_dir=payload.get("modelDir") or None,
             download=bool(payload.get("downloadMethod") and payload.get("downloadMethod") != "never"),
@@ -1124,6 +1300,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             audio_params=payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else None,
             debug=bool(payload.get("debug")),
             strict=True,
+            separator_cache=separator_cache,
         )
         if ensemble_stem is not None:
             return _finalize_ensemble_output(
@@ -1135,7 +1312,11 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         record_map = {Path(r.path).resolve(): r for r in records if getattr(r, "path", None)}
         output_records = [record_map.get(Path(path).resolve()) for path in original_saved_paths]
         saved_paths = original_saved_paths
-        if fmt == "yaml" and simple_definition is not None:
+        if workbench:
+            saved_paths = _publish_workbench_outputs(
+                original_saved_paths, output_records, simple_output_metadata, output_targets, graph_output_dir, dynamic_folders,
+            )
+        elif fmt == "yaml" and simple_definition is not None:
             if simple_output_metadata:
                 simple_output_metadata = _match_simple_output_metadata(output_records, simple_output_metadata)
             saved_paths = _finalize_simple_output_paths(
@@ -1148,18 +1329,23 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
     output_stems = [item["stem"] for item in simple_output_metadata] \
         if len(simple_output_metadata) == len(saved_paths) else []
     outputs: list[dict[str, Any]] = []
+    named_outputs = {item["node_id"]: item for item in simple_output_metadata} if workbench else {}
     for index, path in enumerate(saved_paths):
         rec = output_records[index] if index < len(output_records) else None
         stem = output_stems[index] if index < len(output_stems) else ""
+        if workbench:
+            stem = str(named_outputs.get(str(rec.node_id) if rec else "", {}).get("stem") or "")
         if not stem and rec and rec.stem:
             stem = rec.stem
         if not stem:
-            stem = _workflow_output_stem(path, primary)
+            stem = _workflow_output_stem(str(rec.path) if workbench and rec else path, primary)
         item: dict[str, Any] = {
             "stem": stem,
             "path": path,
             "name": Path(path.replace("\\", "/")).name,
         }
+        if workbench and rec:
+            item["nodeId"] = str(rec.node_id)
         if rec and rec.sample_rate:
             item["sampleRate"] = rec.sample_rate
         outputs.append(item)
@@ -1188,7 +1374,8 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
     result_payload = {
         "files": saved_paths,
         "outputs": outputs,
-        "outputDir": str(task_output_dir.resolve()),
+        "outputDir": str(Path(saved_paths[0]).parent.resolve()) if workbench and saved_paths else str(task_output_dir.resolve()),
+        **({"outputDirectories": sorted({str(Path(path).parent.resolve()) for path in saved_paths})} if workbench else {}),
         "outputFormat": output_format,
     }
     if node_values:
@@ -1228,10 +1415,10 @@ def cmd_infer_workflow(payload: dict[str, Any]) -> int:
         result = _run_pymss(payload, task_id, input_path=input_path or None, inputs=inputs or None,
                             output_dir=output_dir, output_layout=output_layout)
         emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
-        emit("task_done", result, task_id=task_id)
+        emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
         return 0
     except Exception as exc:
-        return emit_error("WORKFLOW_RUN_FAILED", str(exc), traceback.format_exc(), task_id=task_id)
+        return _emit_workflow_failure(task_id, exc)
     finally:
         _cleanup_workflow_file(task_id)
 
@@ -1248,7 +1435,19 @@ def _cmd_infer_workflow_batch(payload: dict[str, Any], raw_tasks: list[Any]) -> 
         return emit_error("WORKFLOW_TASK_ID_MISSING", "Workflow task id is required")
 
     failed = False
+    batch_cleanup = ExitStack()
     try:
+        definition = payload.get("workflow")
+        separator_cache = None
+        if isinstance(definition, dict) and "steps" in definition:
+            # Match pymss' workflow batch runner: reuse the bounded native cache
+            # across files, and release it when the batch finishes. Limit the
+            # cache to one separator so different models do not accumulate
+            # in GPU memory. Advanced graphs retain their native per-run scope.
+            graph = _workflow_graph()
+            separator_cache = batch_cleanup.enter_context(graph.SeparatorCache(
+                factory=_workflow_separator_factory, max_entries=1,
+            ))
         for input_index, item in enumerate(raw_tasks, 1):
             if not isinstance(item, dict):
                 continue
@@ -1269,15 +1468,19 @@ def _cmd_infer_workflow_batch(payload: dict[str, Any], raw_tasks: list[Any]) -> 
             }, task_id=task_id)
             emit("task_stage", {"stage": "validating_input", "message": "Validating workflow input", "progress": 12}, task_id=task_id)
             try:
-                result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index)}, task_id,
-                                    input_path=input_path or None,
-                                    inputs=item_inputs or None,
-                                    output_dir=output_dir, output_layout=output_layout)
-                emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
-                emit("task_done", result, task_id=task_id)
+                with task_logging(task_id):
+                    result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index),
+                                        **({"workbenchOutputs": item.get("workbenchOutputs", payload.get("workbenchOutputs"))}
+                                           if payload.get("workbench") is True else {})}, task_id,
+                                        input_path=input_path or None,
+                                        inputs=item_inputs or None,
+                                        output_dir=output_dir, output_layout=output_layout,
+                                        **({"separator_cache": separator_cache} if separator_cache is not None else {}))
+                    emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
+                    emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
             except Exception as exc:
                 failed = True
-                emit_error("WORKFLOW_RUN_FAILED", str(exc), traceback.format_exc(), task_id=task_id)
+                _emit_workflow_failure(task_id, exc)
             finally:
                 _cleanup_workflow_file(task_id)
         return 1 if failed else 0
@@ -1287,3 +1490,5 @@ def _cmd_infer_workflow_batch(payload: dict[str, Any], raw_tasks: list[Any]) -> 
             if isinstance(item, dict):
                 emit_error("WORKFLOW_RUN_FAILED", str(exc), detail, task_id=str(item.get("taskId") or ""))
         return 1
+    finally:
+        batch_cleanup.close()

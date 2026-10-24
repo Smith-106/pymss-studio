@@ -79,7 +79,7 @@ Choose a version on [GitHub Releases](https://github.com/pymss-project/pymss-stu
 | Linux | Build from source | The current release workflow does not produce Linux installers; see development prerequisites below. |
 | Intel Mac | No dedicated release package | The existing MLX package targets Apple Silicon; source builds still require checking inference dependency compatibility. |
 
-Release packages include a bootstrap Python runtime, so end users do not need to install system Python separately. Open **Settings → Runtime** to inspect, install, or switch environments supported by your platform.
+Release packages include Python, so end users do not need to install system Python separately. The macOS DMG includes the fixed Python, PyTorch, MLX, and bundled core packages; first launch does not download another Python environment. Open **Settings → Runtime** to inspect the active runtime and update its core. Installing, switching, reinstalling, or deleting an entire environment in the application is available only on Windows.
 
 ### File types
 
@@ -105,7 +105,7 @@ xattr -cr '/Applications/Pymss Studio.app'
 4. **Run and review.** Select **Start Separation**, monitor progress and logs in the task queue, and audition the finished stems or open **Results**.
 5. **Edit and export.** Open a result in the stem editor, adjust clips, volume, pan, and effects, save the project, and use **Export Mix** to create an audio file.
 
-For a repeatable processing chain, create and save a workflow under **Workflows**, then switch **Separate** to **Workflow** mode. A short input can help confirm the model, device, and outputs before a larger batch.
+For a repeatable processing chain, open or create a workflow under **Workflows** in a separate editor window, choose files or a folder on its input nodes and directories on its output nodes, then save and run directly in the editor. Follow node progress on the canvas; edits made during execution apply to the next run. A short input can help confirm the model, device, and outputs before a larger batch.
 
 ## Preview
 
@@ -149,7 +149,7 @@ Open **Tools** to use these utilities independently of the separation workflow.
 | Audio slicing | Analyze silence and export clips, with minimum-length, threshold, and boundary-silence settings. |
 | Audio merging | Order a directory's files by name, modification time, or a regular expression, then export a WAV with consistent audio settings. |
 
-The optional FunASR component installs on demand; ASR models download and cache on first use. Download a model archive from the [GAME release](https://github.com/openvpi/GAME/releases/tag/v1.0.0) linked in the MIDI tool. **Keep the complete extracted directory: `model.pt` requires `config.yaml` beside it, and language-conditioned models also require `lang_map.json`.** Do not move the weights alone. Language, output, and parameter options depend on the selected tool and model.
+The optional FunASR component installs on demand; ASR models download and cache on first use. The ASR tool is currently unavailable on macOS. Download a model archive from the [GAME release](https://github.com/openvpi/GAME/releases/tag/v1.0.0) linked in the MIDI tool. **Keep the complete extracted directory: `model.pt` requires `config.yaml` beside it, and language-conditioned models also require `lang_map.json`.** Do not move the weights alone. Language, output, and parameter options depend on the selected tool and model.
 
 ## Plugin marketplace
 
@@ -174,15 +174,19 @@ Settings, models, outputs, projects, logs, and temporary files share a data root
 | Windows portable package with a `pymss-studio.portable` marker beside the executable | `data/` beside the executable. |
 | Regular installed / other release packages | `.pymss-studio/` in the user directory, such as `%USERPROFILE%\.pymss-studio` on Windows. |
 
-The root defaults to `settings/`, `models/`, `outputs/`, `editor-projects/`, `logs/`, and `temp/`. Inference environments are managed separately: Windows / Linux generally use the installation resources' `python-runtime/runtime-envs/`; user-installed macOS environments use `runtime-envs/` under the data root.
+The root defaults to `settings/`, `models/`, `outputs/`, `editor-projects/`, `logs/`, and `temp/`. On macOS and Linux, writable runtime state is stored in `runtime-envs/` under this root: `active-runtime.json` selects the current core, `.overlays/` contains core updates and their dependencies, and `optional-packages/` contains separately installed components. On Windows, these paths remain under the selected runtime root's `runtime-envs/`, generally in `python-runtime/runtime-envs/` beside the installation resources. The macOS base Python environment stays inside the application bundle.
 
 **Editor projects reference audio files by path.** Back up the associated audio as well as the project. Relink missing assets in the editor after moving or deleting original outputs. Use the application's migration workflow when changing the model directory.
 
 ### Updates and environment management
 
-Open **Settings → About** for version and update information. Official Windows builds that support in-app updates can check and install updates there. Use the release page for other platforms or builds without automatic update support.
+Open **Settings → About** for version and update information. Windows and macOS builds whose release channel supports in-app updates can check and install updates there. Use the release page for builds without automatic update support. On macOS, an application update replaces the entire `.app`, preserving user data; administrator authorization is requested if write permissions are insufficient. Move the app to `/Applications` before updating: updates are blocked from a read-only DMG or App Translocation location. A change to the fixed base runtime contract requires a manual installation.
 
-Application updates and Python inference environment management are separate operations. Use **Settings → Runtime** to switch or maintain CPU / GPU environments. Dependency combinations are defined in [`python/runtime-manifest.json`](./python/runtime-manifest.json); avoid mixing unrelated Torch or backend versions into the bundled environments.
+Use **Settings → Runtime** to update `pymss`, `pymss-core`, and their compatible dependencies independently of the desktop application. Review the prepared version and dependency plan before confirming. Packages are installed into a new core overlay and activated only after validation; a compatible previous core can be restored when available. Updates that require replacing fixed accelerator components are rejected, preserving the active runtime. Dependency combinations are defined in [`python/runtime-manifest.json`](./python/runtime-manifest.json).
+
+Optional components such as FunASR use their own directories, separate from core overlays. Installation checks compatibility with the current PyTorch version and accelerator backend. On Windows and Linux, uninstalling FunASR removes its separate component directory and any copy installed directly in the active environment; downloaded models are kept. On macOS, component operations preserve packages in the bundled base runtime; the ASR tool remains unavailable. Pip and Numba caches are stored under the data root's `temp/` directory.
+
+On macOS, deleting `Pymss Studio.app` removes the application and bundled runtime while retaining the user data root, including settings, models, outputs, and core overlays. Removing and reinstalling the app therefore reuses retained data. Custom model/output directories and `.pymss-studio-previous-*.app` update backups beside the application must be managed separately.
 
 ## Troubleshooting
 
@@ -195,6 +199,24 @@ Application updates and Python inference environment management are separate ope
 | ASR or MIDI cannot start | Check FunASR installation and ASR model source. For GAME, use the complete extracted directory and check for `config.yaml` and, where needed, `lang_map.json` beside the weights. |
 | Missing project assets | Check whether audio files moved or were deleted, relink them in the editor, and save the project again. |
 | Update fails or a new version behaves unexpectedly | Record version, package type, and errors; read the release notes. Back up projects and settings before manually installing a complete package. |
+
+With developer mode enabled, open **Diagnostics → Logs** to filter by source, level, or task. Studio, Worker, pymss, and external tools have separate source badges. Warnings and errors are highlighted, with expandable tracebacks, code locations, and context. Task, workflow node, download, and installation logs use the same presentation.
+
+Launching the application from a command prompt or terminal also produces readable console logs. Supported terminals use colors for levels and sources; redirected output and `NO_COLOR` omit color codes. Application log files contain one JSON record per line, while historical text in cumulative logs remains readable without conversion.
+
+**Diagnostics → Generate diagnostic report** writes `latest-diagnostic-report.md` with build/session details, recent page and tool visits, operation requests and outcomes, separation parameters, workflow batch/node correlations, task history and graph summaries, editor project/export summaries, model downloads, cached runtime probes, and update events. Requests are captured before validation or worker startup, preserving the selected feature and parameters when an environment is missing or process creation fails.
+
+The report distinguishes observations from this process and saved snapshots, including their observation/save times. Generation does not rerun environment probes or scan media files. It retains at most 24 recent operations and 12 historical tasks, prioritizing active and failed tasks; fields, collections, store reads, and report sections have explicit limits and omission/unavailability notes. Request and configuration summaries use allow-lists and omit transcript text, audio contents, arbitrary graph text, and proxy addresses. Errors and log tails can still contain custom names and paths; review them before sharing.
+
+Automatic error reports coalesce errors within a five-second interval and write the latest error and traceback afterward. Pending errors are flushed before normal application exit. Clearing logs cancels older pending reports.
+
+If no window appears at startup, exit any existing Pymss Studio process, open CMD in the installation directory, and enable verbose logging before the interface loads:
+
+```cmd
+start "" /b /wait "Pymss Studio.exe" --debug
+```
+
+To save console output, run `start "" /b /wait "Pymss Studio.exe" --debug > "%TEMP%\pymss-startup.log" 2>&1`. The flag enables verbose Studio and Worker logs for this process without changing the saved developer mode setting. A subsequent launch without the flag uses the original logging level. Exit an existing process before relaunching with the flag. On macOS and Linux, pass `--debug` directly to the application executable.
 
 For unresolved issues, include application version and package type, OS version, GPU model, separation model, reproduction steps, and relevant log excerpts in [GitHub Issues](https://github.com/pymss-project/pymss-studio/issues). Remove personal paths, proxy credentials, and other sensitive information from logs before sharing.
 
@@ -212,7 +234,7 @@ cd pymss-studio
 pnpm install --frozen-lockfile
 ```
 
-For a first full desktop development session, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. These commands prepare the bootstrap interpreter; the application installs Python inference dependencies according to its runtime manifest. Download model weights separately in the model library.
+For a first full desktop development session on Windows, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. The commands below prepare only the bootstrap interpreter. On macOS and Linux, prepare a compatible inference runtime separately or reuse a prepared bundled runtime; in-app installation of an entire environment is unavailable. Download model weights separately in the model library.
 
 Windows PowerShell:
 

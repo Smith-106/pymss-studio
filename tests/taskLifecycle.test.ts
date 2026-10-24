@@ -4,6 +4,7 @@ import {
   isInterruptedTaskStatus,
   resolveJobStatus,
   selectQueuedJobGroups,
+  sortJobTasks,
   type TaskLifecycleItem,
   type TaskStatus,
 } from '../src/features/tasks/lifecycle.ts'
@@ -38,6 +39,17 @@ describe('task job lifecycle', () => {
 })
 
 describe('Worker-slot queue selection', () => {
+  it('uses batch order despite clock changes and keeps stored tasks unchanged', () => {
+    const tasks: TaskLifecycleItem[] = [
+      { ...task('second', 'done', 'batch', 10), batchIndex: 1 },
+      { ...task('first', 'done', 'batch', 20), batchIndex: 0 },
+    ]
+    assert.deepEqual(sortJobTasks(tasks).map(item => item.id), ['first', 'second'])
+    assert.deepEqual(tasks.map(item => item.id), ['second', 'first'])
+    delete tasks[0].batchIndex
+    assert.deepEqual(sortJobTasks(tasks).map(item => item.id), ['second', 'first'])
+  })
+
   it('counts a multi-task batch as one active Worker', () => {
     const tasks = [
       task('active-a', 'separating', 'active', 1),
@@ -63,6 +75,40 @@ describe('Worker-slot queue selection', () => {
     assert.deepEqual(selectQueuedJobGroups(tasks, 2).map(group => group.map(item => item.id)), [
       ['batch-a', 'batch-b'],
       ['single'],
+    ])
+  })
+
+  it('uses explicit source order for tasks created in the same millisecond', () => {
+    const tasks: TaskLifecycleItem[] = [
+      { id: 'third', jobId: 'batch', batchIndex: 2, createdAt: 1, status: 'queued' },
+      { id: 'second', jobId: 'batch', batchIndex: 1, createdAt: 1, status: 'queued' },
+      { id: 'first', jobId: 'batch', batchIndex: 0, createdAt: 1, status: 'queued' },
+    ]
+    assert.deepEqual(selectQueuedJobGroups(tasks, 1).map(group => group.map(item => item.id)), [
+      ['first', 'second', 'third'],
+    ])
+  })
+
+  it('keeps jobs FIFO before sorting the complete batch internally', () => {
+    const tasks: TaskLifecycleItem[] = [
+      { id: 'newer-second', jobId: 'newer', batchIndex: 1, createdAt: 20, status: 'queued' },
+      { id: 'older-second', jobId: 'older', batchIndex: 1, createdAt: 10, status: 'queued' },
+      { id: 'newer-first', jobId: 'newer', batchIndex: 0, createdAt: 20, status: 'queued' },
+      { id: 'older-first', jobId: 'older', batchIndex: 0, createdAt: 10, status: 'queued' },
+    ]
+    assert.deepEqual(selectQueuedJobGroups(tasks, 2).map(group => group.map(item => item.id)), [
+      ['older-first', 'older-second'],
+      ['newer-first', 'newer-second'],
+    ])
+  })
+
+  it('keeps legacy partial batch metadata in stable creation order', () => {
+    const tasks: TaskLifecycleItem[] = [
+      { id: 'legacy-first', jobId: 'legacy', createdAt: 1, status: 'queued' },
+      { id: 'newer-indexed', jobId: 'legacy', batchIndex: 0, createdAt: 2, status: 'queued' },
+    ]
+    assert.deepEqual(selectQueuedJobGroups(tasks, 1).map(group => group.map(item => item.id)), [
+      ['legacy-first', 'newer-indexed'],
     ])
   })
 

@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { createLogger } from '@/utils/logger'
+import { hasEditorEffects, prepareEditorExportEffects } from '@/utils/editorRender'
+import { computed, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import i18n, { getCurrentLocale } from '@/i18n'
@@ -23,6 +25,8 @@ import type {
   EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
+
+const studioLog = createLogger('ui.stores.editor')
 
 export type {
   EditorExportFormat,
@@ -135,6 +139,7 @@ type PendingEditorExport = {
   id: string
   projectId: string
   exportDir?: string
+  progressOffset?: number
   resolve: (result: ExportResult) => void
   reject: (error: Error) => void
 }
@@ -592,6 +597,7 @@ export const useEditorStore = defineStore('editor', () => {
   let exportListenerPromise: Promise<void> | null = null
   let exportStartPromise: Promise<void> | null = null
   let exportCancelRequested = false
+  let exportRenderController: AbortController | null = null
   let exportRequestSequence = 0
 
   const canUndo = computed(() => undoStack.value.length > 0)
@@ -1091,6 +1097,11 @@ export const useEditorStore = defineStore('editor', () => {
     return invoke<AudioMetadata>('get_audio_metadata', { payload: { path } })
   }
 
+  function hasUsableAudioMetadata(metadata: AudioMetadata | EditorSource | null | undefined) {
+    return Boolean(metadata && [metadata.duration, metadata.sampleRate, metadata.channels]
+      .every((value) => Number.isFinite(value) && value > 0))
+  }
+
   async function ensurePeaks(sourceId: string) {
     if (!session.value) return null
     const source = session.value.sources.find((item) => item.id === sourceId)
@@ -1285,17 +1296,16 @@ export const useEditorStore = defineStore('editor', () => {
 
   async function ensureSourceByPath(path: string, options?: Partial<EditorSource>) {
     if (!session.value) throw new Error('Editor session is not loaded')
+    const targetSession = session.value
     const normalized = normalizePathKey(path)
     const existing = session.value.sources.find((source) => normalizePathKey(source.path) === normalized)
     if (existing) return existing
 
-    const metadata = await getMetadata(path).catch(() => ({
-      path,
-      name: fileName(path),
-      duration: 0,
-      sampleRate: 0,
-      channels: 0,
-    }))
+    const metadata = await getMetadata(path)
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    if (!hasUsableAudioMetadata(metadata)) throw new Error(String(i18n.global.t('editor.assetMetadataInvalid')))
+    const concurrentSource = targetSession.sources.find((source) => normalizePathKey(source.path) === normalized)
+    if (concurrentSource) return concurrentSource
     const source: EditorSource = {
       id: makeId('source'),
       role: 'reference',
@@ -1443,24 +1453,67 @@ export const useEditorStore = defineStore('editor', () => {
     return source
   }
 
-  async function scanAssets(paths: string[]) {
+  async function scanAssets(paths: string[], options?: { addTracks?: boolean }) {
     if (!session.value) throw new Error('Editor session is not loaded')
+    const targetSession = session.value
     const imported = await invoke<ImportEditorAssetsResult>('import_editor_assets', {
-      projectId: session.value.id,
+      projectId: targetSession.id,
       paths,
     })
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    const sourcePaths = new Map<string, string>()
+    const warnings = [...(imported.warnings || [])]
     for (const asset of imported.files || []) {
-      await ensureSourceByPath(asset.path, {
-        originKind: asset.originKind,
-        originRoot: asset.originRoot || null,
-        relativePath: asset.relativePath || fileName(asset.path),
-        missing: asset.missing,
+      if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+      try {
+        const source = await ensureSourceByPath(asset.path, {
+          originKind: asset.originKind,
+          originRoot: asset.originRoot || null,
+          relativePath: asset.relativePath || fileName(asset.path),
+          missing: asset.missing,
+        })
+        if (source.missing || !hasUsableAudioMetadata(source)) {
+          throw new Error(String(i18n.global.t('editor.assetMetadataInvalid')))
+        }
+        if (!sourcePaths.has(source.id)) sourcePaths.set(source.id, asset.path)
+      } catch (error) {
+        if (session.value !== targetSession) throw error
+        const detail = error instanceof Error ? error.message : String(error)
+        warnings.push(String(i18n.global.t('editor.assetImportFailed', { name: fileName(asset.path), detail })))
+      }
+    }
+    // Metadata can finish while a slider or clip is being dragged. Keep the
+    // imported tracks in their own undo action after that interaction ends.
+    while (options?.addTracks && sourcePaths.size && interactionDepth.value > 0 && session.value === targetSession) {
+      await new Promise<void>((resolve) => {
+        const stop = watch([interactionDepth, session], () => {
+          if (interactionDepth.value > 0 && session.value === targetSession) return
+          stop()
+          resolve()
+        }, { flush: 'sync' })
       })
+    }
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    const currentSources = new Map(targetSession.sources.map((source) => [source.id, source]))
+    for (const [sourceId, path] of sourcePaths) {
+      const source = currentSources.get(sourceId)
+      if (source && !source.missing && hasUsableAudioMetadata(source)) continue
+      sourcePaths.delete(sourceId)
+      const detail = String(i18n.global.t(source ? 'editor.assetMetadataInvalid' : 'editor.assetRemovedDuringImport'))
+      warnings.push(String(i18n.global.t('editor.assetImportFailed', { name: fileName(path), detail })))
+    }
+    if (options?.addTracks && sourcePaths.size) {
+      beginInteraction()
+      try {
+        for (const sourceId of sourcePaths.keys()) addTrackFromSourceId(sourceId)
+      } finally {
+        commitInteraction()
+      }
     }
     await saveProject()
     return {
-      files: (imported.files || []).map((asset) => asset.path),
-      warnings: imported.warnings || [],
+      files: [...sourcePaths.values()],
+      warnings,
     } satisfies ScanAudioPathsResult
   }
 
@@ -1708,10 +1761,13 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (workerEvent.type === 'editor_export_progress') {
           const payload = workerEvent.payload || {}
+          const total = Math.max(1, Number(payload.total || 100))
+          const completed = Math.max(0, Number(payload.completed || 0))
+          const offset = pending.progressOffset || 0
           exportProgress.value = {
             phase: String(payload.phase || 'preparing') as EditorExportProgress['phase'],
-            completed: Math.max(0, Number(payload.completed || 0)),
-            total: Math.max(1, Number(payload.total || 100)),
+            completed: offset ? offset + Math.min(1, completed / total) * (100 - offset) : completed,
+            total: offset ? 100 : total,
             current: String(payload.current || ''),
           }
           return
@@ -1731,7 +1787,10 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (workerEvent.type === 'error') {
           pendingExport = null
-          pending.reject(new Error(String(workerEvent.payload?.message || 'Editor export failed')))
+          const message = workerEvent.payload?.code === 'EDITOR_EXPORT_PEAK_EXCEEDED'
+            ? String(i18n.global.t('editor.exportPeakExceeded'))
+            : String(workerEvent.payload?.message || 'Editor export failed')
+          pending.reject(new Error(message))
         }
       }).then((unlisten) => {
         exportUnlisten = unlisten
@@ -1751,6 +1810,10 @@ export const useEditorStore = defineStore('editor', () => {
       : (options || {})
     const fmt = normalized.format || exportFormat.value
     const taskId = `editor_export_${Date.now().toString(36)}_${++exportRequestSequence}_${Math.random().toString(36).slice(2, 8)}`
+    const snapshot = JSON.parse(JSON.stringify(session.value)) as EditorSession
+    const renderController = new AbortController()
+    exportRenderController = renderController
+    const renderRequired = snapshot.tracks.some(track => hasEditorEffects(track.effects))
     exporting.value = true
     exportCancelling.value = false
     exportCancelRequested = false
@@ -1759,11 +1822,18 @@ export const useEditorStore = defineStore('editor', () => {
     try {
       await ensureEditorExportListener()
       if (exportCancelRequested) throw new EditorExportCancelledError()
+      const prepared = await prepareEditorExportEffects(snapshot, taskId, renderController.signal, (ratio, current) => {
+        exportProgress.value = { phase: 'rendering', completed: Math.floor(ratio * 75), total: 100, current }
+      })
+      exportRenderController = null
+      if (exportCancelRequested) throw new EditorExportCancelledError()
+      const project = prepared.session
       const completion = new Promise<ExportResult>((resolve, reject) => {
         pendingExport = {
           id: taskId,
-          projectId: session.value!.id,
+          projectId: snapshot.id,
           exportDir: normalized.exportDir,
+          progressOffset: prepared.session !== snapshot ? 75 : 0,
           resolve,
           reject,
         }
@@ -1776,12 +1846,13 @@ export const useEditorStore = defineStore('editor', () => {
           fileName: normalized.fileName,
           audioParams: normalized.audioParams || {},
           project: {
-            id: session.value.id,
-            name: session.value.name,
-            masterVolume: session.value.masterVolume,
-            masterPan: session.value.masterPan,
-            assets: session.value.sources.map(sourceToExportAsset),
-            tracks: session.value.tracks.map((track) => trackToExportTrack(track, sourceMap.value.get(track.sourceId))),
+            id: project.id,
+            name: project.name,
+            masterVolume: project.masterVolume,
+            masterPan: project.masterPan,
+            sourceSampleRate: prepared.sourceSampleRate,
+            assets: project.sources.map(sourceToExportAsset),
+            tracks: project.tracks.map((track) => trackToExportTrack(track, project.sources.find(source => source.id === track.sourceId))),
           },
         },
       }).then(() => undefined)
@@ -1792,16 +1863,23 @@ export const useEditorStore = defineStore('editor', () => {
       return result
     } catch (error) {
       if (pendingExport?.id === taskId) pendingExport = null
-      lastError.value = error instanceof EditorExportCancelledError
+      const failure = renderController.signal.aborted ? new EditorExportCancelledError() : error
+      lastError.value = failure instanceof EditorExportCancelledError
         ? null
-        : error instanceof Error ? error.message : String(error)
-      throw error
+        : failure instanceof Error ? failure.message : String(failure)
+      throw failure
     } finally {
+      if (renderRequired) {
+        await invoke('cleanup_editor_export_render', { projectId: snapshot.id, taskId }).catch(error => {
+          studioLog.warn('Failed to clean up editor render files', error)
+        })
+      }
       exporting.value = false
       exportCancelling.value = false
       exportProgress.value = null
       exportStartPromise = null
       exportCancelRequested = false
+      exportRenderController = null
     }
   }
 
@@ -1820,6 +1898,10 @@ export const useEditorStore = defineStore('editor', () => {
     exportCancelling.value = true
     exportCancelRequested = true
     try {
+      if (exportRenderController) {
+        exportRenderController.abort()
+        return true
+      }
       if (exportStartPromise) await exportStartPromise
       if (!pendingExport) return true
       return cancelPendingExportTask(pendingExport)

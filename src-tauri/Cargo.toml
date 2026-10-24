@@ -15,8 +15,10 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-store = "2"
 reqwest = { version = "0.13", default-features = false, features = ["socks", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 trash = "5"
 url = "2"
@@ -25,12 +27,25 @@ base64 = "0.22"
 minisign-verify = "0.2"
 semver = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+rustfft = "6.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
 
 # Keep line-level debugging for application code while avoiding oversized MSVC
 # program databases generated from the complete Tauri dependency graph.

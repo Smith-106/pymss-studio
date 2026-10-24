@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from worker_protocol import debug_log, emit_error, load_payload
+from worker_protocol import debug_log, emit_error, load_payload, protocol_logging
 from worker_proxy import ProxyConfigError, configure_process_proxy, load_proxy_config, parse_proxy_config
 
 
@@ -163,7 +163,13 @@ def main(argv: list[str]) -> int:
     try:
         payload = load_payload(args.payload)
         debug_log("worker.payload", command=args.command, hasPayload=bool(args.payload))
-        code = run_command(args.command, payload)
+        with protocol_logging(
+            args.command,
+            task_id=payload.get("taskId"),
+            job_id=payload.get("jobId"),
+            batch=isinstance(payload.get("tasks"), list) and bool(payload["tasks"]),
+        ):
+            code = run_command(args.command, payload)
         debug_log("worker.exit", command=args.command, code=code)
         return code
     except ProxyConfigError as exc:

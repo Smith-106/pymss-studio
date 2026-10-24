@@ -2,9 +2,8 @@
 
 Each active backend gets a writable sidecar under the application data directory. Pip first
 resolves against the active environment, then installs only the missing distributions into the
-sidecar so platform-specific packages such as PyTorch are neither replaced nor duplicated. A
-package already supplied directly by the selected runtime is uninstalled through that runtime's
-interpreter rather than through the bootstrap environment.
+sidecar so platform-specific packages such as PyTorch are neither replaced nor duplicated.
+The macOS base runtime remains immutable, including when a component is uninstalled.
 """
 
 from __future__ import annotations
@@ -81,6 +80,9 @@ def _runtime_envs_dir() -> Path:
     configured = str(os.environ.get("PYMSS_STUDIO_RUNTIME_ENVS_DIR") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
+    if sys.platform == "darwin":
+        data_root = str(os.environ.get("PYMSS_STUDIO_DATA_ROOT") or "").strip()
+        return (Path(data_root).expanduser() if data_root else Path.home() / ".pymss-studio") / "runtime-envs"
     executable = Path(sys.executable).resolve()
     env_dir = executable.parent.parent if executable.parent.name.lower() in {"scripts", "bin"} else executable.parent
     return env_dir.parent
@@ -98,25 +100,36 @@ def _runtime_identity(*, backend: str | None = None, executable: Path | None = N
 
 def _active_runtime_backend() -> str:
     active_file = str(os.environ.get("PYMSS_STUDIO_ACTIVE_RUNTIME_FILE") or "").strip()
-    backend = ""
-    if active_file:
+    candidates = [Path(active_file)] if active_file else []
+    bundled = str(os.environ.get("PYMSS_STUDIO_BUNDLED_RUNTIME_ENVS_DIR") or "").strip()
+    if bundled:
+        candidates.append(Path(bundled) / "active-runtime.json")
+    for file in candidates:
         try:
-            state = json.loads(Path(active_file).read_text(encoding="utf-8"))
+            state = json.loads(file.read_text(encoding="utf-8"))
             backend = str(state.get("backend") or "").strip().lower()
-        except Exception:
-            backend = ""
-    return backend
+            if backend:
+                return backend
+        except (OSError, ValueError, AttributeError):
+            continue
+    return ""
 
 
 def _runtime_context() -> RuntimeContext:
     executable = Path(sys.executable).resolve()
     backend = _active_runtime_backend()
     identity = _runtime_identity(backend=backend, executable=executable)
+    packages_root = _runtime_envs_dir() / "optional-packages"
+    # Older bundled installs had no user pointer until the first core update,
+    # so components used the executable identity instead of the backend name.
+    legacy_identity = _runtime_identity(backend="", executable=executable)
+    if not (packages_root / identity).exists() and (packages_root / legacy_identity).is_dir():
+        identity = legacy_identity
     return RuntimeContext(
         executable=executable,
         backend=backend,
         identity=identity,
-        packages_dir=_runtime_envs_dir() / "optional-packages" / identity,
+        packages_dir=packages_root / identity,
     )
 
 
@@ -165,6 +178,8 @@ def _environment_version(name: str, runtime: RuntimeContext | None = None) -> st
     )
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
     try:
         output = subprocess.check_output(
             [str(runtime.executable), "-c", script],
@@ -215,6 +230,7 @@ def optional_package_status(name: Any, runtime: RuntimeContext | None = None) ->
         "present": bool(version),
         "version": version,
         "source": source,
+        "canUninstall": source == "managed" or (source == "environment" and sys.platform != "darwin"),
         "issue": issue,
         "runtimeIdentity": runtime.identity,
     }
@@ -231,6 +247,9 @@ def _run_process(
     environment: dict[str, str] | None = None,
     task_id: str | None = None,
 ) -> None:
+    environment = dict(os.environ if environment is None else environment)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -238,7 +257,7 @@ def _run_process(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=environment or os.environ.copy(),
+        env=environment,
     )
     assert process.stdout is not None
     recent: list[str] = []
@@ -258,6 +277,8 @@ def _run_process(
             process.kill()
         process.wait()
         raise
+    finally:
+        process.stdout.close()
     if process.wait() != 0:
         detail = recent[-1] if recent else f"pip exited with code {process.returncode}"
         raise RuntimeError(detail)
@@ -272,26 +293,40 @@ def _resolve_install_requirements(
     runtime: RuntimeContext | None = None,
 ) -> list[str]:
     runtime = runtime or _runtime_context()
-    _run_process(
-        [
-            str(runtime.executable),
-            "-m",
-            "pip",
+    torch_version = _environment_version("torch", runtime)
+    if not torch_version:
+        raise RuntimeError("The active runtime does not include PyTorch")
+    audio_version = torch_version.split("+", 1)[0]
+    constraints = report_path.with_suffix(".constraints.txt")
+    constraints.write_text(f"torch=={torch_version}\ntorchaudio=={audio_version}\n", encoding="utf-8")
+    try:
+        _run_process(
+            [
+                str(runtime.executable),
+                "-m",
+                "pip",
+                "install",
+                "--dry-run",
+                "--disable-pip-version-check",
+                "--prefer-binary",
+                "--constraint",
+                str(constraints),
+                "--report",
+                str(report_path),
+                "--index-url",
+                index_url,
+                requirement,
+            ],
+            name,
             "install",
-            "--dry-run",
-            "--disable-pip-version-check",
-            "--prefer-binary",
-            "--report",
-            str(report_path),
-            "--index-url",
-            index_url,
-            requirement,
-        ],
-        name,
-        "install",
-        task_id=task_id,
-    )
+            task_id=task_id,
+        )
+    finally:
+        constraints.unlink(missing_ok=True)
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    from pip._vendor.packaging.utils import canonicalize_name
+    from worker_bootstrap import _is_base_accelerator_package
+
     resolved: list[str] = []
     for item in report.get("install") or []:
         package_metadata = item.get("metadata") or {}
@@ -301,10 +336,19 @@ def _resolve_install_requirements(
             raise RuntimeError("pip returned an incomplete optional package resolution report")
         if not all(character.isalnum() or character in {"-", "_", "."} for character in package_name):
             raise RuntimeError(f"pip returned an invalid package name: {package_name}")
+        normalized_name = canonicalize_name(package_name)
+        if normalized_name == "torchaudio":
+            if version.split("+", 1)[0] != audio_version:
+                raise RuntimeError("The component requires a torchaudio version incompatible with the fixed runtime package torch.")
+            # The dedicated audio installer selects the wheel matching the
+            # captured Torch backend, rather than taking the PyPI build here.
+            continue
+        if _is_base_accelerator_package(normalized_name) or normalized_name in {"pymss", "pymss-core"}:
+            raise RuntimeError(f"The component requires changing the runtime package {package_name}. The base runtime was preserved.")
         resolved.append(f"{package_name}=={version}")
-    required_name = requirement.partition("==")[0].strip().lower().replace("_", "-")
+    required_name = canonicalize_name(requirement.partition("==")[0].strip())
     resolved_names = {
-        value.partition("==")[0].strip().lower().replace("_", "-")
+        canonicalize_name(value.partition("==")[0].strip())
         for value in resolved
     }
     if required_name not in resolved_names:
@@ -321,7 +365,7 @@ def _torchaudio_requirement(runtime: RuntimeContext | None = None) -> tuple[str,
         raise RuntimeError("The active runtime does not include PyTorch")
     version = torch_version.split("+", 1)[0]
     torchaudio_version = _environment_version("torchaudio", runtime)
-    if torchaudio_version and torchaudio_version.split("+", 1)[0] == version:
+    if torchaudio_version == torch_version:
         return None
     from worker_bootstrap import _manifest
     backend = runtime.backend
@@ -330,7 +374,8 @@ def _torchaudio_requirement(runtime: RuntimeContext | None = None) -> tuple[str,
         for requirement in torch_spec.get("requirements") or []:
             if "/torchaudio-" in str(requirement).lower():
                 return str(requirement), None
-        raise RuntimeError("The active ROCm runtime does not define a compatible torchaudio wheel")
+        if not torch_spec.get("indexUrl"):
+            raise RuntimeError("The active ROCm runtime does not define a compatible torchaudio wheel")
     return f"torchaudio=={version}", str(torch_spec.get("indexUrl") or "").strip() or None
 
 
@@ -437,7 +482,9 @@ def _uninstall_package(
     target = _package_dir(name, runtime)
     if target.is_dir():
         shutil.rmtree(target)
-    if _environment_version(name, runtime):
+    elif sys.platform == "darwin" and _environment_version(name, runtime):
+        raise RuntimeError("This component is supplied by the read-only base runtime and cannot be uninstalled. The runtime was preserved.")
+    if sys.platform != "darwin" and _environment_version(name, runtime):
         _run_process(
             [str(runtime.executable), "-m", "pip", "uninstall", "--yes", name],
             name,
@@ -527,7 +574,7 @@ def cmd_manage_optional_package(payload: dict[str, Any]) -> int:
         status = optional_package_status(name, runtime)
         if action == "install" and not status["installed"]:
             raise RuntimeError(f"{name} is still unavailable after installation")
-        if action == "uninstall" and status["present"]:
+        if action == "uninstall" and status["present"] and status["canUninstall"]:
             raise RuntimeError(f"{name} is still installed after uninstallation")
         emit("optional_package_status", status, task_id=task_id)
         return 0

@@ -4,10 +4,11 @@ import os
 import re
 import traceback
 from collections import deque
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from worker_audio import _apply_stereo_pan, _equal_power_fade, _read_audio, _resample_audio
@@ -16,9 +17,12 @@ from worker_models import (
     auxiliary_paths_for,
     config_path_for,
     get_any_model_entry,
+    is_user_model_entry,
     model_path_for,
 )
-from worker_protocol import _as_bool, _as_float, _as_int, emit, emit_error
+from worker_protocol import ProtocolLogHandler, _as_bool, _as_float, _as_int, current_log_task_id, emit, emit_error, task_logging
+from worker_inference_constraints import InferenceParameterError, validate_chunk_size
+from worker_paths import normalize_output_dir as _normalize_output_dir
 
 
 class ModelNotFoundError(RuntimeError):
@@ -29,26 +33,75 @@ class ModelDownloadError(RuntimeError):
     pass
 
 
-class JsonLogHandler:
-    def __init__(self, task_id: str):
-        import logging
-        self.task_id = task_id
-        self.level = logging.INFO
+class JsonLogHandler(ProtocolLogHandler):
+    def __init__(
+        self,
+        task_id: str,
+        node_id_provider: Any = None,
+        level_provider: Any = None,
+        task_id_provider: Any = None,
+    ) -> None:
+        super().__init__(
+            event_type="task_log",
+            task_id=task_id,
+            task_id_provider=task_id_provider,
+            node_id_provider=node_id_provider,
+            level_provider=level_provider,
+            source="pymss",
+            emitter=lambda *args, **kwargs: emit(*args, **kwargs),
+        )
 
-    def setLevel(self, level: int) -> None:
-        self.level = level
 
-    def handle(self, record: Any) -> bool:
-        if record.levelno < self.level:
-            return False
-        payload = {"level": record.levelname.lower(), "message": record.getMessage()}
-        if record.exc_info:
-            import logging
-            payload["detail"] = logging.Formatter().formatException(record.exc_info)
-        elif getattr(record, "stack_info", None):
-            payload["detail"] = record.stack_info
-        emit("task_log", payload, task_id=self.task_id)
-        return True
+@contextmanager
+def separation_logging(
+    task_id: str,
+    *,
+    node_id_provider: Any = None,
+    task_id_provider: Any = None,
+) -> Iterator[Any]:
+    """Use one bridge for individual files, batches and native workflows."""
+    import logging
+
+    try:
+        from pymss import get_separation_logger
+        logger = get_separation_logger()
+    except Exception:
+        yield None
+        return
+    console = getattr(logger, "console_handler", None)
+    handler = JsonLogHandler(
+        task_id,
+        node_id_provider=node_id_provider,
+        task_id_provider=task_id_provider,
+        level_provider=(lambda: console.level) if console is not None else None,
+    )
+    console_handlers = [
+        item for item in getattr(logger, "handlers", [])
+        if isinstance(item, logging.StreamHandler) and not isinstance(item, logging.FileHandler)
+    ]
+    previous_propagate = getattr(logger, "propagate", False)
+
+    def suppress_console(_record: Any) -> bool:
+        return False
+
+    for item in console_handlers:
+        item.addFilter(suppress_console)
+    logger.addHandler(handler)
+    # SDK formatters may mutate the shared LogRecord. Capture its original fields
+    # before any preserved SDK file handler formats it.
+    logger.handlers = [handler, *[item for item in getattr(logger, "handlers", []) if item is not handler]]
+    logger.propagate = False
+    try:
+        yield logger
+    finally:
+        try:
+            logger.removeHandler(handler)
+        except Exception:
+            logger.handlers = [item for item in logger.handlers if item is not handler]
+        handler.close()
+        logger.propagate = previous_propagate
+        for item in console_handlers:
+            item.removeFilter(suppress_console)
 
 
 def _normalize_output_naming(value: Any) -> dict[str, Any]:
@@ -159,7 +212,14 @@ def _studio_separator_type() -> type[Any]:
     from pymss import MSSeparator  # type: ignore
 
     class StudioMSSeparator(MSSeparator):
+        def update_inference_params(self, config: Any, params: Any) -> Any:
+            updated = super().update_inference_params(config, params)
+            validate_chunk_size(self.model_type, config, config.get("audio", {}).get("chunk_size"))
+            return updated
+
         def __init__(self, *args: Any, output_naming: Any = None, output_model: str = "", **kwargs: Any) -> None:
+            from worker_rocm import configure_rocm_runtime
+            configure_rocm_runtime(kwargs.get("device", "auto"), kwargs.get("device_ids"), kwargs.get("logger"))
             super().__init__(*args, **kwargs)
             self._studio_naming = _normalize_output_naming(output_naming)
             self._studio_output_model = output_model
@@ -183,6 +243,14 @@ def _studio_separator_type() -> type[Any]:
                 str(stem).strip().lower(): index
                 for index, stem in enumerate(ordered_stems)
             }
+
+        def separate(self, *args: Any, **kwargs: Any) -> Any:
+            from worker_rocm import run_rocm_inference
+            separate = super().separate
+            return run_rocm_inference(
+                lambda: separate(*args, **kwargs), getattr(self, "device", "auto"),
+                getattr(self, "device_ids", None), getattr(self, "logger", None),
+            )
 
         def _calculate_expected_output_count(self) -> int:
             try:
@@ -333,6 +401,8 @@ def resolve_pymss_output_dir(output_dir: str, success_files: list[str], fallback
     return str(Path(output_dir) / file_name)
 
 def _emit_inference_error(exc: Exception, task_id: str) -> int:
+    if isinstance(exc, InferenceParameterError):
+        return emit_error("INFERENCE_PARAMS_INVALID", str(exc), task_id=task_id)
     message = str(exc)
     lowered = message.lower()
     if "no audio stream found" in lowered:
@@ -366,14 +436,6 @@ def _close_separator(separator: Any) -> None:
         except Exception:
             pass
 
-
-def _normalize_output_dir(value: Any) -> str:
-    default_output_dir = os.environ.get("PYMSS_STUDIO_DEFAULT_OUTPUT_DIR")
-    output_dir = value or default_output_dir or "results"
-    output_path = Path(str(output_dir))
-    if not output_path.is_absolute() and default_output_dir:
-        return str(Path(default_output_dir).parent / output_path)
-    return str(output_dir)
 
 def _normalize_selected_stems(value: Any) -> list[str]:
     if not isinstance(value, list):
@@ -464,6 +526,9 @@ def _resolve_studio_model(
         "model_path": str(model_path),
         "config_path": str(config_path) if config_path else None,
         "auxiliary_paths": [str(path) for path in auxiliary_paths],
+        "target_instrument_override": (
+            None if is_user_model_entry(entry) else getattr(entry, "target_instrument_override", "") or None
+        ),
     }
 
 
@@ -546,11 +611,12 @@ def _prepare_separator(
         model_type=resolved_model_type,
         model_path=resolved_model_path,
         config_path=resolved.get('config_path'),
+        target_instrument_override=resolved.get('target_instrument_override'),
         device=device,
         device_ids=device_ids,
         output_format=output_format,
         use_tta=use_tta,
-        store_dirs=_store_dirs_for_selected_stems(_normalize_output_dir(payload.get("output")), selected_stems),
+        store_dirs=_store_dirs_for_selected_stems(str(payload["output"]), selected_stems),
         save_as_folder=bool(payload.get("saveAsFolder", False)),
         audio_params=audio_params,
         logger=logger,
@@ -680,6 +746,7 @@ def _enrich_inference_params_for_model(
         chunk_size = _as_int(inference.get('chunk_size'))
     if chunk_size is None:
         chunk_size = _as_int(audio.get('chunk_size'))
+    validate_chunk_size(normalized_model_type, config, chunk_size)
 
     if explicit_overlap_size is None:
         derived_overlap_size: int | None = None
@@ -744,8 +811,7 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
             "inputIndex": int(item.get("inputIndex") or index + 1),
         })
 
-    logger = None
-    log_handler = None
+    cleanup = ExitStack()
     separator = None
     active_task_id: str | None = None
     terminal_task_ids: set[str] = set()
@@ -788,13 +854,10 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
             task_output = resolve_pymss_output_dir(output_root, [], item["input"], save_as_folder)
             emit("task_started", {"model": payload.get("model"), "input": item["input"], "output": task_output}, task_id=item["taskId"])
             emit("task_stage", {"stage": "validating_input", "message": "Validating input"}, task_id=item["taskId"])
-        try:
-            from pymss import get_separation_logger  # type: ignore
-            logger = get_separation_logger()
-            log_handler = JsonLogHandler(root_task_id)
-            logger.addHandler(log_handler)
-        except Exception:
-            logger = None
+        logger = cleanup.enter_context(separation_logging(
+            root_task_id,
+            task_id_provider=current_log_task_id,
+        ))
         separator = _prepare_separator(
             payload={**payload, "output": output_root, "saveAsFolder": save_as_folder},
             task_id=root_task_id,
@@ -804,23 +867,25 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
         for item in batch_tasks:
             task_id = item["taskId"]
             active_task_id = task_id
-            emit("task_stage", {"stage": "separating", "message": "Separating"}, task_id=task_id)
-            success_files = separator.process_folder(item["input"], int(item.get("inputIndex") or 1))
-            if Path(item["input"]).name not in {Path(name).name for name in success_files}:
-                emit_error("INFERENCE_FAILED", f"Batch separation did not produce outputs for {Path(item['input']).name}", task_id=task_id)
+            with task_logging(task_id):
+                emit("task_stage", {"stage": "separating", "message": "Separating"}, task_id=task_id)
+                success_files = separator.process_folder(item["input"], int(item.get("inputIndex") or 1))
+                if Path(item["input"]).name not in {Path(name).name for name in success_files}:
+                    emit_error("INFERENCE_FAILED", f"Batch separation did not produce outputs for {Path(item['input']).name}", task_id=task_id)
+                    terminal_task_ids.add(task_id)
+                    failed = True
+                    continue
+                task_output = resolve_pymss_output_dir(output_root, success_files, item["input"], save_as_folder)
+                emit("task_stage", {"stage": "writing_output", "message": "Collecting outputs"}, task_id=task_id)
+                outputs = separator.studio_outputs()
+                emit("task_done", {
+                    "files": [output["path"] for output in outputs],
+                    "outputs": outputs,
+                    "outputDir": str(Path(task_output).resolve()),
+                    "outputRoot": output_root,
+                    "outputFormat": output_format,
+                }, task_id=task_id)
                 terminal_task_ids.add(task_id)
-                failed = True
-                continue
-            task_output = resolve_pymss_output_dir(output_root, success_files, item["input"], save_as_folder)
-            emit("task_stage", {"stage": "writing_output", "message": "Collecting outputs"}, task_id=task_id)
-            outputs = separator.studio_outputs()
-            emit("task_done", {
-                "files": [output["path"] for output in outputs],
-                "outputs": outputs,
-                "outputDir": str(Path(task_output).resolve()),
-                "outputFormat": output_format,
-            }, task_id=task_id)
-            terminal_task_ids.add(task_id)
         active_task_id = None
         return 1 if failed else 0
     except Exception as exc:
@@ -829,12 +894,8 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
                 _emit_inference_error(exc, item["taskId"])
         return 1
     finally:
-        if logger is not None and log_handler is not None:
-            try:
-                logger.removeHandler(log_handler)
-            except Exception:
-                pass
         _close_separator(separator)
+        cleanup.close()
 
 
 def cmd_infer(payload: dict[str, Any]) -> int:
@@ -844,11 +905,7 @@ def cmd_infer(payload: dict[str, Any]) -> int:
     task_id = payload.get("taskId") or f"sep_{int(datetime.now().timestamp())}"
     model_name = payload.get("model")
     input_path = payload.get("input")
-    default_output_dir = os.environ.get("PYMSS_STUDIO_DEFAULT_OUTPUT_DIR")
-    output_dir = payload.get("output") or default_output_dir or "results"
-    output_path = Path(output_dir)
-    if not output_path.is_absolute() and default_output_dir:
-        output_dir = str(Path(default_output_dir).parent / output_path)
+    output_dir = _normalize_output_dir(payload.get("output"))
     if not model_name:
         return emit_error("MODEL_NOT_FOUND", "Missing model name", task_id=task_id)
     if not input_path:
@@ -894,20 +951,13 @@ def cmd_infer(payload: dict[str, Any]) -> int:
         }, task_id=task_id)
 
     separator = None
-    logger = None
-    log_handler = None
+    cleanup = ExitStack()
     try:
         emit("task_started", {"model": model_name, "input": input_path, "output": task_output}, task_id=task_id)
         emit("task_stage", {"stage": "validating_input", "message": "Validating input"}, task_id=task_id)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        try:
-            from pymss import get_separation_logger  # type: ignore
-            logger = get_separation_logger()
-            log_handler = JsonLogHandler(task_id)
-            logger.addHandler(log_handler)
-        except Exception:
-            logger = None
+        logger = cleanup.enter_context(separation_logging(task_id))
 
         separator = _prepare_separator(
             payload={
@@ -926,7 +976,7 @@ def cmd_infer(payload: dict[str, Any]) -> int:
         emit("task_stage", {"stage": "writing_output", "message": "Collecting outputs"}, task_id=task_id)
         task_output = resolve_pymss_output_dir(output_dir, success_files, input_path, save_as_folder)
         outputs = separator.studio_outputs()
-        emit("task_done", {"files": [output["path"] for output in outputs], "outputs": outputs, "outputDir": str(Path(task_output).resolve()), "outputFormat": output_format}, task_id=task_id)
+        emit("task_done", {"files": [output["path"] for output in outputs], "outputs": outputs, "outputDir": str(Path(task_output).resolve()), "outputRoot": output_dir, "outputFormat": output_format}, task_id=task_id)
         return 0
     except ModelNotFoundError as exc:
         return emit_error("MODEL_NOT_FOUND", str(exc), traceback.format_exc(), task_id=task_id)
@@ -935,9 +985,5 @@ def cmd_infer(payload: dict[str, Any]) -> int:
     except Exception as exc:
         return _emit_inference_error(exc, task_id)
     finally:
-        if logger is not None and log_handler is not None:
-            try:
-                logger.removeHandler(log_handler)
-            except Exception:
-                pass
         _close_separator(separator)
+        cleanup.close()

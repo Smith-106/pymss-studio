@@ -32,7 +32,7 @@ const bottomItems = computed(() => [
 </script>
 
 <template>
-  <aside class="side-nav">
+  <aside class="side-nav" data-guide="workspace-navigation">
     <div class="side-nav__main">
       <router-link
         v-for="item in mainItems"

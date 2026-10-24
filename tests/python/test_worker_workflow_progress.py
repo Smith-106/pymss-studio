@@ -14,6 +14,27 @@ import worker_workflows
 
 
 class WorkflowProgressTests(unittest.TestCase):
+    def test_native_execution_preserves_failure_identity_and_state(self):
+        with patch.object(worker_workflows, "emit") as emit:
+            worker_workflows._emit_execution("advanced")({
+                "event": "node_failed", "version": 1, "node_id": "save", "node_type": "SaveAudio",
+                "node_fraction": 0.25, "overall_fraction": 0.6, "error_type": "DAGError", "message": "Missing input",
+            })
+        self.assertEqual(emit.call_args.args, ("workflow_execution", {
+            "event": "node_failed", "version": 1, "nodeId": "save", "nodeType": "SaveAudio",
+            "nodeProgress": 0.25, "overallFraction": 0.6, "errorType": "DAGError", "message": "Missing input",
+        }))
+        self.assertEqual(emit.call_args.kwargs, {"task_id": "advanced"})
+
+    def test_graph_completion_does_not_invent_an_active_node(self):
+        with patch.object(worker_workflows, "emit") as emit:
+            worker_workflows._emit_execution("advanced")({
+                "event": "execution_completed", "version": 1, "node_id": None,
+                "node_fraction": None, "overall_fraction": 1,
+            })
+        self.assertIsNone(emit.call_args.args[1]["nodeId"])
+        self.assertIsNone(emit.call_args.args[1]["nodeProgress"])
+
     def test_native_overall_fraction_is_forwarded_and_audio_seconds_are_preserved(self):
         with patch.object(worker_workflows, "emit") as emit:
             callback = worker_workflows._emit_progress("workflow")

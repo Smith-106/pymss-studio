@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
 import { computed, nextTick, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -7,6 +8,8 @@ import { useSettingsStore } from '@/stores/settings'
 import { useModelStore, type ModelDefaultInferenceParams } from '@/stores/model'
 import { useAppStore } from '@/stores/app'
 import type { WorkflowEntry } from '@/stores/workflow'
+import { appendWorkflowNodeLogs, type WorkflowNodeLogs } from '@/workflows/nodeLogs'
+import { normalizeLogRecord, workerLogRecord, localLogRecord, type LogEntry } from '@/utils/logRecord'
 import { detectWorkflowFormat, WORKFLOW_FORMAT_VERSION } from '@/workflows/formats'
 import {
   getWorkflowDefinitionIssue,
@@ -18,13 +21,19 @@ import {
   isTerminalTaskStatus,
   resolveJobStatus,
   selectQueuedJobGroups,
+  sortJobTasks,
   taskJobId,
   TERMINAL_TASK_STATUSES,
   type TaskStatus,
 } from '@/features/tasks/lifecycle'
 import { normalizeStemOutputs, stemFromOutputPath, type StemOutput } from '@/utils/stemOutputs'
 import { normalizeConcurrentSeparations } from '@/features/tasks/concurrency'
+import { isMainTaskOwner } from '@/utils/taskOwner'
+import { getSeparateWorkflowInputIssue } from '@/utils/workflowInputs'
+import { cloneWorkflow, prepareWorkbenchRun, workflowInputNodes, type WorkflowRuntimeBindings, type WorkflowWorkbenchSnapshot, type WorkflowNodeState } from '@/workflows/workbench'
 import { SEPARATE_MODEL_PAGE_SIZES, normalizePageSize } from '@/utils/pagination'
+
+const studioLog = createLogger('ui.stores.task')
 
 export type { TaskStatus } from '@/features/tasks/lifecycle'
 export type { StemOutput } from '@/utils/stemOutputs'
@@ -46,6 +55,7 @@ export type SeparationRunConfig = {
   workflowId?: string
   workflowName?: string
   workflowDefinition?: Record<string, unknown>
+  workbench?: WorkflowWorkbenchSnapshot
   modelType?: string | null
   outputLayout: OutputLayout
   outputNaming?: OutputNamingConfig
@@ -71,11 +81,13 @@ export type SeparationTask = {
   jobId?: string
   resultId?: string
   batchId?: string
+  batchIndex?: number
   model: string
   input: string
   jobOutput?: string
   outputPrefix?: string
   output: string
+  outputDirectories?: string[]
   status: TaskStatus
   message: string
   createdAt: number
@@ -92,9 +104,13 @@ export type SeparationTask = {
   outputs: StemOutput[]
   /** Plugin graph leaf values (ASR text, measurements, MIDI paths) by node. */
   nodeValues?: { nodeId: number; nodeType: string; slot: number; value: string }[]
-  logs: string[]
+  logs: LogEntry[]
+  nodeLogs?: WorkflowNodeLogs
   error?: string
   runConfig?: SeparationRunConfig
+  nodeStates?: Record<string, WorkflowNodeState>
+  nodeExecutionOrder?: string[]
+  currentNodeId?: string
   taskHidden?: boolean
   resultHidden?: boolean
 }
@@ -145,7 +161,6 @@ type PersistedSeparateState = {
   ensembleModelStems?: Record<string, string>
   ensembleType?: string
   ensembleWeights?: Record<string, number>
-  temporaryOutputDir?: string
   outputLayout?: OutputLayout
   outputNamingTemplate?: string
   customStemOrder?: string[]
@@ -236,6 +251,11 @@ function normalizeOutputPath(value?: string | null) {
   return value && value.trim() ? value : 'outputs'
 }
 
+function resolveOutputDirectory(value?: string | null, fallback?: string | null, windows = false) {
+  const directory = value && value.trim() ? value : fallback && fallback.trim() ? fallback : 'outputs'
+  return windows || !directory.startsWith('/') ? directory.trim() : directory
+}
+
 function normalizeTimestamp(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
@@ -244,64 +264,93 @@ function normalizeDurationMs(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.max(0, Math.round(value)) : undefined
 }
 
-function joinOutputPath(base: string, child: string) {
-  const separator = base.includes('\\') ? '\\' : '/'
-  return `${base.replace(/[\\/]$/, '')}${separator}${child}`
+function joinOutputPath(base: string, child: string, windows: boolean) {
+  const separator = windows && base.includes('\\') ? '\\' : '/'
+  const trailingSeparator = windows ? /[\\/]$/ : /[/]$/
+  return `${base.replace(trailingSeparator, '')}${separator}${child}`
 }
 
 function createRunId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
 }
 
-function inputStemSegment(input: string, fallback: string) {
+function inputStemSegment(input: string, fallback: string, windows: boolean) {
   return input
-    .split(/[/\\]/)
+    .split(windows ? /[/\\]/ : /[/]/)
     .filter(Boolean)
     .pop()
-    ?.replace(/\.[^/.\\]+$/, '')
-    .trim() || fallback
+    ?.replace(windows ? /\.[^/.\\]+$/ : /\.[^/.]+$/, '') || fallback
 }
 
-function outputsFromFiles(outputDir: string, files: string[], outputFormat = 'wav', outputPrefix?: string, inputPath?: string): StemOutput[] {
+function outputsFromFiles(outputDir: string, files: string[], outputFormat = 'wav', outputPrefix?: string, inputPath?: string, windows = /^[A-Za-z]:|^\\\\/.test(outputDir)): StemOutput[] {
   if (!files?.length) return []
-  const separator = outputDir.includes('\\') ? '\\' : '/'
-  const base = outputDir.replace(/[\\/]$/, '')
-  return files.map((file) => {
-    const rawPath = String(file || '').trim()
-    const rawStemName = rawPath.split(/[/\\]/).pop()?.replace(/\.[^/.\\]+$/, '') || ''
+  return files.flatMap((file) => {
+    const rawPath = String(file || '')
+    const parts = rawPath.split(windows ? /[/\\]/ : /[/]/)
+    if (!rawPath || parts.some(part => part === '.' || part === '..')) return []
+    const leaf = parts.at(-1) || ''
+    const extension = leaf.match(windows ? /\.[^/.\\]+$/ : /\.[^/.]+$/)?.[0] || ''
+    const rawStemName = extension ? leaf.slice(0, -extension.length) : leaf
     const outputFileName = outputPrefix ? `${outputPrefix}_${rawStemName}` : rawStemName
-    const isAbsolutePath = /^(?:[A-Za-z]:[\\/]|[\\/]{1,2})/.test(rawPath)
-    return {
-      stem: stemFromOutputPath(rawStemName, inputPath),
-      path: isAbsolutePath ? rawPath : `${base}${separator}${outputFileName}.${outputFormat}`,
-    }
+    const isAbsolutePath = windows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(rawPath) : rawPath.startsWith('/')
+    const relativeParent = rawPath.slice(0, rawPath.length - leaf.length)
+    return [{
+      stem: stemFromOutputPath(leaf, inputPath, windows),
+      path: isAbsolutePath ? rawPath : joinOutputPath(outputDir, `${relativeParent}${outputFileName}${extension || `.${outputFormat}`}`, windows),
+    }]
   })
 }
 
-function parentDir(path: string) {
-  const trimmed = normalizeOutputPath(path).replace(/[\\/]$/, '')
-  const index = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
-  return index > 0 ? trimmed.slice(0, index) : ''
+function cleanupPath(path: string, windows: boolean) {
+  let normalized = windows ? path.replace(/\\/g, '/') : path
+  if (windows) {
+    normalized = normalized.replace(/^\/\/\?\/UNC\//i, '//').replace(/^\/\/\?\/([A-Za-z]:\/)/, '$1')
+  }
+  return normalized.replace(/\/+$/, '') || (normalized.startsWith('/') ? '/' : '')
 }
 
-function samePath(a?: string, b?: string) {
-  const left = normalizeOutputPath(a || '').replace(/[\\/]$/, '')
-  const right = normalizeOutputPath(b || '').replace(/[\\/]$/, '')
-  return Boolean(left && right && left.toLowerCase() === right.toLowerCase())
+function parentDir(path: string, windows: boolean) {
+  const normalized = cleanupPath(path, windows)
+  const index = normalized.lastIndexOf('/')
+  return index > 0 ? normalized.slice(0, index) : ''
 }
 
-function cleanupDirChain(path: string, stopAt?: string) {
+function pathKey(path: string, windows: boolean) {
+  const normalized = cleanupPath(path, windows)
+  const drive = windows ? normalized.match(/^[A-Za-z]:/)?.[0] || '' : ''
+  let prefix = ''
+  if (drive) prefix = `${drive}/`
+  else if (normalized.startsWith('/')) prefix = windows && normalized.startsWith('//') ? '//' : '/'
+  const segments: string[] = []
+  const rootDepth = prefix === '//' ? 2 : 0
+  for (const part of (drive ? normalized.slice(2) : normalized).split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (segments.length > rootDepth && segments.at(-1) !== '..') segments.pop()
+      else if (!prefix) segments.push(part)
+    } else segments.push(part)
+  }
+  const key = prefix + segments.join('/')
+  return windows ? key.toLowerCase() : key
+}
+
+function samePath(a: string | undefined, b: string | undefined, windows: boolean) {
+  return Boolean(a && b && pathKey(a, windows) === pathKey(b, windows))
+}
+
+function cleanupDirChain(path: string, stopAt: string | undefined, windows: boolean) {
   const dirs: string[] = []
-  const seen = new Set<string>()
-  const stop = stopAt?.trim()
-  let current = normalizeOutputPath(path).replace(/[\\/]$/, '')
-  while (current && !(stop && samePath(current, stop))) {
-    const key = current.toLowerCase()
-    if (seen.has(key)) break
+  const absolute = windows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/ : /^\//
+  if (!stopAt || !absolute.test(path) || !absolute.test(stopAt)) return dirs
+  const stop = cleanupPath(stopAt, windows)
+  let current = cleanupPath(path, windows)
+  if ([stop, current].some(value => value.split('/').some(part => part === '.' || part === '..'))) return dirs
+  const stopKey = pathKey(stop, windows)
+  const prefix = stopKey.endsWith('/') ? stopKey : `${stopKey}/`
+  while (current && !samePath(current, stop, windows)) {
+    if (!pathKey(current, windows).startsWith(prefix)) return []
     dirs.push(current)
-    seen.add(key)
-    if (!stop) break
-    current = parentDir(current)
+    current = parentDir(current, windows)
   }
   return dirs
 }
@@ -339,7 +388,7 @@ function resolveStageProgress(status: TaskStatus, current?: number, total?: numb
   return Math.round(clamp(current / total, 0, 1) * 100)
 }
 
-function normalizeTask(task: Partial<SeparationTask>): SeparationTask {
+function normalizeTask(task: Partial<SeparationTask>, windows = /^[A-Za-z]:|^\\\\/.test(task.output || task.jobOutput || '')): SeparationTask {
   let status = normalizeStatus(task.status)
   let interrupted = false
   if (isInterruptedTaskStatus(status)) {
@@ -349,10 +398,10 @@ function normalizeTask(task: Partial<SeparationTask>): SeparationTask {
   const normalizedRunConfig = normalizeRunConfig(task.runConfig)
   const normalizedOutput = normalizeOutputPath(task.output)
   const normalizedFiles = task.files || []
-  const workerOutputs = normalizeStemOutputs(task.outputs, task.input)
+  const workerOutputs = normalizeStemOutputs(task.outputs, task.input, windows)
   const normalizedOutputs = workerOutputs.length
     ? workerOutputs
-    : outputsFromFiles(normalizedOutput, normalizedFiles, normalizedRunConfig?.outputFormat || 'wav', task.outputPrefix, task.input)
+    : outputsFromFiles(normalizedOutput, normalizedFiles, normalizedRunConfig?.outputFormat || 'wav', task.outputPrefix, task.input, windows)
   const meta = STAGE_META[status]
   const startedAt = normalizeTimestamp(task.startedAt)
   const finishedAt = normalizeTimestamp(task.finishedAt)
@@ -366,11 +415,13 @@ function normalizeTask(task: Partial<SeparationTask>): SeparationTask {
     jobId: typeof task.jobId === 'string' && task.jobId.trim() ? task.jobId : undefined,
     resultId: typeof task.resultId === 'string' && task.resultId.trim() ? task.resultId : undefined,
     batchId: typeof task.batchId === 'string' && task.batchId.trim() ? task.batchId : undefined,
+    ...(typeof task.batchIndex === 'number' && Number.isSafeInteger(task.batchIndex) && task.batchIndex >= 0 ? { batchIndex: task.batchIndex } : {}),
     model: task.model || '',
     input: task.input || '',
     jobOutput: typeof task.jobOutput === 'string' && task.jobOutput.trim() ? normalizeOutputPath(task.jobOutput) : undefined,
     outputPrefix: typeof task.outputPrefix === 'string' && task.outputPrefix.trim() ? task.outputPrefix : undefined,
     output: normalizedOutput,
+    ...(Array.isArray(task.outputDirectories) ? { outputDirectories: task.outputDirectories.filter(path => typeof path === 'string' && path.trim()) } : {}),
     status,
     message: interrupted ? '上次运行未完成' : (task.message || meta.label),
     createdAt: task.createdAt || Date.now(),
@@ -390,6 +441,11 @@ function normalizeTask(task: Partial<SeparationTask>): SeparationTask {
       : (task.logs || []),
     error: interrupted ? '应用关闭或重启导致任务中断' : task.error,
     runConfig: normalizedRunConfig,
+    nodeStates: task.nodeStates,
+    nodeExecutionOrder: Array.isArray(task.nodeExecutionOrder)
+      ? [...new Set(task.nodeExecutionOrder.filter(id => typeof id === 'string' && id.trim()))] : undefined,
+    nodeLogs: task.nodeLogs,
+    currentNodeId: interrupted ? undefined : task.currentNodeId,
     taskHidden: task.taskHidden === true,
     resultHidden: task.resultHidden === true,
   }
@@ -555,7 +611,15 @@ export const useTaskStore = defineStore('task', () => {
   const ensembleModelStems = ref<Record<string, string>>({})
   const ensembleType = ref('avg_wave')
   const ensembleWeights = ref<Record<string, number>>({})
+  // Retain directory overrides across route changes, but inherit Settings after restarting.
   const separateTemporaryOutputDir = ref('')
+  const separateOutputDir = computed(() => resolveOutputDirectory(separateTemporaryOutputDir.value, useSettingsStore().outputDir, windowsPaths.value))
+  const windowsPaths = computed(() => {
+    const app = useAppStore()
+    const platform = app.envInfo?.platform || app.runtimeInfo?.platform
+      || (typeof navigator !== 'undefined' ? navigator.platform : '')
+    return /^win/i.test(platform)
+  })
   const separateOutputLayout = ref<OutputLayout>('flat')
   const separateOutputNamingTemplate = ref('%index%_%filename%_%stem%')
   const separateCustomStemOrder = ref<string[]>([])
@@ -613,7 +677,6 @@ export const useTaskStore = defineStore('task', () => {
       ensembleModelStems: { ...ensembleModelStems.value },
       ensembleType: ensembleType.value,
       ensembleWeights: { ...ensembleWeights.value },
-      temporaryOutputDir: separateTemporaryOutputDir.value,
       outputLayout: separateOutputLayout.value,
       outputNamingTemplate: separateOutputNamingTemplate.value,
       customStemOrder: [...separateCustomStemOrder.value],
@@ -628,7 +691,7 @@ export const useTaskStore = defineStore('task', () => {
   function persistSeparateState() {
     if (!initialized.value) return
     void saveAppStore('separate-state', separateStateSnapshot()).catch((error) => {
-      console.warn('Failed to persist separate settings', error)
+      studioLog.warn('Failed to persist separate settings', error)
     })
   }
 
@@ -664,7 +727,7 @@ export const useTaskStore = defineStore('task', () => {
       groups.set(id, [...(groups.get(id) || []), task])
     })
     return [...groups.entries()].map(([id, items]) => {
-      const sorted = [...items].sort((a, b) => a.createdAt - b.createdAt)
+      const sorted = sortJobTasks(items)
       const primary = sorted[0]
       const output = primary.jobOutput || primary.output
       const progressTotal = sorted.reduce((sum, item) => {
@@ -718,9 +781,10 @@ export const useTaskStore = defineStore('task', () => {
     return removed
   }
 
-  function clearFinishedSessionJobs() {
+  function clearFinishedSessionJobs(jobIds?: readonly string[]) {
+    const allowedIds = jobIds ? new Set(jobIds) : null
     const finishedJobIds = new Set(sessionJobs.value
-      .filter(job => isTerminalTaskStatus(job.status))
+      .filter(job => isTerminalTaskStatus(job.status) && (!allowedIds || allowedIds.has(job.id)))
       .map(job => job.id))
     if (!finishedJobIds.size) return 0
     const next = new Set(sessionTaskIds.value)
@@ -734,7 +798,7 @@ export const useTaskStore = defineStore('task', () => {
   async function persistTasks() {
     if (!initialized.value) return
     await saveAppStore('task-history', {
-      tasks: tasks.value.slice(0, 80).map((task) => ({ ...task, logs: task.logs.slice(-120) })),
+      tasks: tasks.value.map((task) => ({ ...task, logs: task.logs.slice(-120) })),
     } satisfies PersistedTaskState)
   }
 
@@ -743,7 +807,7 @@ export const useTaskStore = defineStore('task', () => {
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
       saveTimer = null
-      void persistTasks()
+      void persistTasks().catch(error => studioLog.warn('Failed to persist task history', error))
     }, 120)
   }
 
@@ -752,7 +816,7 @@ export const useTaskStore = defineStore('task', () => {
     if (progressPersistTimer) return
     progressPersistTimer = setTimeout(() => {
       progressPersistTimer = null
-      void persistTasks()
+      void persistTasks().catch(error => studioLog.warn('Failed to persist task history', error))
     }, 800)
   }
 
@@ -762,9 +826,10 @@ export const useTaskStore = defineStore('task', () => {
       loadAppStore<PersistedTaskState>('task-history'),
       loadAppStore<PersistedSeparateState>('separate-state'),
     ])
-    tasks.value = (stored?.tasks || []).map((task) => normalizeTask(task))
+    // Older versions retained result-page deletions as hidden task records.
+    tasks.value = (stored?.tasks || []).filter(task => !task.resultHidden).map((task) => normalizeTask(task, windowsPaths.value))
     activeTaskId.value = tasks.value[0]?.id || null
-    separateRunMode.value = separateStored?.runMode === 'workflow' ? 'workflow' : 'model'
+    separateRunMode.value = 'model'
     ensembleEnabled.value = separateStored?.ensembleEnabled === true
     ensembleModels.value = Array.isArray(separateStored?.ensembleModels)
       ? separateStored.ensembleModels.map(item => String(item || '').trim()).filter(Boolean)
@@ -783,7 +848,6 @@ export const useTaskStore = defineStore('task', () => {
         return Number.isFinite(weight) && weight >= 0 ? [[name, weight]] : []
       }),
     )
-    separateTemporaryOutputDir.value = String(separateStored?.temporaryOutputDir || '')
     separateOutputLayout.value = normalizeOutputLayout(separateStored?.outputLayout)
     separateOutputNamingTemplate.value = String(separateStored?.outputNamingTemplate || '%index%_%filename%_%stem%')
     separateCustomStemOrder.value = Array.isArray(separateStored?.customStemOrder)
@@ -806,10 +870,11 @@ export const useTaskStore = defineStore('task', () => {
         }),
     )
     initialized.value = true
+    if (stored?.tasks?.some(task => task.resultHidden)) queuePersist()
   }
 
   watch(
-    [separateRunMode, ensembleEnabled, ensembleModels, ensembleStem, ensembleModelStems, ensembleType, ensembleWeights, separateTemporaryOutputDir,
+    [separateRunMode, ensembleEnabled, ensembleModels, ensembleStem, ensembleModelStems, ensembleType, ensembleWeights,
       separateOutputLayout, separateOutputNamingTemplate, separateCustomStemOrder, modelListViewMode, modelListSortMode, modelListPageSize, useTta],
     () => {
       if (applyingModelDefaults) return
@@ -954,13 +1019,12 @@ export const useTaskStore = defineStore('task', () => {
     restoreInferenceNumberFallback('window_size')
   }
 
-  function appendTaskLogs(task: SeparationTask, lines: string | string[]) {
+  function appendTaskLogs(task: SeparationTask, lines: LogEntry | LogEntry[]) {
     const settings = useSettingsStore()
     const values = Array.isArray(lines) ? lines : [lines]
     const normalized = values
-      .flatMap((line) => String(line || '').split(/\r?\n/))
-      .map((line) => line.trimEnd())
-      .filter(Boolean)
+      .flatMap<LogEntry>((line) => typeof line === 'string' ? line.split(/\r?\n/).map(value => value.trimEnd()).filter(Boolean) : [line])
+      .filter(line => typeof line === 'string' || line.legacy || !task.logs.some(previous => typeof previous !== 'string' && previous.id === line.id))
     if (!normalized.length) return
     task.logs.push(...normalized)
     task.logs = task.logs.slice(-getLogLimit(settings.developerMode))
@@ -1074,18 +1138,19 @@ export const useTaskStore = defineStore('task', () => {
   function resolveTaskOutputPath(jobOutput: string, input: string, resultId: string, outputLayout: OutputLayout) {
     return outputLayout === 'flat'
       ? jobOutput
-      : joinOutputPath(jobOutput, inputStemSegment(input, resultId))
+      : joinOutputPath(jobOutput, inputStemSegment(input, resultId, windowsPaths.value), windowsPaths.value)
   }
 
-  function createQueuedTask(input: string, model: string, inferenceParams: Record<string, unknown>, modelType?: string | null, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig) {
+  function createQueuedTask(input: string, model: string, inferenceParams: Record<string, unknown>, modelType?: string | null, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig, batchIndex?: number) {
     const settings = useSettingsStore()
     const id = createRunId('sep')
     const resultId = createRunId('result')
-    const resolvedJobOutput = jobOutput || normalizeOutputPath(settings.outputDir)
+    const resolvedJobOutput = jobOutput || resolveOutputDirectory(settings.outputDir, undefined, windowsPaths.value)
     const task: SeparationTask = {
       id,
       jobId,
       resultId,
+      ...(typeof batchIndex === 'number' && Number.isSafeInteger(batchIndex) && batchIndex >= 0 ? { batchIndex } : {}),
       model,
       input,
       jobOutput: resolvedJobOutput,
@@ -1098,7 +1163,7 @@ export const useTaskStore = defineStore('task', () => {
       stageLabel: STAGE_META.queued.label,
       files: [],
       outputs: [],
-      logs: [`${new Date().toLocaleTimeString()} Queued`],
+      logs: [localLogRecord('Queued', 'task.queued', 'info', { taskId: id })],
       runConfig: buildRunConfig(inferenceParams, modelType, outputLayout, outputNaming),
     }
     tasks.value.unshift(task)
@@ -1108,15 +1173,16 @@ export const useTaskStore = defineStore('task', () => {
     return task
   }
 
-  function createQueuedWorkflowTask(input: string, workflow: WorkflowEntry, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig) {
+  function createQueuedWorkflowTask(input: string, workflow: WorkflowEntry, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig, batchIndex?: number) {
     const settings = useSettingsStore()
     const id = createRunId('wf')
     const resultId = createRunId('result')
-    const resolvedJobOutput = jobOutput || normalizeOutputPath(settings.outputDir)
+    const resolvedJobOutput = jobOutput || resolveOutputDirectory(settings.outputDir, undefined, windowsPaths.value)
     const task: SeparationTask = {
       id,
       jobId,
       resultId,
+      ...(typeof batchIndex === 'number' && Number.isSafeInteger(batchIndex) && batchIndex >= 0 ? { batchIndex } : {}),
       model: workflow.name,
       input,
       jobOutput: resolvedJobOutput,
@@ -1129,7 +1195,7 @@ export const useTaskStore = defineStore('task', () => {
       stageLabel: STAGE_META.queued.label,
       files: [],
       outputs: [],
-      logs: [`${new Date().toLocaleTimeString()} Queued workflow: ${workflow.name}`],
+      logs: [localLogRecord(`Queued workflow: ${workflow.name}`, 'task.queued', 'info', { taskId: id })],
       runConfig: buildWorkflowRunConfig(workflow, outputLayout, outputNaming),
     }
     tasks.value.unshift(task)
@@ -1148,14 +1214,14 @@ export const useTaskStore = defineStore('task', () => {
     setTaskStatus(task.id, 'preparing', 'Preparing task')
     try {
       if (config.runMode === 'workflow') {
-        const validationError = workflowDefinitionValidationError(config.workflowDefinition || {})
-        if (validationError) throw new Error(validationError)
+        validateWorkflowRunConfig(config)
         await invoke<{ taskId: string; started: boolean }>('start_workflow_inference', {
           payload: {
             taskId: task.id,
             workflowName: config.workflowName || task.model,
             workflow: config.workflowDefinition || {},
             input: task.input || null,
+            ...(config.workbench && !config.workbench.nativeGraph ? { workbench: true, inputs: config.workbench.inputs, workbenchOutputs: config.workbench.outputs } : {}),
             output: config.outputLayout === 'folders' ? (task.jobOutput || task.output) : task.output,
             modelDir: config.modelDir ?? (settings.modelDir || null),
             source: config.downloadSource || settings.downloadSource,
@@ -1212,7 +1278,7 @@ export const useTaskStore = defineStore('task', () => {
   }
 
   async function startBatchWorker(batchTasks: SeparationTask[]) {
-    if (!batchTasks.length) return false
+    if (!batchTasks.length || batchTasks.some(task => task.status !== 'queued')) return false
     rememberSessionTasks(batchTasks)
     const settings = useSettingsStore()
     const primary = batchTasks[0]
@@ -1269,7 +1335,7 @@ export const useTaskStore = defineStore('task', () => {
   }
 
   async function startWorkflowBatchWorker(batchTasks: SeparationTask[]) {
-    if (!batchTasks.length) return false
+    if (!batchTasks.length || batchTasks.some(task => task.status !== 'queued')) return false
     rememberSessionTasks(batchTasks)
     const settings = useSettingsStore()
     const primary = batchTasks[0]
@@ -1278,17 +1344,20 @@ export const useTaskStore = defineStore('task', () => {
       setTaskStatus(task.id, 'preparing', 'Preparing workflow batch task')
     })
     try {
+      for (const task of batchTasks) validateWorkflowRunConfig(task.runConfig || config)
       await invoke<{ taskId: string; started: boolean }>('start_workflow_inference', {
         payload: {
           taskId: primary.id,
           workflowName: config.workflowName || primary.model,
           workflow: config.workflowDefinition || {},
           output: primary.jobOutput || primary.output,
+          ...(config.workbench && !config.workbench.nativeGraph ? { workbench: true } : {}),
           tasks: batchTasks.map((task, index) => ({
             taskId: task.id,
             input: task.input,
             output: task.output,
             inputIndex: index + 1,
+            ...(task.runConfig?.workbench && !task.runConfig.workbench.nativeGraph ? { inputs: task.runConfig.workbench.inputs, workbenchOutputs: task.runConfig.workbench.outputs } : {}),
           })),
           modelDir: config.modelDir ?? (settings.modelDir || null),
           source: config.downloadSource || settings.downloadSource,
@@ -1321,22 +1390,39 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
+  let schedulingQueue = false
+  let queueScheduleRequested = false
+
   function scheduleQueue() {
     // Browser-only previews cannot start a Rust worker. Keep restored queue items
     // intact until the desktop runtime is available instead of failing them on boot.
     if (!isTauriRuntime()) return
-    const nextJobs = selectQueuedJobGroups(tasks.value, maxConcurrentSeparations())
-    nextJobs.forEach((jobTasks) => {
-      if (jobTasks.length === 1) {
-        void startQueuedTask(jobTasks[0].id)
-        return
-      }
-      if (jobTasks[0].runConfig?.runMode === 'workflow') {
-        void startWorkflowBatchWorker(jobTasks)
-      } else {
-        void startBatchWorker(jobTasks)
-      }
-    })
+    if (!isMainTaskOwner()) return
+    if (schedulingQueue) {
+      queueScheduleRequested = true
+      return
+    }
+    schedulingQueue = true
+    try {
+      do {
+        queueScheduleRequested = false
+        const nextJobs = selectQueuedJobGroups(tasks.value, maxConcurrentSeparations())
+        nextJobs.forEach((jobTasks) => {
+          if (jobTasks.length === 1) {
+            void startQueuedTask(jobTasks[0].id)
+            return
+          }
+          if (jobTasks[0].runConfig?.runMode === 'workflow') {
+            void startWorkflowBatchWorker(jobTasks)
+          } else {
+            void startBatchWorker(jobTasks)
+          }
+        })
+        // Synchronous validation failures request another pass after the current selection is consumed.
+      } while (queueScheduleRequested)
+    } finally {
+      schedulingQueue = false
+    }
   }
 
   function setTaskStatus(id: string, status: TaskStatus, message?: string, progress?: number) {
@@ -1361,7 +1447,7 @@ export const useTaskStore = defineStore('task', () => {
       : status === 'separating'
         ? normalizedProgress
         : Math.max(task.progress || 0, normalizedProgress)
-    task.logs.push(`${new Date().toLocaleTimeString()} ${task.message}`)
+    task.logs.push(localLogRecord(task.message, `task.${status}`, status === 'failed' ? 'error' : 'info', { taskId: task.id }))
     task.logs = task.logs.slice(-getLogLimit(settings.developerMode))
     touch(task)
     if (TERMINAL_STATUSES.includes(status)) markTaskFinished(task, task.updatedAt)
@@ -1378,6 +1464,65 @@ export const useTaskStore = defineStore('task', () => {
     } else if (event.type === 'task_stage') {
       const stage = normalizeStatus(event.payload?.stage)
       setTaskStatus(taskId, stage, event.payload?.message || STAGE_META[stage].label, event.payload?.progress)
+    } else if (event.type === 'workflow_execution') {
+      // Native graph execution supplies explicit lifecycle events. Do not infer
+      // node completion from a progress fraction: output collection still runs
+      // after execution_completed, and task_done remains the task terminal event.
+      if (isTerminalTaskStatus(task.status) || task.runConfig?.runMode !== 'workflow') return
+      const payload = event.payload || {}
+      const executionEvent = typeof payload.event === 'string' ? payload.event : ''
+      const knownExecutionEvent = [
+        'execution_started', 'execution_completed', 'execution_failed', 'execution_cancelled',
+        'node_started', 'node_progress', 'node_completed', 'node_failed', 'node_cancelled', 'node_skipped',
+      ].includes(executionEvent)
+      if (payload.version !== 1 || !knownExecutionEvent) return
+      const nodeEvent = executionEvent.startsWith('node_')
+      const nodeId = typeof payload.nodeId === 'string' && payload.nodeId.trim() ? payload.nodeId : undefined
+      const message = typeof payload.message === 'string' ? payload.message : ''
+      const fraction = typeof payload.overallFraction === 'number' && Number.isFinite(payload.overallFraction)
+        ? clamp(payload.overallFraction, 0, 1) : undefined
+      task.status = 'separating'
+      markTaskStarted(task)
+      task.stageLabel = STAGE_META.separating.label
+      task.message = message || STAGE_META.separating.label
+      if (fraction !== undefined) task.progress = Math.max(task.progress || 0, Math.min(90, 35 + fraction * 55))
+      const done = Number(payload.done)
+      const total = Number(payload.total)
+      if (payload.unit === 'seconds' && Number.isFinite(done) && Number.isFinite(total)) {
+        task.progressCurrent = done
+        task.progressTotal = total
+        task.progressDetail = message || undefined
+      } else {
+        task.progressCurrent = undefined
+        task.progressTotal = undefined
+        task.progressDetail = undefined
+      }
+      if (nodeId && nodeEvent) {
+        task.nodeStates ||= {}
+        const previous = task.nodeStates[nodeId]
+        if (!previous) (task.nodeExecutionOrder ||= []).push(nodeId)
+        const nodeFraction = typeof payload.nodeProgress === 'number' && Number.isFinite(payload.nodeProgress)
+          ? clamp(payload.nodeProgress, 0, 1) : undefined
+        const nodeStatus = executionEvent === 'node_completed' ? 'done'
+          : executionEvent === 'node_failed' ? 'failed'
+            : executionEvent === 'node_cancelled' ? 'cancelled'
+              : executionEvent === 'node_skipped' ? 'skipped'
+                : 'running'
+        const progress = nodeStatus === 'done' ? 100
+          : nodeFraction === undefined ? (previous?.progress || 0) : nodeFraction * 100
+        task.nodeStates[nodeId] = { status: nodeStatus, progress, ...(message ? { message } : {}) }
+        if (nodeStatus === 'running' || nodeStatus === 'failed') task.currentNodeId = nodeId
+        else if (task.currentNodeId === nodeId) task.currentNodeId = undefined
+        if (message && ['node_started', 'node_completed', 'node_failed', 'node_cancelled', 'node_skipped'].includes(executionEvent)) {
+          const prefix = executionEvent === 'node_completed' ? 'Node completed: '
+            : executionEvent === 'node_failed' ? 'Node failed: '
+              : executionEvent === 'node_cancelled' ? 'Node cancelled: '
+                : executionEvent === 'node_skipped' ? 'Node skipped: ' : 'Node started: '
+          appendWorkflowNodeLogs(task, nodeId, localLogRecord(`${prefix}${message}`, executionEvent, nodeStatus === 'failed' ? 'error' : 'info', { taskId: task.id, nodeId }))
+        }
+      }
+      touch(task)
+      queueProgressPersist()
     } else if (event.type === 'task_progress') {
       // Terminal states are monotonic. A worker may flush a progress line after
       // cancellation or failure has already been observed; never resurrect it.
@@ -1386,6 +1531,22 @@ export const useTaskStore = defineStore('task', () => {
       const done = Number(event.payload?.done)
       const total = Number(event.payload?.total)
       const detail = typeof event.payload?.message === 'string' ? event.payload.message : undefined
+      const nodeId = typeof event.payload?.nodeId === 'string' ? event.payload.nodeId : undefined
+      const nodeProgress = event.payload?.nodeProgress
+      if (nodeId && typeof nodeProgress === 'number' && Number.isFinite(nodeProgress)) {
+        const fraction = clamp(nodeProgress, 0, 1)
+        task.nodeStates ||= {}
+        const previous = task.nodeStates[nodeId]
+        if (!previous) (task.nodeExecutionOrder ||= []).push(nodeId)
+        const complete = fraction >= 1 && event.payload?.audioIndex == null && event.payload?.unit == null
+        const status = complete ? 'done' : 'running'
+        if (detail && (!previous || previous.status !== status || previous.message !== detail)) {
+          const transition = status === 'done' && previous?.status !== 'done' ? 'Node completed: ' : !previous ? 'Node started: ' : ''
+          appendWorkflowNodeLogs(task, nodeId, localLogRecord(`${transition}${detail}`, `node.${status}`, 'info', { taskId: task.id, nodeId }))
+        }
+        task.nodeStates[nodeId] = { status, progress: fraction * 100, message: detail }
+        task.currentNodeId = complete ? undefined : nodeId
+      }
       task.status = stage
       if (stage !== 'queued') markTaskStarted(task)
       task.stageLabel = STAGE_META[stage].label
@@ -1402,17 +1563,34 @@ export const useTaskStore = defineStore('task', () => {
         : Math.max(task.progress || 0, resolvedProgress)
       touch(task)
       queueProgressPersist()
-    } else if (event.type === 'task_log') {
-      const settings = useSettingsStore()
-      const level = String(event.payload?.level || 'info')
-      const message = String(event.payload?.message || '')
-      appendTaskLogs(task, settings.developerMode ? `[${level}] ${message}` : `${level}: ${message}`)
+    } else if (event.type === 'task_log' || event.type === 'worker_log') {
+      const record = workerLogRecord(event)
+      if ((record.level === 'debug' || record.level === 'trace') && !useSettingsStore().developerMode) return
+      appendTaskLogs(task, record)
+      appendWorkflowNodeLogs(task, record.nodeId, record)
     } else if (event.type === 'error') {
       if (isTerminalTaskStatus(task.status)) return
+      if (task.runConfig?.workbench && Array.isArray(event.payload?.outputs)) {
+        task.outputs = normalizeStemOutputs(event.payload.outputs, task.input, windowsPaths.value)
+        task.files = task.outputs.map(output => output.path)
+      }
+      if (typeof event.payload?.nodeId === 'string' && task.nodeStates?.[event.payload.nodeId]) {
+        task.nodeStates[event.payload.nodeId].status = 'failed'
+      }
+      if (task.currentNodeId && task.nodeStates?.[task.currentNodeId]) {
+        task.nodeStates[task.currentNodeId].status = 'failed'
+      }
       const codeValue = event.payload?.code
       const code = codeValue ? `[${codeValue}] ` : ''
       const message = resolveTaskErrorMessage(codeValue, event.payload?.message, task.input)
       const detail = event.payload?.detail || ''
+      const errorRecord = event.payload?.logRecord ? workerLogRecord(event) : normalizeLogRecord({
+        schemaVersion: 1, id: `${task.id}-error-${task.logs.length}`, timestamp: event.timestamp || new Date().toISOString(),
+        source: 'worker', level: 'error', logger: 'worker', event: 'task.failed', message: `${code}${message}`,
+        detail: String(detail), taskId: task.id, nodeId: event.payload?.nodeId || task.currentNodeId, context: {},
+      })
+      appendWorkflowNodeLogs(task, typeof event.payload?.nodeId === 'string' ? event.payload.nodeId : task.currentNodeId,
+        errorRecord)
       const recoverable = Boolean(event.payload?.recoverable)
       task.error = message
       task.message = message
@@ -1428,7 +1606,7 @@ export const useTaskStore = defineStore('task', () => {
         task.progress = 100
       }
       if (!recoverable) markTaskFinished(task)
-      appendTaskLogs(task, [`error: ${code}${message}`, detail ? `traceback:\n${detail}` : ''])
+      appendTaskLogs(task, errorRecord)
     } else if (event.type === 'task_done') {
       if (isTerminalTaskStatus(task.status)) return
       task.status = 'done'
@@ -1443,18 +1621,28 @@ export const useTaskStore = defineStore('task', () => {
       if (Array.isArray(event.payload?.nodeValues)) task.nodeValues = event.payload.nodeValues
       if (event.payload?.outputDir) {
         task.output = event.payload.outputDir
-        if (task.runConfig?.outputLayout === 'flat') task.jobOutput = event.payload.outputDir
       }
-      const normalizedOutputs = normalizeStemOutputs(event.payload?.outputs, task.input)
+      if (task.runConfig?.workbench && Array.isArray(event.payload?.outputDirectories)) {
+        task.outputDirectories = event.payload.outputDirectories.filter((path: unknown): path is string => typeof path === 'string' && Boolean(path.trim()))
+        if (task.outputDirectories?.length) task.output = task.outputDirectories[0]
+      }
+      if (typeof event.payload?.outputRoot === 'string' && event.payload.outputRoot) {
+        task.jobOutput = event.payload.outputRoot
+      } else if (task.runConfig?.outputLayout === 'flat' && event.payload?.outputDir) {
+        task.jobOutput = event.payload.outputDir
+      }
+      const normalizedOutputs = normalizeStemOutputs(event.payload?.outputs, task.input, windowsPaths.value)
       task.outputs = normalizedOutputs.length
         ? normalizedOutputs
-        : outputsFromFiles(task.output, task.files, event.payload?.outputFormat || 'wav', task.outputPrefix, task.input)
+        : outputsFromFiles(task.output, task.files, event.payload?.outputFormat || 'wav', task.outputPrefix, task.input, windowsPaths.value)
       task.error = undefined
       touch(task)
       markTaskFinished(task, task.updatedAt)
       queuePersist()
     } else if (event.type === 'task_cancelled') {
       if (isTerminalTaskStatus(task.status)) return
+      if (task.currentNodeId && task.nodeStates?.[task.currentNodeId]) task.nodeStates[task.currentNodeId].status = 'cancelled'
+      appendWorkflowNodeLogs(task, task.currentNodeId, localLogRecord(event.payload?.message || 'Cancelled', 'task.cancelled', 'info', { taskId: task.id, nodeId: task.currentNodeId }))
       task.status = 'cancelled'
       markTaskStarted(task)
       task.message = event.payload?.message || 'Cancelled'
@@ -1544,7 +1732,7 @@ export const useTaskStore = defineStore('task', () => {
   function resultTrashTargets(task: SeparationTask): string[] {
     const seen = new Set<string>()
     return task.outputs
-      .map((output) => output.path?.trim())
+      .map((output) => output.path)
       .filter((path): path is string => Boolean(path))
       .filter((path) => {
         if (seen.has(path)) return false
@@ -1553,19 +1741,67 @@ export const useTaskStore = defineStore('task', () => {
       })
   }
 
+  function resultTrashTargetsForTasks(items: SeparationTask[]): { paths: string[]; retained: number } {
+    const removing = getRemovalTasks(items.map(item => item.id))
+    const removingIds = new Set(removing.map(item => item.id))
+    const windows = windowsPaths.value
+    const protectedPaths = new Set<string>()
+    const protectedDirectories = new Set<string>()
+    for (const item of tasks.value) {
+      if (item.input) protectedPaths.add(pathKey(item.input, windows))
+      for (const input of Object.values(item.runConfig?.workbench?.inputs || {})) {
+        if (input) protectedPaths.add(pathKey(input, windows))
+      }
+      const definition = item.runConfig?.workflowDefinition || item.runConfig?.workbench?.sourceDefinition
+      if (definition) {
+        for (const node of workflowInputNodes(definition)) {
+          if (node.embeddedPath) protectedPaths.add(pathKey(node.embeddedPath, windows))
+        }
+        if (!removingIds.has(item.id)) {
+          for (const node of Array.isArray(definition.nodes) ? definition.nodes : []) {
+            if (node?.type === 'pymss_load_audio_batch' && typeof node.widgets_values?.[0] === 'string') {
+              const directory = pathKey(node.widgets_values[0], windows)
+              if (directory) protectedDirectories.add(directory.endsWith('/') ? directory : `${directory}/`)
+            }
+          }
+        }
+      }
+      if (!removingIds.has(item.id)) {
+        for (const output of item.outputs) protectedPaths.add(pathKey(output.path, windows))
+      }
+    }
+    const seen = new Set<string>()
+    let retained = 0
+    const directories = [...protectedDirectories]
+    const paths = removing.flatMap(resultTrashTargets).filter(path => {
+      const key = pathKey(path, windows)
+      if (seen.has(key)) return false
+      seen.add(key)
+      if (protectedPaths.has(key) || directories.some(directory => key.startsWith(directory))) {
+        retained += 1
+        return false
+      }
+      return true
+    })
+    return { paths, retained }
+  }
+
   function resultTrashEmptyDirs(task: SeparationTask): string[] {
+    // Node-bound directories can have unrelated roots; only recycle explicit output files.
+    if (task.runConfig?.workbench) return []
     if (task.runConfig?.outputLayout !== 'folders') return []
-    const jobOutput = task.jobOutput?.trim()
-    const output = task.output?.trim()
-    if (output && !samePath(output, jobOutput)) return cleanupDirChain(output, jobOutput)
+    const jobOutput = task.jobOutput
+    const output = task.output
+    const windows = windowsPaths.value
+    if (output && !samePath(output, jobOutput, windows)) return cleanupDirChain(output, jobOutput, windows)
 
     const parents = task.outputs
-      .map((item) => parentDir(item.path || ''))
+      .map((item) => parentDir(item.path || '', windows))
       .filter(Boolean)
-    const dirs = parents.flatMap(parent => cleanupDirChain(parent, jobOutput))
+    const dirs = parents.flatMap(parent => cleanupDirChain(parent, jobOutput, windows))
     const seen = new Set<string>()
     return dirs.filter((dir) => {
-      const key = dir.toLowerCase()
+      const key = pathKey(dir, windows)
       if (seen.has(key)) return false
       seen.add(key)
       return true
@@ -1573,7 +1809,7 @@ export const useTaskStore = defineStore('task', () => {
   }
 
   function primaryRevealPath(task: SeparationTask) {
-    return task.output
+    return task.runConfig?.workbench ? task.outputs[0]?.path || task.output : task.output
   }
 
   function getTaskById(id: string) {
@@ -1637,33 +1873,64 @@ export const useTaskStore = defineStore('task', () => {
     return removed
   }
 
-  // 结果页删除：仅隐藏结果项，不影响任务页日志记录
-  function removeResult(id: string) {
-    const target = tasks.value.find((task) => task.id === id)
-    if (!target) return
-    target.resultHidden = true
-    if (focusedResultTaskId.value === id) focusedResultTaskId.value = null
-    reclaimHiddenTasks()
-    queuePersist()
+  function getRemovalTasks(ids: string[]) {
+    const selected = new Set(ids)
+    const jobs = new Set(tasks.value.filter(task => selected.has(task.id)).map(taskJobId))
+    const related = tasks.value.filter(task => jobs.has(taskJobId(task)))
+    if (related.some(task => !isTerminalTaskStatus(task.status))) {
+      throw new Error(i18n.global.t('results.removeRunningBatch'))
+    }
+    return related
   }
 
-  function removeResults(ids: string[]) {
-    const removeSet = new Set(ids)
-    if (!removeSet.size) return 0
-    let removed = 0
-    tasks.value.forEach((task) => {
-      if (removeSet.has(task.id) && !task.resultHidden) {
-        task.resultHidden = true
-        removed += 1
-      }
-    })
-    if (!removed) return 0
-    if (focusedResultTaskId.value && removeSet.has(focusedResultTaskId.value)) {
-      focusedResultTaskId.value = null
+  // Result deletion owns the complete run record, including failed siblings.
+  // Editor projects and optional file recycling are handled before this call.
+  function removeResult(id: string) {
+    return removeResults([id])
+  }
+
+  async function removeResults(ids: string[]) {
+    const related = getRemovalTasks(ids)
+    if (!related.length) return 0
+    const removedIds = new Set(related.map(task => task.id))
+    const previous = [...tasks.value]
+    tasks.value = tasks.value.filter(task => !removedIds.has(task.id))
+    try {
+      await persistTasks()
+    } catch (error) {
+      // Preserve concurrent progress and newly queued work when restoring records.
+      const current = new Map(tasks.value.map(task => [task.id, task]))
+      const previousIds = new Set(previous.map(task => task.id))
+      tasks.value = [
+        ...tasks.value.filter(task => !previousIds.has(task.id)),
+        ...previous.flatMap(task => current.has(task.id) ? [current.get(task.id)!] : removedIds.has(task.id) ? [task] : []),
+      ]
+      queuePersist()
+      throw error
     }
-    reclaimHiddenTasks()
-    queuePersist()
-    return removed
+    sessionTaskIds.value = new Set([...sessionTaskIds.value].filter(id => !removedIds.has(id)))
+    if (activeTaskId.value && removedIds.has(activeTaskId.value)) activeTaskId.value = taskBoardTasks.value[0]?.id || null
+    if (focusedTaskId.value && removedIds.has(focusedTaskId.value)) focusedTaskId.value = null
+    if (focusedResultTaskId.value && removedIds.has(focusedResultTaskId.value)) focusedResultTaskId.value = null
+    return related.length
+  }
+
+  async function removeWorkflowRun(workflowId: string, jobId: string) {
+    const job = getJobById(jobId)
+    if (!job) return
+    if (!job.tasks.every(task => task.runConfig?.workbench && task.runConfig.workflowId === workflowId)) {
+      throw new Error(i18n.global.t('workbench.runNotFound'))
+    }
+    if (job.tasks.some(hasResultPresence)) throw new Error(i18n.global.t('workbench.removeRunHasResults'))
+    await removeResults(job.tasks.map(task => task.id))
+  }
+
+  async function removeSeparationRuns(jobIds: string[]) {
+    const selected = new Set(jobIds)
+    const related = tasks.value.filter(task => selected.has(taskJobId(task)))
+    if (related.some(task => task.runConfig?.workbench)) throw new Error(i18n.global.t('workbench.runNotFound'))
+    if (related.some(hasResultPresence)) throw new Error(i18n.global.t('workbench.removeRunHasResults'))
+    return removeResults(related.map(task => task.id))
   }
 
   function clearHistory() {
@@ -1675,24 +1942,9 @@ export const useTaskStore = defineStore('task', () => {
     queuePersist()
   }
 
-  // 结果页清空：将指定结果（或全部当前可见结果）标记为 resultHidden，不影响任务页与磁盘文件
+  // Empty selections must not turn into a request to remove all results.
   function clearResults(ids?: string[]) {
-    const removeSet = ids?.length ? new Set(ids) : null
-    let removed = 0
-    tasks.value.forEach((task) => {
-      if (task.resultHidden) return
-      if (task.status !== 'done' || (!task.outputs.length && !task.files.length)) return
-      if (removeSet && !removeSet.has(task.id)) return
-      if (!task.resultHidden) {
-        task.resultHidden = true
-        removed += 1
-      }
-    })
-    if (!removed) return 0
-    focusedResultTaskId.value = null
-    reclaimHiddenTasks()
-    queuePersist()
-    return removed
+    return removeResults(ids ?? resultTasks.value.map(task => task.id))
   }
 
   async function cancelAllTasks() {
@@ -1724,6 +1976,8 @@ export const useTaskStore = defineStore('task', () => {
     }
     const cancelled = await invoke<boolean>('cancel_task', { taskId: id })
     if (cancelled) {
+      if (task.currentNodeId && task.nodeStates?.[task.currentNodeId]) task.nodeStates[task.currentNodeId].status = 'cancelled'
+      appendWorkflowNodeLogs(task, task.currentNodeId, '[info] Cancelled')
       task.status = 'cancelled'
       task.message = 'Cancelled'
       task.stageLabel = STAGE_META.cancelled.label
@@ -1734,6 +1988,16 @@ export const useTaskStore = defineStore('task', () => {
       scheduleQueue()
     }
     return cancelled
+  }
+
+  async function cancelWorkbenchJob(jobId: string) {
+    const targets = tasks.value.filter(task => (task.jobId || task.id) === jobId && !isTerminalTaskStatus(task.status))
+    // Remove the entire queued remainder before any cancellation can resume scheduling.
+    for (const target of targets.filter(task => task.status === 'queued')) setTaskStatus(target.id, 'cancelled', 'Cancelled')
+    for (const target of targets) {
+      if (!isTerminalTaskStatus(target.status)) await cancelTask(target.id)
+    }
+    scheduleQueue()
   }
 
   function buildInferenceParams(modelType?: string | null): Record<string, unknown> {
@@ -1888,8 +2152,8 @@ export const useTaskStore = defineStore('task', () => {
     return params
   }
 
-  function submitOne(input: string, model: string, inferenceParams: Record<string, unknown>, modelType?: string | null, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig) {
-    return createQueuedTask(input, model, inferenceParams, modelType, jobId, jobOutput, outputLayout, outputNaming)
+  function submitOne(input: string, model: string, inferenceParams: Record<string, unknown>, modelType?: string | null, jobId?: string, jobOutput?: string, outputLayout: OutputLayout = 'folders', outputNaming?: OutputNamingConfig, batchIndex?: number) {
+    return createQueuedTask(input, model, inferenceParams, modelType, jobId, jobOutput, outputLayout, outputNaming, batchIndex)
   }
 
   async function startSeparation(options: { outputDir?: string; outputLayout?: OutputLayout; outputNaming?: OutputNamingConfig } = {}) {
@@ -1909,11 +2173,10 @@ export const useTaskStore = defineStore('task', () => {
     const inferenceParams = buildInferenceParams(modelType)
     const targets = [...inputFiles.value]
     const jobId = createRunId('job')
-    const settings = useSettingsStore()
     const outputLayout = normalizeOutputLayout(options.outputLayout)
-    const jobOutput = normalizeOutputPath(options.outputDir || settings.outputDir)
+    const jobOutput = resolveOutputDirectory(options.outputDir, separateOutputDir.value, windowsPaths.value)
     const outputNaming = normalizeOutputNaming(options.outputNaming)
-    const createdTasks = targets.map(input => submitOne(
+    const createdTasks = targets.map((input, batchIndex) => submitOne(
       input,
       model,
       inferenceParams,
@@ -1922,6 +2185,7 @@ export const useTaskStore = defineStore('task', () => {
       jobOutput,
       outputLayout,
       outputNaming,
+      batchIndex,
     ))
     modelStore.recordModelUse(model)
     scheduleQueue()
@@ -1937,36 +2201,113 @@ export const useTaskStore = defineStore('task', () => {
     return ''
   }
 
+  function validateSeparateWorkflowInput(definition: Record<string, unknown>) {
+    const issue = getSeparateWorkflowInputIssue(definition)
+    if (issue) throw new Error(i18n.global.t(
+      issue.code === 'multiple-inputs' ? 'separate.workflowMultipleInputs' : 'separate.workflowNoInput',
+      { count: issue.count },
+    ))
+  }
+
+  function validateWorkflowRunConfig(config: SeparationRunConfig) {
+    const definition = config.workflowDefinition || {}
+    const validationError = workflowDefinitionValidationError(definition)
+    if (validationError) throw new Error(validationError)
+    if (!config.workbench) validateSeparateWorkflowInput(definition)
+  }
+
   async function startWorkflowInference(workflow: WorkflowEntry, options: { outputDir?: string; outputLayout?: OutputLayout; outputNaming?: OutputNamingConfig } = {}) {
     if (!workflow?.id) {
       throw new Error('Workflow is required')
     }
     const validationError = workflowDefinitionValidationError(workflow.definition)
     if (validationError) throw new Error(validationError)
-    const settings = useSettingsStore()
+    validateSeparateWorkflowInput(workflow.definition)
     const targets = [...inputFiles.value]
     if (!targets.length) {
       throw new Error(i18n.global.t('separate.startHintNoInput'))
     }
     const jobId = createRunId('job')
     const outputLayout = normalizeOutputLayout(options.outputLayout)
-    const jobOutput = normalizeOutputPath(options.outputDir || settings.outputDir)
+    const jobOutput = resolveOutputDirectory(options.outputDir, separateOutputDir.value, windowsPaths.value)
     const outputNaming = normalizeOutputNaming(options.outputNaming)
-    const createdTasks = targets.map(input => createQueuedWorkflowTask(
+    const createdTasks = targets.map((input, batchIndex) => createQueuedWorkflowTask(
       input,
       workflow,
       jobId,
       jobOutput,
       outputLayout,
       outputNaming,
+      batchIndex,
     ))
     scheduleQueue()
     return { succeeded: targets.length, failed: 0, total: targets.length, jobId, tasks: createdTasks }
   }
+  async function startWorkbenchInference(workflow: WorkflowEntry, bindings: WorkflowRuntimeBindings) {
+    if (!isMainTaskOwner()) throw new Error('workbench.mainWindowOnly')
+    const validationError = workflowDefinitionValidationError(workflow.definition)
+    if (validationError) throw new Error(validationError)
+    const nativeGraph = detectWorkflowFormat(workflow.definition) === 'graph'
+    const directory = resolveOutputDirectory(bindings.outputDirectory, useSettingsStore().outputDir, windowsPaths.value)
+    const prepared = prepareWorkbenchRun(workflow.definition, bindings, directory, windowsPaths.value)
+    const jobId = createRunId('job')
+    const runtimeEntry = { ...workflow, definition: prepared.definition }
+    const createdTasks = prepared.runs.map((run, batchIndex) => {
+      const created = createQueuedWorkflowTask(run.input, runtimeEntry, jobId, directory, nativeGraph ? 'flat' : bindings.outputLayout, undefined, batchIndex)
+      const config = tasks.value.find(task => task.id === created.id)!.runConfig!
+      config.useTta = false
+      if (nativeGraph) config.workflowDefinition = cloneWorkflow(workflow.definition)
+      config.workbench = {
+        version: 1, ...(nativeGraph ? { nativeGraph: true as const } : {}), sourceUpdatedAt: workflow.updatedAt,
+        sourceDefinition: cloneWorkflow(workflow.definition), bindings: cloneWorkflow(bindings),
+        inputs: cloneWorkflow(run.inputs), outputs: cloneWorkflow(run.outputs),
+      }
+      return created
+    })
+    queuePersist()
+    scheduleQueue()
+    return { jobId, tasks: createdTasks, total: createdTasks.length }
+  }
+
   async function retryTask(taskId: string) {
     const existing = tasks.value.find((t) => t.id === taskId)
     if (!existing) return
+    if (existing.runConfig?.workbench && existing.runConfig.workflowDefinition) {
+      const config = cloneWorkflow(existing.runConfig)
+      const snapshot = config.workbench!
+      const created = createQueuedWorkflowTask(existing.input, {
+        id: config.workflowId!, name: config.workflowName || existing.model, description: '',
+        definition: snapshot.sourceDefinition, format: detectWorkflowFormat(snapshot.sourceDefinition),
+        formatVersion: WORKFLOW_FORMAT_VERSION, createdAt: existing.createdAt, updatedAt: snapshot.sourceUpdatedAt,
+      }, undefined, existing.jobOutput || existing.output, config.outputLayout, config.outputNaming)
+      const queued = tasks.value.find(task => task.id === created.id)!
+      queued.runConfig = config
+      queued.output = existing.output
+      scheduleQueue()
+      return created
+    }
+    const outputLayout = normalizeOutputLayout(existing.runConfig?.outputLayout)
+    const windows = windowsPaths.value
+    const isAbsolute = (path: string) => windows ? /^(?:[A-Za-z]:[/\\]|[/\\]{2})/.test(path) : path.startsWith('/')
+    let jobOutput = existing.jobOutput
+    if (!jobOutput || !isAbsolute(jobOutput)) {
+      const output = existing.output
+      if (!isAbsolute(output)) throw new Error(i18n.global.t('separate.retryOutputDirectoryUnknown'))
+      if (outputLayout === 'folders') {
+        const folderName = output.split(windows ? /[/\\]/ : /[/]/).filter(Boolean).pop()
+        const inputName = inputStemSegment(existing.input, existing.resultId || existing.id, windows)
+        const matchesInput = windows ? folderName?.toLowerCase() === inputName.toLowerCase() : folderName === inputName
+        if (!matchesInput) throw new Error(i18n.global.t('separate.retryOutputDirectoryUnknown'))
+        jobOutput = output.replace(windows ? /[^/\\]+[/\\]*$/ : /[^/]+[/]*$/, '')
+        if (jobOutput.length > 1 && !(windows && /^[A-Za-z]:[/\\]$/.test(jobOutput))) {
+          jobOutput = jobOutput.replace(windows ? /[/\\]$/ : /[/]$/, '')
+        }
+      } else {
+        jobOutput = output
+      }
+    }
     if (existing.runConfig?.runMode === 'workflow' && existing.runConfig.workflowId && existing.runConfig.workflowName && existing.runConfig.workflowDefinition) {
+      validateSeparateWorkflowInput(existing.runConfig.workflowDefinition)
       const task = createQueuedWorkflowTask(existing.input, {
         id: existing.runConfig.workflowId,
         name: existing.runConfig.workflowName,
@@ -1976,7 +2317,7 @@ export const useTaskStore = defineStore('task', () => {
         formatVersion: WORKFLOW_FORMAT_VERSION,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
-      }, undefined, undefined, existing.runConfig.outputLayout, existing.runConfig.outputNaming)
+      }, undefined, jobOutput, outputLayout, existing.runConfig.outputNaming)
       scheduleQueue()
       return task
     }
@@ -1986,12 +2327,14 @@ export const useTaskStore = defineStore('task', () => {
     const persistedModelType = existing.runConfig?.modelType ?? null
     const modelEntry = modelStore.models.find((item) => item.name === existing.model) || null
     const modelType = modelEntry?.modelType || persistedModelType || null
-    const task = createQueuedTask(existing.input, existing.model, retryParams, modelType, undefined, undefined, existing.runConfig?.outputLayout, existing.runConfig?.outputNaming)
+    const task = createQueuedTask(existing.input, existing.model, retryParams, modelType, undefined, jobOutput, outputLayout, existing.runConfig?.outputNaming)
     scheduleQueue()
     return task
   }
 
   return {
+    cancelWorkbenchJob,
+    startWorkbenchInference,
     initialized,
     tasks,
     activeTaskId,
@@ -2018,6 +2361,7 @@ export const useTaskStore = defineStore('task', () => {
     ensembleType,
     ensembleWeights,
     separateTemporaryOutputDir,
+    separateOutputDir,
     separateOutputLayout,
     separateOutputNamingTemplate,
     separateCustomStemOrder,
@@ -2053,6 +2397,7 @@ export const useTaskStore = defineStore('task', () => {
     trashResultPaths,
     resultTrashEmptyDirs,
     resultTrashTargets,
+    resultTrashTargetsForTasks,
     primaryRevealPath,
     getTaskById,
     getJobById,
@@ -2065,6 +2410,9 @@ export const useTaskStore = defineStore('task', () => {
     clearFinishedSessionJobs,
     removeResult,
     removeResults,
+    getRemovalTasks,
+    removeWorkflowRun,
+    removeSeparationRuns,
     clearResults,
     clearHistory,
     cancelTask,

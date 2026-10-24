@@ -63,7 +63,7 @@ class InferenceLifecycleTests(unittest.TestCase):
         self.emit.assert_any_call("task_done", {
             "files": [str(self.output / "vocals.wav")],
             "outputs": self.separator.studio_outputs.return_value,
-            "outputDir": str(self.output.resolve()), "outputFormat": "wav",
+            "outputDir": str(self.output.resolve()), "outputRoot": str(self.output.resolve()), "outputFormat": "wav",
         }, task_id="separation-1")
 
     def test_generic_errors_preserve_code_message_traceback_and_task_id(self) -> None:

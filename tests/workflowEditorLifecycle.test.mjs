@@ -118,14 +118,19 @@ function environment() {
   const reads = []
   const writes = []
   const exports = []
+  const editorOpens = []
+  let editorOpenError
+  let nativeEditorSnapshot = null
   const callbacks = new Map()
   const listeners = new Map()
   let callbackId = 0
   globalThis.window = {
     setTimeout: () => 0,
     __TAURI_INTERNALS__: {
+      metadata: { currentWindow: { label: 'main' } },
       transformCallback(handler) { callbacks.set(++callbackId, handler); return callbackId },
       async invoke(command, args) {
+        if (command === 'get_workflow_editors') return structuredClone(nativeEditorSnapshot)
         if (command === 'load_app_store') {
           assert.equal(args.name, 'workflow-state')
           reads.push(args.name)
@@ -133,6 +138,10 @@ function environment() {
         }
         if (command === 'mutate_workflow_store') {
           const mutation = args.payload
+          const target = mutation.entry?.id || mutation.workflowId
+          if (['upsert', 'delete'].includes(mutation.action) && nativeEditorSnapshot?.editors.some(editor => editor.workflowId === target && editor.label !== 'main')) {
+            throw new Error('WORKFLOW_EDITOR_IN_USE')
+          }
           if (mutateHook) await mutateHook(mutation)
           const state = structuredClone(stored)
           state.workflows ||= []
@@ -226,6 +235,11 @@ function environment() {
           writes.push(stored)
           return null
         }
+        if (command === 'open_workflow_simple_editor_window' || command === 'open_workflow_node_editor_window') {
+          if (editorOpenError) throw editorOpenError
+          editorOpens.push({ command, payload: args.payload })
+          return { opened: true }
+        }
         if (command === 'save_text_file_dialog') {
           exports.push(args)
           return args.defaultName
@@ -251,7 +265,9 @@ function environment() {
   const store = useWorkflowStore(pinia)
   stores.push(store)
   return {
-    store, reads, writes, listeners, exports,
+    store, reads, writes, listeners, exports, editorOpens,
+    set editorOpenFailure(value) { editorOpenError = value },
+    set nativeEditorSnapshot(value) { nativeEditorSnapshot = structuredClone(value) },
     get stored() { return stored },
     set stored(value) { stored = structuredClone(value) },
     set read(value) { readHook = value },
@@ -282,6 +298,38 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.$dispose()
   Reflect.deleteProperty(globalThis, 'window')
   Reflect.deleteProperty(globalThis, 'localStorage')
+})
+
+test('overview rejects malformed simple imports without saving or changing selection', async () => {
+  const env = environment()
+  await env.store.initialize()
+  const page = env.mount(WorkflowsView)
+  const before = JSON.stringify(env.store.workflows)
+  const selected = env.store.selectedWorkflowId
+  const baselineWrites = env.writes.length
+  for (const patch of [{ model: { name: 'x' } }, { stems: { name: 'Vocals' } }, { stems: ['Vocals', 1] }]) {
+    const definition = { version: 1, steps: [{ id: 's', model: 'model.ckpt', input: 'input', stems: ['Vocals'], save: { Vocals: 'Default' }, ...patch }] }
+    const input = { value: 'selected', files: [{ name: 'invalid.json', text: async () => JSON.stringify(definition) }] }
+    await page.state.handleImportWorkflow({ target: input })
+    assert.equal(input.value, '')
+    assert.equal(env.writes.length, baselineWrites)
+    assert.equal(JSON.stringify(env.store.workflows), before)
+    assert.equal(env.store.selectedWorkflowId, selected)
+    assert.equal(messages.at(-1).level, 'error')
+    assert.match(messages.at(-1).text, /workflowImportInvalid/)
+  }
+})
+
+test('overview imports an unfinished Studio draft without requiring runnable outputs', async () => {
+  const env = environment()
+  await env.store.initialize()
+  const page = env.mount(WorkflowsView)
+  const definition = { version: 1, steps: [{ id: 's', model: '', input: 'input', stems: [], save: {} }] }
+  const input = { value: 'selected', files: [{ name: 'draft.json', text: async () => JSON.stringify(definition) }] }
+  await page.state.handleImportWorkflow({ target: input })
+  assert.equal(input.value, '')
+  assert.deepEqual(JSON.parse(JSON.stringify(env.store.selectedWorkflow.definition)), definition)
+  assert.equal(messages.at(-1).level, 'success')
 })
 
 test('overview import and export repair old graph versions without rewriting the saved definition', async () => {
@@ -381,6 +429,7 @@ test('standalone routes do not subscribe to main-window workflow events', async 
   for (const path of ['/editor', '/workflow-node-editor', '/workflow-simple-editor']) {
     const env = environment()
     route.path = path
+    window.__TAURI_INTERNALS__.metadata = { currentWindow: { label: 'workflow-editor' } }
     const shell = env.mount(App)
     await flush()
     assert.equal(env.listeners.size, 0, path)
@@ -410,7 +459,7 @@ test('a failed close refresh preserves the list and details and does not report 
   assert.equal(page.state.editingId, 'original')
   assert.equal(page.state.name, 'original')
   assert.deepEqual(env.writes, [])
-  assert.equal(warnings.mock.calls.some(call => call.arguments.includes(failure)), true)
+  assert.equal(warnings.mock.calls.some(call => call.arguments.some(value => String(value).includes(failure.message))), true)
 })
 
 test('closing an existing editor refreshes metadata without changing saved definitions or timestamps', async () => {
@@ -707,7 +756,7 @@ test('main-window listeners that finish registering after unmount are released',
   assert.equal(env.reads.length, 0)
 })
 
-test('a main window temporarily displaying a standalone route ignores close events', async () => {
+test('workflow editor routes do not turn the main window into an embedded workbench', async () => {
   const env = environment()
   await env.store.initialize()
   env.mount(App)
@@ -1001,7 +1050,7 @@ test('a pending save does not restore the selection the user has already left', 
   assert.deepEqual(selections, ['second'])
 })
 
-test('the main-window run action still reloads, selects the requested workflow and navigates', async () => {
+test('legacy editor actions refresh the main window without navigating into the editor', async () => {
   const env = environment()
   await env.store.initialize()
   env.mount(App)
@@ -1014,8 +1063,88 @@ test('the main-window run action still reloads, selects the requested workflow a
   assert.equal(env.reads.length, 1)
   assert.equal(env.store.selectedWorkflowId, 'saved')
   assert.equal(page.state.editingId, 'saved')
-  assert.deepEqual(navigation, [{ path: '/', query: { mode: 'workflow' } }])
+  assert.deepEqual(navigation, [])
   assert.equal(env.writes.length, 1)
   assert.equal(env.stored.selectedWorkflowId, 'saved')
   assert.deepEqual(env.stored.workflows.map(item => item.id).sort(), ['original', 'saved'])
+})
+
+
+test('simple and advanced workflows open native editor windows without replacing the overview', async () => {
+  const env = environment()
+  await env.store.initialize()
+  const page = env.mount(WorkflowsView)
+  await page.state.openSimpleEditor({ workflowId: 'original' })
+  await page.state.openNodeEditor({ workflowId: 'advanced', skipWarning: true })
+  assert.deepEqual(env.editorOpens, [
+    { command: 'open_workflow_simple_editor_window', payload: { workflowId: 'original', newWorkflow: false } },
+    { command: 'open_workflow_node_editor_window', payload: { workflowId: 'advanced', newWorkflow: false } },
+  ])
+  assert.equal(env.store.simpleEditorOpenWorkflowId, 'original')
+  assert.equal(env.store.nodeEditorOpenWorkflowId, 'advanced')
+  assert.deepEqual(navigation, [])
+})
+
+test('new workflows use blank native windows and a failed open leaves the overview in place', async () => {
+  const env = environment()
+  await env.store.initialize()
+  const page = env.mount(WorkflowsView)
+  await page.state.openSimpleEditor({ forceNew: true })
+  assert.deepEqual(env.editorOpens, [{ command: 'open_workflow_simple_editor_window', payload: { workflowId: '', newWorkflow: true } }])
+  assert.equal(env.store.simpleEditorOpenWorkflowId, '__new__')
+  env.editorOpenFailure = new Error('Window creation failed')
+  await page.state.openNodeEditor({ workflowId: 'original', skipWarning: true })
+  assert.equal(env.store.nodeEditorOpenWorkflowId, '')
+  assert.deepEqual(navigation, [])
+  assert.equal(messages.at(-1).text, 'Window creation failed')
+})
+
+test('native ownership adopts formal ids and ignores older snapshots or stale open responses', () => {
+  const env = environment()
+  env.store.applyEditorSnapshot({ revision: 1, editors: [{ label: 'workflow-simple-editor-new', workflowId: '', kind: 'simple' }] })
+  env.store.applyEditorSnapshot({ revision: 2, editors: [{ label: 'workflow-simple-editor-new', workflowId: 'original', kind: 'simple' }] })
+  env.store.recordEditorOpened({ editorSnapshot: { revision: 1, editors: [] } }, 'simple', '__new__')
+  assert.equal(env.store.editorFor('original').label, 'workflow-simple-editor-new')
+  assert.equal(env.store.simpleEditorOpenWorkflowId, 'original')
+  assert.equal(env.store.hasAnyEditorOpen, true)
+})
+
+test('closing one native editor leaves another document locked, including delayed close notifications', async () => {
+  const env = environment()
+  const remaining = { label: 'workflow-simple-editor-b', workflowId: 'other', kind: 'simple' }
+  env.store.applyEditorSnapshot({ revision: 2, editors: [{ label: 'workflow-simple-editor-a', workflowId: 'original', kind: 'simple' }, remaining] })
+  env.nativeEditorSnapshot = { revision: 3, editors: [remaining] }
+  await env.store.handleEditorClosed('simple', 'workflow-simple-editor-a')
+  assert.equal(env.store.editorFor('original'), undefined)
+  assert.equal(env.store.editorFor('other').label, remaining.label)
+  await env.store.handleEditorClosed('simple', 'workflow-simple-editor-a')
+  assert.equal(env.store.editorFor('other').label, remaining.label)
+  assert.equal(env.store.hasAnyEditorOpen, true)
+})
+
+test('management saves and force overwrites cannot bypass an active native workflow owner', async () => {
+  const env = environment()
+  await env.store.initialize()
+  env.nativeEditorSnapshot = { revision: 1, editors: [{ label: 'workflow-simple-editor-new', workflowId: 'original', kind: 'simple' }] }
+  const page = env.mount(WorkflowsView)
+  await env.store.refreshEditorWindows()
+  page.state.name = 'Management edit'
+  await page.state.saveMeta()
+  assert.deepEqual(env.writes, [])
+  const input = { id: 'original', name: 'Forced edit', definition: env.store.selectedWorkflow.definition, force: true }
+  await assert.rejects(env.store.saveWorkflow(input), error => error.code === 'WORKFLOW_EDITOR_IN_USE')
+  assert.deepEqual(env.writes, [])
+})
+
+test('main app consumes ownership snapshots before reacting to legacy editor-close events', async () => {
+  const env = environment()
+  await env.store.initialize()
+  env.mount(App)
+  await flush()
+  const owner = { label: 'workflow-simple-editor-new', workflowId: 'original', kind: 'simple' }
+  env.dispatch('pymss://workflow-editors-changed', { revision: 8, editors: [owner] })
+  env.nativeEditorSnapshot = { revision: 8, editors: [owner] }
+  env.dispatch(closeEvent('simple'), { label: 'closed-older-window' })
+  await flush()
+  assert.equal(env.store.editorFor('original').label, owner.label)
 })

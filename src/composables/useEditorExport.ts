@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { MessageApiInjection } from 'naive-ui/es/message/src/MessageProvider'
@@ -6,6 +7,8 @@ import type { EditorExportFormat, EditorExportSampleRate } from '@/types/editor'
 import type { useEditorStore } from '@/stores/editor'
 import { EditorExportCancelledError } from '@/stores/editor'
 import type { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.composables.useEditorExport')
 
 type EditorStore = ReturnType<typeof useEditorStore>
 type SettingsStore = ReturnType<typeof useSettingsStore>
@@ -19,13 +22,14 @@ type UseEditorExportOptions = {
 
 export function useEditorExport(options: UseEditorExportOptions) {
   const { editor, settings, message, t } = options
+  let exportInFlight = false
 
   const showExportDialog = ref(false)
   const exportFormatDraft = ref<EditorExportFormat>('wav')
   const exportWavBitDepthDraft = ref('PCM_24')
   const exportFlacBitDepthDraft = ref('PCM_24')
   const exportSampleRateDraft = ref<EditorExportSampleRate>('auto')
-  const exportPeakProtectionDraft = ref(true)
+  const exportPeakProtectionDraft = ref(false)
   const exportFileNameDraft = ref('')
   const exportDirDraft = ref('')
   const exportDirPicking = ref(false)
@@ -53,6 +57,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
   }
 
   function openExportDialog() {
+    if (exportInFlight) return
     exportFormatDraft.value = editor.exportFormat
     exportWavBitDepthDraft.value = settings.wavBitDepth
     exportFlacBitDepthDraft.value = settings.flacBitDepth
@@ -113,25 +118,32 @@ export function useEditorExport(options: UseEditorExportOptions) {
   }
 
   async function exportMix() {
+    if (exportInFlight) return
+    exportInFlight = true
     try {
-      const peakProtection = exportFormatDraft.value !== 'wav'
-        || exportWavBitDepthDraft.value !== 'FLOAT'
-        || exportPeakProtectionDraft.value
+      const format = exportFormatDraft.value
+      const wavBitDepth = exportWavBitDepthDraft.value
+      const flacBitDepth = exportFlacBitDepthDraft.value
+      const peakProtection = exportPeakProtectionDraft.value
       const result = await editor.exportMix({
-        format: exportFormatDraft.value,
+        format,
         exportDir: exportDirDraft.value.trim() || undefined,
         fileName: exportFileNameDraft.value.trim() || undefined,
         audioParams: {
-          wavBitDepth: exportWavBitDepthDraft.value,
-          flacBitDepth: exportFlacBitDepthDraft.value,
+          wavBitDepth,
+          flacBitDepth,
           sampleRate: exportSampleRateDraft.value,
           peakProtection,
         },
       })
-      editor.exportFormat = exportFormatDraft.value
-      settings.wavBitDepth = exportWavBitDepthDraft.value
-      settings.flacBitDepth = exportFlacBitDepthDraft.value
+      editor.exportFormat = format
       message.success(t('editor.exported', { path: result.path }))
+      try {
+        await settings.saveEditorExportPreference({ format, bitDepth: format === 'wav' ? wavBitDepth : flacBitDepth })
+      } catch (error) {
+        studioLog.warn('Failed to save editor export preference', error)
+        message.warning(t('editor.exportPreferencesSaveFailed'))
+      }
       if (result.peakProtectionApplied && Number(result.peakAdjustmentDb) < 0) {
         message.info(t('editor.exportPeakAdjusted', {
           db: Math.abs(Number(result.peakAdjustmentDb)).toFixed(1),
@@ -146,6 +158,8 @@ export function useEditorExport(options: UseEditorExportOptions) {
     } catch (error) {
       if (error instanceof EditorExportCancelledError) message.info(t('editor.exportCancelled'))
       else message.error(editor.lastError || t('editor.exportFailed'))
+    } finally {
+      exportInFlight = false
     }
   }
 

@@ -40,6 +40,8 @@ export type TaskLifecycleItem = {
   id: string
   jobId?: string
   batchId?: string
+  /** Explicit source order for tasks submitted together in a batch. */
+  batchIndex?: number
   createdAt: number
   status: TaskStatus
 }
@@ -54,6 +56,20 @@ export function isInterruptedTaskStatus(status: TaskStatus) {
 
 export function taskJobId(task: Pick<TaskLifecycleItem, 'id' | 'jobId' | 'batchId'>) {
   return task.jobId || task.batchId || task.id
+}
+
+function batchIndexOf(task: TaskLifecycleItem): number | undefined {
+  if (typeof task.batchIndex === 'number'
+    && Number.isSafeInteger(task.batchIndex)
+    && task.batchIndex >= 0) return task.batchIndex
+  return undefined
+}
+
+/** Order one job consistently for dispatch, progress and results without changing stored tasks. */
+export function sortJobTasks<T extends TaskLifecycleItem>(tasks: readonly T[]): T[] {
+  const indexed = tasks.every(task => batchIndexOf(task) !== undefined)
+  return [...tasks].sort((left, right) =>
+    (indexed ? left.batchIndex! - right.batchIndex! : 0) || left.createdAt - right.createdAt)
 }
 
 /** Resolves a job state without reporting queued work as running or partial failure as success. */
@@ -95,5 +111,5 @@ export function selectQueuedJobGroups<T extends TaskLifecycleItem>(
       else groups.set(id, [task])
     })
 
-  return [...groups.values()].slice(0, available)
+  return [...groups.values()].slice(0, available).map(group => sortJobTasks(group))
 }

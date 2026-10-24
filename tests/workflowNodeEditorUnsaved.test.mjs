@@ -22,6 +22,9 @@ const names = new Set([
   'closeEditor',
   'destroyWindow',
   'saveAndClose',
+  'runPromise',
+  'runWorkflow',
+  'flushChanges',
 ])
 const selected = script.statements.filter(statement => (
   ts.isFunctionDeclaration(statement) ? names.has(statement.name?.text)
@@ -60,15 +63,22 @@ function createContext() {
     editorRef: ref({ snapshotDefinition: () => canvasDefinition }),
     showClosePrompt: ref(false),
     saving: ref(false),
+    closing: ref(false), editingId: ref('flow'), showRevisionConflict: ref(false),
+    saveQueue: Promise.resolve(), cancelAutosave() {}, scheduleAutosave() {}, finishNameEdit() {},
     formError: ref(''),
     currentWindow: null,
     invoke: async () => {},
     router: { push: async target => navigation.push(target) },
     message: { warning: value => warnings.push(value) },
-    save: async () => saveResult,
+    save: async () => {
+      if (saveResult) result.captureInitialSnapshot()
+      return saveResult
+    },
+    workbench: { run: async () => {} },
   }
+  context.canSave = computed(() => !context.formError.value)
   const result = vm.runInNewContext(
-    `${code}\n({ dirty, captureInitialSnapshot, closeEditor, saveAndClose })`,
+    `${code}\n({ dirty, captureInitialSnapshot, closeEditor, saveAndClose, runWorkflow })`,
     context,
   )
   return {
@@ -83,7 +93,7 @@ function createContext() {
 
 test('advanced editor exposes the same unsaved-close actions as the simple editor', () => {
   assert.ok(template.includes('ref="editorRef"'))
-  assert.ok(template.includes('@initialized="captureInitialSnapshot"'))
+  assert.ok(template.includes('@initialized="initializeEditorBaseline"'))
   assert.ok(template.includes('v-model:show="showClosePrompt"'))
   assert.ok(template.includes("t('workflows.simpleDiscardChanges')"))
   assert.ok(template.includes("t('workflows.simpleSaveAndClose')"))
@@ -91,7 +101,7 @@ test('advanced editor exposes the same unsaved-close actions as the simple edito
   assert.ok(editorScript.includes("emit('initialized')"))
 })
 
-test('advanced editor flushes the live canvas before deciding whether to close', async () => {
+test('advanced editor saves the live canvas before closing', async () => {
   const state = createContext()
   state.result.captureInitialSnapshot()
   assert.equal(state.result.dirty.value, false)
@@ -99,9 +109,9 @@ test('advanced editor flushes the live canvas before deciding whether to close',
   state.setCanvasDefinition({ nodes: [{ id: 1 }, { id: 2 }], links: [] })
   await state.result.closeEditor()
 
-  assert.equal(state.result.dirty.value, true)
-  assert.equal(state.context.showClosePrompt.value, true)
-  assert.deepEqual(state.navigation, [])
+  assert.equal(state.result.dirty.value, false)
+  assert.equal(state.context.showClosePrompt.value, false)
+  assert.deepEqual(state.navigation, ['/workflows'])
 })
 
 test('advanced editor closes only after a successful save and keeps invalid drafts open', async () => {
@@ -124,5 +134,23 @@ test('advanced editor closes only after a successful save and keeps invalid draf
   state.context.formError.value = ''
   state.setSaveResult(true)
   await state.result.saveAndClose()
+  assert.deepEqual(state.navigation, ['/workflows'])
+})
+
+test('closing an advanced editor waits for submission to finish and does not submit twice', async () => {
+  const state = createContext()
+  state.result.captureInitialSnapshot()
+  let finish
+  const pending = new Promise(resolve => { finish = resolve })
+  let submissions = 0
+  state.context.workbench.run = () => { submissions++; return pending }
+  const first = state.result.runWorkflow()
+  const second = state.result.runWorkflow()
+  const closing = state.result.closeEditor()
+  await Promise.resolve()
+  assert.equal(submissions, 1)
+  assert.deepEqual(state.navigation, [])
+  finish()
+  await Promise.all([first, second, closing])
   assert.deepEqual(state.navigation, ['/workflows'])
 })

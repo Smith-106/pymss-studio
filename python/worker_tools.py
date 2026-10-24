@@ -5,7 +5,7 @@ from typing import Any
 
 from audio_tools.common import AudioToolError
 from audio_tools.registry import get_audio_tool_handler
-from worker_protocol import emit, emit_error
+from worker_protocol import bind_request_id, emit, emit_error
 
 _USE_OPERATIONS = True
 
@@ -46,7 +46,8 @@ def cmd_audio_tools(payload: dict[str, Any]) -> int:
     if handler is None:
         return emit_error("AUDIO_TOOL_INVALID", "Unknown audio tool operation", request_id=request_id)
     try:
-        result = handler(payload)
+        with bind_request_id(request_id):
+            result = handler(payload)
         emit("audio_tool_result", result, request_id=request_id)
         return 0
     except AudioToolError as error:

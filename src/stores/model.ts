@@ -1,17 +1,22 @@
+import { createLogger } from '@/utils/logger'
+import { workerLogRecord, type LogRecord } from '@/utils/logRecord'
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { isTauriRuntime, loadAppStore, saveAppStore } from '@/utils/appStore'
+import { isMainTaskOwner } from '@/utils/taskOwner'
 import { matchesModelQuery } from '@/utils/modelSearch'
 import { MODEL_LIBRARY_PAGE_SIZES, normalizePageSize } from '@/utils/pagination'
 import { matchesModelSource, type ModelSourceFilter } from '@/utils/modelSource'
 import { useAppStore } from '@/stores/app'
 import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
-import { normalizeInferenceParamMeta, type InferenceParamMeta } from '@/features/inference/sampleStep'
+import { inferenceChunkSizeIssue, normalizeInferenceParamMeta, type InferenceParamMeta } from '@/features/inference/sampleStep'
 
 /** How the model library lays its entries out. */
 export type ModelViewMode = 'card' | 'list'
 import { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.stores.model')
 
 export type ModelEntry = {
   name: string
@@ -158,6 +163,7 @@ export type DownloadLogEntry = {
   ts: number
   level: DownloadLogLevel
   message: string
+  record?: LogRecord
   fileIndex?: number
   totalFiles?: number
   stage?: string
@@ -289,14 +295,14 @@ type StoredModelState = {
   modelPageSize?: number
 }
 
-function normalizeDownloadTasks(input?: Record<string, DownloadTask>) {
+function normalizeDownloadTasks(input?: Record<string, DownloadTask>, restoreInterrupted = true) {
   const next: Record<string, DownloadTask> = {}
   Object.entries(input || {}).forEach(([name, task]) => {
     if (!task?.model) return
     next[name] = {
       ...task,
-      status: task.status === 'downloading' || task.status === 'preparing' ? 'interrupted' : task.status,
-      message: task.status === 'downloading' || task.status === 'preparing' ? '下载已中断' : task.message,
+      status: restoreInterrupted && (task.status === 'downloading' || task.status === 'preparing') ? 'interrupted' : task.status,
+      message: restoreInterrupted && (task.status === 'downloading' || task.status === 'preparing') ? '下载已中断' : task.message,
       updatedAt: Date.now(),
       logs: Array.isArray(task.logs) ? task.logs : [],
       seen: true,
@@ -483,6 +489,7 @@ export const useModelStore = defineStore('model', () => {
   })
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  let persistErrorReported = false
 
   const filteredModels = computed(() => {
     const q = search.value.trim().toLowerCase()
@@ -503,7 +510,7 @@ export const useModelStore = defineStore('model', () => {
   const downloadedModels = computed(() => models.value.filter((model) => model.supported && model.downloaded))
 
   async function persistState() {
-    if (!initialized.value) return
+    if (!initialized.value || !isMainTaskOwner()) return
     await saveAppStore('model-state', {
       models: models.value,
       categories: categories.value,
@@ -522,11 +529,17 @@ export const useModelStore = defineStore('model', () => {
   }
 
   function queuePersist() {
-    if (!initialized.value) return
+    if (!initialized.value || !isMainTaskOwner()) return
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
       saveTimer = null
-      void persistState()
+      void persistState().then(() => {
+        persistErrorReported = false
+      }).catch((error) => {
+        if (persistErrorReported) return
+        persistErrorReported = true
+        studioLog.warn('Failed to persist model state', error)
+      })
     }, 120)
   }
 
@@ -560,7 +573,7 @@ export const useModelStore = defineStore('model', () => {
       categoriesCn.value = stored.categoriesCn || []
       modelDir.value = stored.modelDir || ''
     }
-    downloadTasks.value = normalizeDownloadTasks(stored?.downloadTasks)
+    downloadTasks.value = normalizeDownloadTasks(stored?.downloadTasks, isMainTaskOwner())
     Object.values(downloadTasks.value).forEach((task) => {
       downloadTaskIndex.value[task.taskId] = task.model
       if (task.status === 'downloading') downloadStates.value[task.model] = 'downloading'
@@ -651,6 +664,9 @@ export const useModelStore = defineStore('model', () => {
       ...overrides,
     } as Record<string, unknown>)
     if (!normalized) return
+    const entry = selectedInfo.value?.name === name ? selectedInfo.value : models.value.find(item => item.name === name)
+    const chunkIssue = inferenceChunkSizeIssue(normalized.chunk_size, entry?.inferenceParamMeta)
+    if (chunkIssue) throw new Error(`Invalid chunk size. Use ${chunkIssue.values} samples.`)
     const previousOverrides = modelInferenceOverrides.value
     modelInferenceOverrides.value = {
       ...modelInferenceOverrides.value,
@@ -962,11 +978,12 @@ export const useModelStore = defineStore('model', () => {
           })
         }
       } else if (event.type === 'download_log') {
-        const level = (payload.level === 'warn' || payload.level === 'error' ? payload.level : 'info') as DownloadLogLevel
+        const record = workerLogRecord(event)
+        const level = (record.level === 'warn' ? 'warn' : record.level === 'error' || record.level === 'fatal' ? 'error' : 'info') as DownloadLogLevel
         const message = String(payload.message || '')
         next.logs = appendLog(next.logs, {
           ts: Date.now(),
-          level,
+          level, record,
           message,
           fileIndex: payload.fileIndex,
           totalFiles: payload.totalFiles,
@@ -1562,8 +1579,9 @@ export const useModelStore = defineStore('model', () => {
   }
 
   async function removeCustomModel(name: string, deleteFiles = false) {
+    const settings = useSettingsStore()
     const result = await invoke<CustomModelRemoval>('unregister_custom_model', {
-      payload: { name, deleteFiles },
+      payload: { name, deleteFiles, modelDir: settings.modelDir || null },
     })
     await loadModels()
     return result

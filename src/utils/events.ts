@@ -4,6 +4,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
 import { useModelStore, type WorkerEvent } from '@/stores/model'
 import { retryWithDelays } from '@/utils/async'
+import { isMainTaskOwner } from '@/utils/taskOwner'
 import type { WorkerEventConnectionStatus } from '@/stores/app'
 
 let unlistenWorkerEvents: UnlistenFn | undefined
@@ -28,7 +29,7 @@ export async function registerWorkerEvents() {
       if (settings.developerMode) app.recordWorkerEvent(workerEvent)
       void settings.handleWorkerEvent(workerEvent)
       app.handleRuntimeEvent(workerEvent)
-      tasks.handleWorkerEvent(workerEvent)
+      if (isMainTaskOwner()) tasks.handleWorkerEvent(workerEvent)
       models.handleWorkerEvent(workerEvent)
     }).then((unlisten) => {
       unlistenWorkerEvents = unlisten
@@ -50,7 +51,7 @@ export async function connectWorkerEvents(target: WorkerEventConnectionTarget) {
     target.setWorkerEventConnection('connected')
     // Resume persisted queue items only after the listener is installed so the
     // first worker events cannot be lost during application bootstrap.
-    useTaskStore().scheduleQueue()
+    if (isMainTaskOwner()) useTaskStore().scheduleQueue()
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     target.setWorkerEventConnection('error', detail)

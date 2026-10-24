@@ -1,11 +1,17 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { storeToRefs } from 'pinia'
+import WorkflowRunPanel from '@/components/workflow/WorkflowRunPanel.vue'
+import WorkflowExecutionProgress from '@/components/workflow/WorkflowExecutionProgress.vue'
+import WorkflowNodeBindings from '@/components/workflow/WorkflowNodeBindings.vue'
+import { useWorkflowWorkbench } from '@/composables/useWorkflowWorkbench'
 import WorkflowSimpleNodeEditor from '@/components/workflow/WorkflowSimpleNodeEditor.vue'
 import WorkflowRevisionConflictModal from '@/components/workflow/WorkflowRevisionConflictModal.vue'
 import { useModelStore } from '@/stores/model'
@@ -29,6 +35,9 @@ import {
   simpleStepInputTarget,
 } from '@/utils/simpleWorkflowEditor'
 import { isSimpleWorkflowDefinition } from '@/workflows/formats'
+import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
+
+const studioLog = createLogger('ui.views.WorkflowSimpleEditorView')
 
 const route = useRoute()
 const router = useRouter()
@@ -46,6 +55,7 @@ const showCustomWindowChrome = computed(() => isStandaloneWindow.value && !isMac
 const isMaximized = ref(false)
 const name = ref('')
 const description = ref('')
+const showOutputSettings = ref(false)
 const draft = ref<SimpleDraft>(hydrateSimpleWorkflow({ steps: [] }))
 const editingId = ref('')
 const expectedUpdatedAt = ref<number | undefined>()
@@ -53,6 +63,17 @@ const loaded = ref(false)
 const loadError = ref('')
 const editorRenderKey = ref(0)
 const saving = ref(false)
+const saveError = ref('')
+const nameEditing = ref(false)
+const closing = ref(false)
+const editorRef = ref<{ finishNameEdit: () => void } | null>(null)
+let autosaveTimer: ReturnType<typeof setTimeout> | undefined
+let saveQueue: Promise<void> = Promise.resolve()
+let pendingSaves = 0
+let saveGeneration = 0
+let disposed = false
+let runPromise: Promise<void> | null = null
+let starterSnapshot = ''
 const initialSnapshot = ref('')
 const showClosePrompt = ref(false)
 const showRevisionConflict = ref(false)
@@ -69,6 +90,19 @@ function snapshot() {
 }
 
 const dirty = computed(() => loaded.value && snapshot() !== initialSnapshot.value)
+
+const workflowKey = computed(() => editingId.value || 'new-simple')
+const currentDefinition = computed(() => buildSimpleWorkflowDefinition(draft.value) as unknown as Record<string, unknown>)
+const workbench = useWorkflowWorkbench({ workflowKey, definition: () => currentDefinition.value, save: () => persist() })
+const { selectedJobId, liveNodeStates, liveNodeLogs, executionMatchesDraft, submitting } = workbench
+let confirmedClose = false
+onBeforeRouteLeave(async () => {
+  if (confirmedClose || !loaded.value) return true
+  editorRef.value?.finishNameEdit()
+  closing.value = true
+  try { return await flushChanges() || window.confirm(t('workflows.simpleUnsavedHint')) }
+  finally { closing.value = false }
+})
 
 const simpleReasonKeys: Record<SimpleWorkflowReasonCode, string> = {
   graph_workflow: 'workflows.simpleReasonGraphWorkflow',
@@ -124,8 +158,9 @@ const modelAdvisory = computed(() => {
     ? t('workflows.stepModelNotDownloaded', { id: t('workflows.stepTitle', { index: missingIndex + 1 }) })
     : ''
 })
-const canSave = computed(() => !formError.value && !saving.value)
-const canRun = computed(() => !formError.value && !saving.value)
+const canSave = computed(() => loaded.value && !loadError.value && Boolean(name.value.trim())
+  && analyzeSimpleWorkflow(currentDefinition.value).editable)
+const canRun = computed(() => !formError.value && !closing.value)
 
 function hydrateStepModelTypes(value: SimpleDraft) {
   value.steps.forEach((step) => {
@@ -158,7 +193,16 @@ function createExampleDraft(): SimpleDraft {
 }
 
 function loadEntry(entry?: WorkflowEntry | null) {
+  if (loaded.value) editorRenderKey.value += 1
+  nameEditing.value = false
+  saveGeneration += 1
+  cancelAutosave()
+  saveError.value = ''
   editingId.value = entry?.id || ''
+  if (!loaded.value) {
+    workbench.session.value.bindings.inputs = {}
+    workbench.session.value.bindings.primaryInput = ''
+  }
   name.value = entry?.name || t('workflows.newWorkflow')
   description.value = entry?.description || ''
   loadError.value = ''
@@ -180,9 +224,6 @@ function loadEntry(entry?: WorkflowEntry | null) {
     hydrated.defaultNormalize = example.defaultNormalize
     hydrated.steps = example.steps
     hydrated.ui = example.ui
-  } else if (!hydrated.steps.length && !hydrated.ensembles.length) {
-    hydrated.steps = [createStepDraft(0)]
-    hydrated.ui = createDefaultSimpleEditorUi(hydrated.steps, hydrated.ensembles)
   } else {
     hydrated.ui = hydrated.ui || createDefaultSimpleEditorUi(hydrated.steps, hydrated.ensembles)
   }
@@ -190,56 +231,102 @@ function loadEntry(entry?: WorkflowEntry | null) {
   draft.value = clone(hydrated)
   expectedUpdatedAt.value = entry?.updatedAt
   initialSnapshot.value = snapshot()
+  starterSnapshot = entry ? '' : snapshot()
   loaded.value = true
 }
 
-async function persist(force = false) {
-  if (!canSave.value && !force) return null
-  saving.value = true
+function cancelAutosave() {
+  if (autosaveTimer !== undefined) clearTimeout(autosaveTimer)
+  autosaveTimer = undefined
+}
+
+function scheduleAutosave() {
+  cancelAutosave()
+  if (disposed || closing.value || saving.value || submitting.value || nameEditing.value
+    || showRevisionConflict.value || saveError.value || !canSave.value || (!dirty.value && editingId.value)) return
+  autosaveTimer = setTimeout(() => { autosaveTimer = undefined; void persist() }, 600)
+}
+
+function persist(force = false): Promise<WorkflowEntry | null> {
+  cancelAutosave()
+  if (disposed || (!canSave.value && !force)) return Promise.resolve(null)
+  let savedSnapshot: string
+  let captured: { name: string; description: string; definition: Record<string, unknown> }
   try {
     cleanupSimpleDraft(draft.value)
-    const entry = await workflow.saveWorkflow({
-      id: editingId.value || undefined,
-      name: name.value.trim(),
-      description: description.value.trim(),
+    savedSnapshot = snapshot()
+    captured = clone({
+      name: name.value.trim(), description: description.value.trim(),
       definition: buildSimpleWorkflowDefinition(draft.value) as unknown as Record<string, unknown>,
-      expectedUpdatedAt: force ? undefined : expectedUpdatedAt.value,
-      force,
     })
-    editingId.value = entry.id
-    expectedUpdatedAt.value = entry.updatedAt
-    initialSnapshot.value = snapshot()
-    message.success(t('workflows.saved'))
-    return entry
   } catch (error) {
-    if (error instanceof WorkflowRevisionConflictError) {
-      pendingConflict.value = {
-        definition: buildSimpleWorkflowDefinition(draft.value) as unknown as Record<string, unknown>,
-        name: name.value.trim(),
-        description: description.value.trim(),
+    saveError.value = error instanceof Error ? error.message : String(error)
+    return Promise.resolve(null)
+  }
+  const generation = saveGeneration
+  pendingSaves += 1
+  saving.value = true
+  const request = saveQueue.then(async () => {
+    if (disposed || generation !== saveGeneration || (showRevisionConflict.value && !force)) return null
+    const existing = workflows.value.find(item => item.id === editingId.value)
+    if (!force && existing && savedSnapshot === initialSnapshot.value && existing.updatedAt === expectedUpdatedAt.value
+      && JSON.stringify(existing.definition) === JSON.stringify(captured.definition)) return existing
+    try {
+      const entry = await workflow.saveWorkflow({
+        ...captured, id: editingId.value || undefined,
+        expectedUpdatedAt: force ? undefined : expectedUpdatedAt.value, force,
+      })
+      if (disposed || generation !== saveGeneration) return null
+      workbench.adoptWorkflowKey(entry.id)
+      editingId.value = entry.id
+      expectedUpdatedAt.value = entry.updatedAt
+      initialSnapshot.value = savedSnapshot
+      saveError.value = ''
+      return entry
+    } catch (error) {
+      saveError.value = error instanceof WorkflowEditorInUseError ? t('workflows.editorInUseHint') : error instanceof Error ? error.message : String(error)
+      if (error instanceof WorkflowRevisionConflictError) {
+        pendingConflict.value = captured
+        showRevisionConflict.value = true
       }
-      showRevisionConflict.value = true
       return null
     }
-    message.error(error instanceof Error ? error.message : String(error))
-    return null
-  } finally {
-    saving.value = false
+  })
+  saveQueue = request.then(() => undefined, () => undefined)
+  return request.finally(() => {
+    pendingSaves -= 1
+    saving.value = pendingSaves > 0
+    scheduleAutosave()
+  })
+}
+
+async function flushChanges() {
+  cancelAutosave()
+  if (runPromise) await runPromise
+  await saveQueue
+  while (dirty.value || !editingId.value) {
+    if (showRevisionConflict.value || !canSave.value || !await persist()) return false
   }
+  return true
 }
 
 async function closeEditor() {
-  if (dirty.value) {
-    showClosePrompt.value = true
-    return
+  if (closing.value) return
+  editorRef.value?.finishNameEdit()
+  closing.value = true
+  try {
+    if (loaded.value && !await flushChanges()) { if (!showRevisionConflict.value) showClosePrompt.value = true; return }
+    await destroyWindow()
+  } finally {
+    closing.value = false
   }
-  await destroyWindow()
 }
 
 async function destroyWindow() {
   if (isStandaloneWindow.value && currentWindow) {
     try { await invoke('close_current_window'); return } catch { await currentWindow.close().catch(() => undefined); return }
   }
+  confirmedClose = true
   await router.push('/workflows')
 }
 
@@ -284,24 +371,21 @@ async function saveAndClose() {
   // the draft was invalid, while the prompt was already dismissed, which
   // made the action appear to do nothing.
   if (saving.value) return
-  if (formError.value) {
-    message.warning(formError.value)
+  if (!canSave.value) {
+    message.warning(formError.value || t('workflows.simpleReasonInvalidDefinition'))
     return
   }
   showClosePrompt.value = false
-  const entry = await persist()
-  if (entry) await destroyWindow()
+  await closeEditor()
 }
 
 async function runWorkflow() {
-  const entry = await persist()
-  if (!entry) return
-  if (isStandaloneWindow.value && currentWindow) {
-    await currentWindow.emit('pymss://workflow-simple-editor-action', { action: 'run', workflowId: entry.id })
-    await destroyWindow()
-    return
-  }
-  await router.push({ path: '/', query: { mode: 'workflow' } })
+  if (runPromise) return runPromise
+  editorRef.value?.finishNameEdit()
+  const request = workbench.run()
+  runPromise = request
+  try { await request }
+  finally { if (runPromise === request) runPromise = null; scheduleAutosave() }
 }
 
 async function reloadConflict() {
@@ -316,17 +400,23 @@ async function reloadConflict() {
 function saveConflictCopy() {
   const pending = pendingConflict.value
   if (!pending) return
+  saveGeneration += 1
+  cancelAutosave()
+  saveError.value = ''
   pendingConflict.value = null
   showRevisionConflict.value = false
+  const copyName = t('workflows.copyName', { name: name.value.trim() })
+  workbench.adoptWorkflowKey('new-simple')
   editingId.value = ''
   expectedUpdatedAt.value = undefined
-  name.value = t('workflows.copyName', { name: pending.name })
+  name.value = copyName
   void persist()
 }
 
 function overwriteConflict() {
   pendingConflict.value = null
   showRevisionConflict.value = false
+  saveError.value = ''
   void persist(true)
 }
 
@@ -338,7 +428,7 @@ onMounted(async () => {
   // delaying the editor window.
   if (!model.modelsLoaded) {
     void model.loadModels().catch((error) => {
-      console.warn('Failed to refresh models for simple workflow editor', error)
+      studioLog.warn('Failed to refresh models for simple workflow editor', error)
     })
   }
   const id = String(route.query.workflowId || '').trim()
@@ -364,22 +454,33 @@ watch(() => draft.value.steps.length, () => {
   if (!draft.value.ui) draft.value.ui = createDefaultSimpleEditorUi(draft.value.steps)
 })
 
+watch(snapshot, () => {
+  if (starterSnapshot && snapshot() !== starterSnapshot) starterSnapshot = ''
+  if (!showRevisionConflict.value) saveError.value = ''
+  scheduleAutosave()
+}, { flush: 'post' })
+watch([loaded, saving, submitting, nameEditing, showRevisionConflict], scheduleAutosave, { flush: 'post' })
+
 watch(downloadedModels, () => {
   hydrateStepModelTypes(draft.value)
   // A new editor can mount before the model cache finishes loading. Fill the
   // starter step once the first downloaded model becomes available, without
   // replacing edits the user has already made in the blank draft.
-  if (editingId.value || !loaded.value || dirty.value || draft.value.ensembles.length || draft.value.steps.some(step => step.model.trim())) return
+  if (!starterSnapshot || !loaded.value || snapshot() !== starterSnapshot || draft.value.ensembles.length || draft.value.steps.some(step => step.model.trim())) return
   const example = createExampleDraft()
   draft.value.steps = example.steps
   draft.value.ui = example.ui
-  initialSnapshot.value = snapshot()
+  if (!editingId.value) initialSnapshot.value = snapshot()
+  starterSnapshot = ''
   // Recreate the child once so its undo baseline includes the asynchronously
   // loaded starter template rather than the initial blank draft.
   editorRenderKey.value += 1
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  saveGeneration += 1
+  cancelAutosave()
   unlistenResize?.()
   unlistenCloseRequested?.()
 })
@@ -411,24 +512,33 @@ onBeforeUnmount(() => {
       </n-result>
     </div>
     <WorkflowSimpleNodeEditor
-      v-else-if="loaded"
-      :key="editorRenderKey"
-      v-model:draft="draft"
-      v-model:name="name"
-      v-model:description="description"
-      :models="downloadedModels"
-      :model-inference-overrides="modelInferenceOverrides"
-      :saving="saving"
-      :form-error="formError"
-      :advisory="modelAdvisory"
-      :can-save="canSave"
-      :can-run="canRun"
-      @save="persist"
-      @close="closeEditor"
-      @run="runWorkflow"
-    />
+      v-else-if="loaded" ref="editorRef" :key="editorRenderKey" :inert="closing"
+      v-model:draft="draft" v-model:name="name"
+      :runtime-controls="true" :node-states="liveNodeStates" :node-logs="liveNodeLogs" :execution-visible="executionMatchesDraft"
+      :models="downloadedModels" :model-inference-overrides="modelInferenceOverrides"
+      :form-error="formError" :advisory="modelAdvisory" :can-run="canRun"
+      @close="closeEditor" @run="runWorkflow" @name-editing="nameEditing = $event" @output-settings="showOutputSettings = true">
+      <template #save-status>
+        <span v-if="saving" class="simple-save-status">{{ t('workflows.autoSaveSaving') }}</span>
+        <n-button v-else-if="saveError" size="tiny" quaternary type="error" :title="saveError" @click="persist()">{{ t('workflows.autoSaveFailed') }} · {{ t('common.retry') }}</n-button>
+        <span v-else class="simple-save-status" :title="dirty || !editingId ? formError : ''">{{ dirty || !editingId ? t('workflows.autoSavePending') : t('workflows.autoSaveSaved') }}</span>
+      </template>
+      <template #runtime-input><WorkflowNodeBindings :workflow-key="workflowKey" :definition="currentDefinition" mode="inputs" :compact="true" /></template>
+      <template #execution-progress><WorkflowExecutionProgress :job="workbench.focusedJob.value" :task="workbench.focusedTask.value" /></template>
+      <template #run-controls>
+        <WorkflowRunPanel :workflow-key="workflowKey" v-model:job-id="selectedJobId" size="small" :run-primary="true"
+          :submitting="submitting" :can-run="canRun" :show-status="false"
+          @run="runWorkflow" @cancel="workbench.cancel">
+
+        </WorkflowRunPanel>
+      </template>
+    </WorkflowSimpleNodeEditor>
+    <n-modal v-model:show="showOutputSettings" preset="card" :title="t('separate.output')" class="simple-output-settings-modal" style="width: min(480px, calc(100vw - 32px))">
+      <WorkflowNodeBindings :workflow-key="workflowKey" :definition="currentDefinition" mode="outputs" :aggregate-output="true" />
+      <template #footer><div class="simple-editor-page__prompt-actions"><n-button size="small" secondary @click="showOutputSettings = false">{{ t('common.close') }}</n-button></div></template>
+    </n-modal>
     <n-modal v-model:show="showClosePrompt" preset="card" :title="t('workflows.simpleUnsavedTitle')" style="width: min(440px, calc(100vw - 32px))">
-      <p>{{ t('workflows.simpleUnsavedHint') }}</p>
+      <p>{{ saveError || formError || t('workflows.simpleUnsavedHint') }}</p>
       <template #footer><div class="simple-editor-page__prompt-actions"><n-button secondary @click="showClosePrompt = false; void destroyWindow()">{{ t('workflows.simpleDiscardChanges') }}</n-button><n-button type="primary" :loading="saving" :disabled="saving" @click="void saveAndClose()">{{ t('workflows.simpleSaveAndClose') }}</n-button></div></template>
     </n-modal>
     <WorkflowRevisionConflictModal
@@ -452,6 +562,7 @@ onBeforeUnmount(() => {
 .simple-editor-chrome__actions button:hover { background: var(--surface-2); color: var(--on-surface); }
 .simple-editor-chrome__actions button.danger:hover { background: var(--danger); color: #fff; }
 .simple-editor-page__prompt-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.simple-save-status { flex: 0 0 auto; color: var(--on-surface-muted); font-size: 11px; white-space: nowrap; }
 .simple-editor-page__blocked { height: 100%; display: grid; place-items: center; padding: 32px; }
 .simple-editor-page--custom-chrome > .simple-editor-page__blocked { height: calc(100% - 40px); }
 .simple-editor-page > :deep(.simple-node-editor) { height: 100%; }
