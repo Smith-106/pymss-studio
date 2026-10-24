@@ -20,7 +20,10 @@ def cmd_audio_tools(payload: dict[str, Any]) -> int:
             # fallback inside the adapter when the plugin is not installed).
             from audio_tools_ops import run_audio_tool_via_operations
 
-            result = run_audio_tool_via_operations(payload)
+            # Bind the request id so progress events emitted by legacy handlers
+            # (plugin-tool fallback) inherit it, mirroring the direct path below.
+            with bind_request_id(request_id):
+                result = run_audio_tool_via_operations(payload)
             emit("audio_tool_result", result, request_id=request_id)
             return 0
         except ImportError:
