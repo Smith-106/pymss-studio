@@ -19,7 +19,7 @@ const plugin = id => ({ id, format: 'vst3', pluginId: id, name: id, path: `/${id
 function environment(t, { scanControl = false } = {}) {
   const capture = deferred()
   const props = reactive({ session: { id: 'project', tracks: [], pluginChain: ['a', 'b', 'c'].map(plugin) }, selectedTrackId: null })
-  const writes = [], calls = [], mounts = [], disposals = [], timers = new Map()
+  const writes = [], calls = [], emitted = [], mounts = [], disposals = [], timers = new Map()
   let timerSequence = 0, stopped = false
   const preferences = new Map()
   const controls = { scanControl, scanStatus: null, statusGate: null, skipGate: null, skipResult: true, cancelResult: true, blacklist: [], blacklistGate: null, directory: null, scanGate: null, editorGate: null, captureGate: capture, report: {
@@ -28,6 +28,7 @@ function environment(t, { scanControl = false } = {}) {
   } }
   const context = vm.createContext({
     PluginHostDialogPendingError: class PluginHostDialogPendingError extends Error {},
+    defineEmits: () => (event, trackId) => emitted.push({ event, trackId }),
     computed, ref, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
     useEditorStore: () => ({
       async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise },
@@ -97,7 +98,7 @@ function environment(t, { scanControl = false } = {}) {
     }).outputText
     return vm.runInContext(eventCode, context)(true)
   }
-  return { props, writes, calls, controls, preferences, mounts, timers, dispose, read, set, call, trigger, releaseCapture: capture.resolve,
+  return { props, writes, calls, emitted, controls, preferences, mounts, timers, dispose, read, set, call, trigger, releaseCapture: capture.resolve,
     async tick() { const pending = [...timers.values()]; timers.clear(); pending.forEach(callback => callback()); await flush() },
     evaluate: expression => vm.runInContext(expression, context),
     buttonDisabled(key) {
@@ -331,10 +332,39 @@ test('a chain action cannot cross a project switch during capture', async t => {
   assert.equal(env.writes.length, 0)
 })
 
+test('library target selection emits the channel choice and follows external track selection without an echo', async t => {
+  const env = environment(t)
+  env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [plugin('voice-effect')] })
+  env.set('target', 'track:voice')
+  await flush()
+  assert.deepEqual(env.emitted, [{ event: 'selectTarget', trackId: 'voice' }])
+  env.props.selectedTrackId = 'voice'
+  await flush()
+  assert.equal(env.emitted.length, 1)
+  env.props.selectedTrackId = null
+  await flush()
+  assert.equal(env.read('target'), 'master')
+  assert.equal(env.emitted.length, 1)
+  assert.equal(env.writes.length, 0)
+})
+
+test('a track named master by identifier retains its own inserts instead of selecting the output bus', async t => {
+  const env = environment(t)
+  env.props.session.tracks.push({ id: 'master', name: 'Audio', pluginChain: [plugin('track-effect')] })
+  env.props.selectedTrackId = 'master'
+  await flush()
+  assert.equal(env.read('target'), 'track:master')
+  assert.equal(env.read('chain')[0].id, 'track-effect')
+  env.set('target', 'master')
+  await flush()
+  assert.deepEqual(env.emitted, [{ event: 'selectTarget', trackId: null }])
+  assert.equal(env.read('chain')[0].id, 'a')
+})
+
 test('closing and reopening the manager preserves its library, paths and target without touching native state', async t => {
   const env = environment(t)
   env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [plugin('voice-effect')] })
-  env.set('target', 'voice')
+  env.set('target', 'track:voice')
   env.set('directories', ['/Library/Audio/Plug-Ins/VST3'])
   env.set('descriptors', env.controls.report.plugins)
   env.set('scanReport', env.controls.report)
@@ -347,7 +377,7 @@ test('closing and reopening the manager preserves its library, paths and target 
   assert.equal(env.read('parameterSlotId'), 'voice-effect')
   env.call('openManager')
   assert.equal(env.read('managerOpen'), true)
-  assert.equal(env.read('target'), 'voice')
+  assert.equal(env.read('target'), 'track:voice')
   assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), ['/Library/Audio/Plug-Ins/VST3'])
   assert.deepEqual(JSON.parse(JSON.stringify(env.read('descriptors'))), env.controls.report.plugins)
   assert.deepEqual(JSON.parse(JSON.stringify(env.read('scanReport'))), env.controls.report)
@@ -401,13 +431,13 @@ test('a project object replacement closes the manager and discards a late scan f
 test('changing the target clears generic parameters and deleting the active track falls back to master', async t => {
   const env = environment(t)
   env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [plugin('voice-effect')] })
-  env.set('target', 'voice')
+  env.set('target', 'track:voice')
   await flush()
   env.call('openManager', 'voice-effect')
   env.set('target', 'master')
   await flush()
   assert.equal(env.read('parameterSlotId'), null)
-  env.set('target', 'voice')
+  env.set('target', 'track:voice')
   await flush()
   env.call('openManager', 'voice-effect')
   env.props.session.tracks = []
@@ -420,7 +450,7 @@ test('changing the target clears generic parameters and deleting the active trac
 test('adding a plugin cannot write a removed track after asynchronous state capture', async t => {
   const env = environment(t)
   env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [] })
-  env.set('target', 'voice')
+  env.set('target', 'track:voice')
   await flush()
   env.set('descriptors', env.controls.report.plugins)
   env.set('selectedPluginId', JSON.stringify(['vst3:library', '/library.vst3']))
@@ -571,7 +601,7 @@ test('a stale skip targets the displayed plugin path and cannot silently skip th
 test('a closed manager keeps its controlled scan and library selection state until the report completes', async t => {
   const env = environment(t, { scanControl: true })
   env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [plugin('voice-effect')] })
-  env.set('target', 'voice')
+  env.set('target', 'track:voice')
   env.set('directories', ['/plugins'])
   env.set('catalogGroupBy', 'category')
   env.set('librarySearch', 'Vendor')
@@ -590,7 +620,7 @@ test('a closed manager keeps its controlled scan and library selection state unt
   await scanning
   assert.equal(env.timers.size, 0)
   env.call('openManager')
-  assert.equal(env.read('target'), 'voice')
+  assert.equal(env.read('target'), 'track:voice')
   assert.equal(env.read('catalogGroupBy'), 'category')
   assert.equal(env.read('librarySearch'), 'Vendor')
   assert.equal(env.read('descriptors').length, 1)

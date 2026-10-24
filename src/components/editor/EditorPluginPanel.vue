@@ -11,6 +11,7 @@ import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, p
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
+const emit = defineEmits<{ selectTarget: [trackId: string | null] }>()
 const { t, locale } = useI18n()
 const editor = useEditorStore()
 const playback = useEditorPlaybackStore()
@@ -61,12 +62,13 @@ const scanPhaseLabel = computed(() => t(scanStatus.value?.phase === 'scanning' ?
 const canChooseAudioUnits = computed(() => capabilities.value?.platform === 'macos' && capabilities.value.formats.includes('au'))
 const targetOptions = computed(() => [
   { label: t('editor.plugins.masterOutput'), value: 'master' },
-  ...props.session.tracks.map(track => ({ label: track.name, value: track.id })),
+  ...props.session.tracks.map(track => ({ label: track.name, value: `track:${track.id}` })),
 ])
 const targetLabel = computed(() => targetOptions.value.find(option => option.value === target.value)?.label || t('editor.plugins.masterOutput'))
-const chain = computed(() => target.value === 'master'
+const targetTrackId = computed(() => target.value === 'master' ? null : target.value.slice(6))
+const chain = computed(() => targetTrackId.value === null
   ? props.session.pluginChain || []
-  : props.session.tracks.find(track => track.id === target.value)?.pluginChain || [])
+  : props.session.tracks.find(track => track.id === targetTrackId.value)?.pluginChain || [])
 const parameterSlot = computed(() => chain.value.find(slot => slot.id === parameterSlotId.value))
 const descriptorKey = (plugin: PluginDescriptor) => JSON.stringify([plugin.id, plugin.path])
 const relocatingSlot = computed(() => chain.value.find(slot => slot.id === relocatingSlotId.value))
@@ -120,10 +122,14 @@ const stopObservingSession = observePluginSession(host => {
   else { opened.value = []; unavailablePlugins.value = [] }
 })
 onScopeDispose(stopObservingSession)
-watch(() => props.selectedTrackId, id => { target.value = id || 'master' }, { immediate: true })
-watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; dialogPending.value = false; dialogOperationError = false; invalidateCatalog(); relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId || 'master' })
+watch(() => props.selectedTrackId, id => { target.value = id === null ? 'master' : `track:${id}` }, { immediate: true })
+watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; dialogPending.value = false; dialogOperationError = false; invalidateCatalog(); relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId === null ? 'master' : `track:${props.selectedTrackId}` })
 watch(targetOptions, options => { if (!options.some(option => option.value === target.value)) target.value = 'master' })
-watch(target, () => { reloadConfirmOpen.value = false; targetMenuOpen.value = false; relocatingSlotId.value = null; selectedPluginId.value = null; parameterSlotId.value = null; feedback.value = '' })
+watch(target, value => {
+  reloadConfirmOpen.value = false; targetMenuOpen.value = false; relocatingSlotId.value = null; selectedPluginId.value = null; parameterSlotId.value = null; feedback.value = ''
+  const trackId = value === 'master' ? null : value.slice(6)
+  if (trackId !== props.selectedTrackId) emit('selectTarget', trackId)
+})
 watch(() => chain.value.map(slot => slot.id), ids => { if (!ids.includes(parameterSlotId.value || '')) parameterSlotId.value = null })
 watch(directories, invalidateCatalog, { deep: true, flush: 'sync' })
 watch(pluginOptions, options => { if (!options.some(option => option.value === selectedPluginId.value && !option.disabled)) selectedPluginId.value = null })
@@ -384,7 +390,7 @@ async function scan(force = false) {
 async function mutate(change: (slots: typeof chain.value) => void, recovery = false) {
   await run(async () => {
     const project = props.session
-    const trackId = target.value === 'master' ? null : target.value
+    const trackId = targetTrackId.value
     await editor.capturePluginState(project, true, recovery)
     if (props.session !== project) return
     const track = trackId ? props.session.tracks.find(track => track.id === trackId) : null
@@ -418,7 +424,7 @@ async function addPlugin() {
   const plugin = descriptors.value.find(value => descriptorKey(value) === selectedPluginId.value)
   if (!plugin || plugin.isInstrument === true || !capabilities.value?.formats.includes(pluginDescriptorFormat(plugin))) return
   const project = props.session
-  const trackId = target.value === 'master' ? null : target.value
+  const trackId = targetTrackId.value
   const destination = targetLabel.value
   const slotId = `plugin_${crypto.randomUUID()}`
   await mutate(slots => slots.push({ id: slotId, format: pluginDescriptorFormat(plugin), pluginId: plugin.id,
@@ -470,8 +476,32 @@ async function toggleEditor(slotId: string) {
 </script>
 
 <template>
-  <section v-if="capabilities?.enabled" class="plugin-panel" :aria-busy="busy">
-    <n-button ref="manageButton" size="small" block secondary :type="operationError ? 'warning' : 'default'" aria-haspopup="dialog" :aria-expanded="managerOpen" :title="operationError ? t('editor.plugins.attentionRequired') : t('editor.plugins.manage')" @click="openManager()"><template #icon><n-icon :component="OptionsOutline" /></template>{{ t('editor.plugins.title') }}</n-button>
+  <section v-if="capabilities?.enabled" class="plugin-panel" :aria-busy="busy" :aria-label="t('editor.plugins.inserts')" @keydown.stop>
+    <div class="plugin-panel__header">
+      <strong>{{ t('editor.plugins.inserts') }}<span>{{ chain.length }}</span></strong>
+      <n-button ref="manageButton" size="tiny" quaternary :type="operationError ? 'warning' : 'default'" :aria-label="t('editor.plugins.title')" aria-haspopup="dialog" :aria-expanded="managerOpen" :title="t('editor.plugins.manage')" @click="openManager()"><template #icon><n-icon :component="AddOutline" /></template>{{ t('editor.plugins.library') }}</n-button>
+    </div>
+    <ol v-if="chain.length" class="plugin-panel__inserts" :aria-label="t('editor.plugins.chainTitle')">
+      <li v-for="(slot, index) in chain" :key="slot.id" class="plugin-insert" :class="{ 'plugin-insert--bypassed': slot.bypassed }">
+        <div class="plugin-insert__main">
+          <span class="plugin-insert__number">{{ index + 1 }}</span>
+          <n-button class="plugin-insert__editor" size="small" text :type="opened.includes(slot.id) ? 'primary' : 'default'" :disabled="busy || !capabilities.nativeEditor || !(capabilities.nativeEditorFormats || ['vst3']).includes(slot.format) || unavailablePlugins.some(item => item.slotId === slot.id)" :aria-label="t(opened.includes(slot.id) ? 'editor.plugins.closeNamedEditor' : 'editor.plugins.openNamedEditor', { name: slot.name || slot.pluginId })" :title="slot.name || slot.pluginId" @click="toggleEditor(slot.id)">{{ slot.name || slot.pluginId }}</n-button>
+          <n-switch size="small" :value="!slot.bypassed" :disabled="busy" :aria-label="t('editor.plugins.enableNamed', { name: slot.name || slot.pluginId })" @update:value="(enabled: boolean) => setPluginBypassed(slot.id, !enabled)" />
+        </div>
+        <div class="plugin-insert__tools">
+          <span class="plugin-manager__format">{{ pluginDescriptorVariant({ ...slot, id: slot.pluginId }) }}</span>
+          <span v-if="unavailablePlugins.some(item => item.slotId === slot.id)" class="plugin-insert__missing" :title="unavailablePlugins.find(item => item.slotId === slot.id)?.message">{{ t('editor.plugins.insertUnavailable') }}</span>
+          <div>
+            <n-button size="tiny" quaternary :disabled="busy || index === 0" :title="t('editor.plugins.moveUp')" :aria-label="t('editor.plugins.moveUp')" @click="movePlugin(slot.id, -1)"><template #icon><n-icon :component="ArrowUpOutline" /></template></n-button>
+            <n-button size="tiny" quaternary :disabled="busy || index === chain.length - 1" :title="t('editor.plugins.moveDown')" :aria-label="t('editor.plugins.moveDown')" @click="movePlugin(slot.id, 1)"><template #icon><n-icon :component="ArrowDownOutline" /></template></n-button>
+            <n-button size="tiny" quaternary :disabled="busy" :title="t('editor.plugins.parameters')" :aria-label="t('editor.plugins.parameters')" @click="openManager(slot.id)"><template #icon><n-icon :component="OptionsOutline" /></template></n-button>
+            <n-button size="tiny" quaternary type="error" :disabled="busy" :title="t('editor.plugins.remove')" :aria-label="t('editor.plugins.remove')" @click="removePlugin(slot.id)"><template #icon><n-icon :component="TrashOutline" /></template></n-button>
+          </div>
+        </div>
+      </li>
+    </ol>
+    <button v-else type="button" class="plugin-panel__add" @click="openManager()"><n-icon :component="AddOutline" />{{ t('editor.plugins.addInsert') }}</button>
+    <button v-if="operationError" type="button" class="plugin-panel__attention" :title="operationError" @click="openManager()">{{ t(dialogPending ? 'editor.plugins.insertWaiting' : 'editor.plugins.attentionRequired') }}</button>
   </section>
 
   <n-modal v-if="capabilities?.enabled" v-model:show="managerOpen" draggable
@@ -643,7 +673,27 @@ async function toggleEditor(slotId: string) {
 </template>
 
 <style scoped>
-.plugin-panel { min-width: 0; padding: 12px 14px; border-bottom: 1px solid var(--outline); }
+.plugin-panel { min-width: 0; padding: 12px 10px; border-bottom: 1px solid var(--outline); }
+.plugin-panel__header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+.plugin-panel__header > strong { display: flex; align-items: baseline; gap: 7px; font-size: 12px; }
+.plugin-panel__header > strong > span { font-size: 10px; font-weight: 400; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
+.plugin-panel__inserts { display: grid; gap: 0; max-height: 260px; overflow: auto; margin: 0; padding: 0; list-style: none; border: 1px solid var(--outline); border-radius: 5px; }
+.plugin-insert { min-width: 0; padding: 5px 7px; background: var(--surface-1); }
+.plugin-insert + .plugin-insert { border-top: 1px solid var(--outline); }
+.plugin-insert--bypassed .plugin-insert__editor { opacity: .55; }
+.plugin-insert__main { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.plugin-insert__number { flex-shrink: 0; width: 12px; font-size: 10px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
+.plugin-insert__editor { flex: 1; justify-content: flex-start; overflow: hidden; min-width: 0; font-size: 12px; }
+.plugin-insert__editor :deep(.n-button__content) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-insert__main > .n-switch { flex-shrink: 0; }
+.plugin-insert__tools { display: flex; align-items: center; gap: 5px; min-width: 0; padding-left: 19px; }
+.plugin-insert__tools > div { display: flex; gap: 1px; margin-left: auto; }
+.plugin-insert__tools :deep(.n-button) { width: 22px; padding: 0; }
+.plugin-insert__missing { color: var(--warning); font-size: 10px; }
+.plugin-panel__add { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 34px; border: 1px dashed var(--outline-strong); border-radius: 5px; background: transparent; color: var(--on-surface-muted); cursor: pointer; font: inherit; font-size: 11px; }
+.plugin-panel__add:hover { color: var(--primary); border-color: var(--primary-border); background: var(--primary-softer); }
+.plugin-panel__attention { display: block; width: 100%; margin-top: 7px; padding: 0; border: 0; background: transparent; color: var(--warning); text-align: left; font: inherit; font-size: 11px; cursor: pointer; }
+.plugin-panel__add:focus-visible, .plugin-panel__attention:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .plugin-panel__hint, .plugin-panel__warning { margin: 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .plugin-panel__warning { color: var(--warning, var(--on-surface-muted)); }
 .plugin-manager { width: min(1060px, calc(100vw - 40px)); height: min(600px, calc(100dvh - 128px)); max-height: calc(100dvh - 128px); margin: 96px auto 24px; align-self: flex-start; min-width: 0; border: 1px solid var(--outline-strong); box-shadow: var(--shadow-soft); }

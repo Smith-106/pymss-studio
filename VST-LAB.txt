@@ -940,3 +940,24 @@ The user's existing application/project data and main branch remain untouched.
 Final Windows ordinary/Lab debug builds passed typecheck, frontend production build,
 linking, capabilities and helper shutdown. Source fingerprints match the final input;
 no desktop data directories were created by the headless verification.
+
+Twenty-second iteration: channel inspector and inline inserts (2026-10-25)
+----------------------------------------------------------------
+The right inspector now selects a track or the existing master output, with a visible
+master shortcut. Volume, pan, stereo meters and insert chains follow the same target;
+library target selection updates the global selection. Existing master state/setters,
+undo and saving are reused without changing the project format. Track-only clip,
+source and built-in effect controls remain scoped to tracks. Channel tokens cannot
+collide with real track identifiers such as master or IDs containing colons.
+
+Inserts are visible directly in the inspector: open/close native UI, enable/bypass,
+reorder, remove and open advanced parameters. The existing floating library retains
+source selection, scanning and blacklist management. No audio-engine replacement or
+bottom mixer was introduced. The Rust native plugin helper remains the DSP path.
+
+Validation: frontend 1200 passed/3 skipped; six channel browser scenarios plus 21
+workbench and 18 full regression scenarios passed with mocked IPC and no page errors.
+Light/dark themes and 1400x900/980x680 layouts were inspected. Reports and final Lab
+build fingerprints: native-v22-*, channel-inspector-v4/, channel-workbench-v2/ and
+channel-regression-v2/ under E:/pymss-vst-lab-artifacts. These checks do not certify
+real DSP/hardware or macOS/Linux. Existing user windows/projects remain untouched.

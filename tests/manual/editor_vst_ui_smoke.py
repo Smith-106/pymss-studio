@@ -125,8 +125,9 @@ with sync_playwright() as playwright:
         expect(panel).to_be_visible()
         expect(panel.get_by_role('button',name='识别插件',exact=True)).to_have_count(0)
         sidebar_height=panel.bounding_box()['height']
-        assert sidebar_height < 70,sidebar_height
-        expect(panel.get_by_role('button')).to_have_count(1)
+        assert sidebar_height < 280,sidebar_height
+        expect(panel.get_by_role('button',name='音频插件',exact=True)).to_have_count(1)
+        expect(panel.get_by_role('button',name='添加音频效果器',exact=True)).to_have_count(1)
         expect(panel.locator('.n-select')).to_have_count(0)
         page.screenshot(path=str(args.output_dir/'plugin-compact-sidebar-1280x820.png'))
         sidebar=panel
@@ -135,7 +136,7 @@ with sync_playwright() as playwright:
         expect(panel).to_be_visible()
         expect(panel).to_have_attribute('aria-modal','false')
         expect(page.locator('.n-modal-mask')).to_have_count(0)
-        results.append({'scenario':'compact-sidebar-modeless-manager','sidebarHeight':sidebar_height})
+        results.append({'scenario':'inline-inserts-empty-state-and-modeless-library','sidebarHeight':sidebar_height})
         print('Plugin manager mounted',flush=True)
         expect(panel.locator('.plugin-panel__directory')).to_have_count(0)
         expect(panel.get_by_role('button',name='识别插件',exact=True)).to_have_count(0)

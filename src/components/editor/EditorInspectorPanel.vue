@@ -2,6 +2,8 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import type { InputInst } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
+import { PencilOutline } from '@vicons/ionicons5'
+import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
 import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
@@ -18,6 +20,13 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
+  selectTrack: [trackId: string | null]
+  setMasterVolume: [value: number]
+  setMasterPan: [value: number]
+  beginMasterVolume: []
+  commitMasterVolume: []
+  beginMasterPan: []
+  commitMasterPan: []
   renameTrack: [trackId: string, name: string, commit?: boolean]
   setTrackVolume: [trackId: string, value: number]
   setTrackPan: [trackId: string, value: number]
@@ -45,8 +54,22 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const playback = useEditorPlaybackStore()
 
 const selectedTrack = computed(() => props.session.tracks.find((track) => track.id === props.selectedTrackId) || null)
+const channelOptions = computed(() => [
+  { label: t('editor.plugins.masterOutput'), value: 'master' },
+  ...props.session.tracks.map(track => ({ label: track.name, value: `track:${track.id}` })),
+])
+const channelValue = computed(() => selectedTrack.value ? `track:${selectedTrack.value.id}` : 'master')
+const channelVolume = computed(() => selectedTrack.value ? selectedTrack.value.volume : props.session.masterVolume)
+const channelPan = computed(() => selectedTrack.value ? selectedTrack.value.pan : props.session.masterPan)
+const channelVolumeLabel = computed(() => t(selectedTrack.value ? 'editor.trackVolume' : 'editor.masterVolume'))
+const channelLevels = computed<[number, number]>(() => {
+  const levels = selectedTrack.value ? playback.trackLevels[selectedTrack.value.id] : playback.masterLevel
+  return [normalizeLevel(levels?.[0]), normalizeLevel(levels?.[1])]
+})
+const channelPeak = computed(() => Math.max(...channelLevels.value))
 const selectedClip = computed(() => (
   selectedTrack.value?.clips?.find((clip) => clip.id === props.selectedClipId) || null
 ))
@@ -55,6 +78,45 @@ const editingTrackId = ref<string | null>(null)
 const renameInput = ref<InputInst | null>(null)
 const nameButton = ref<HTMLButtonElement | null>(null)
 const effectPreset = ref('custom')
+
+function selectChannel(value: string) {
+  if (value === 'master') { emit('selectTrack', null); return }
+  const track = props.session.tracks.find(track => `track:${track.id}` === value)
+  if (track) emit('selectTrack', track.id)
+}
+function updateChannelVolume(value: number) {
+  if (selectedTrack.value) emit('setTrackVolume', selectedTrack.value.id, value)
+  else emit('setMasterVolume', value)
+}
+function updateChannelPan(value: number) {
+  if (selectedTrack.value) emit('setTrackPan', selectedTrack.value.id, value)
+  else emit('setMasterPan', value)
+}
+function beginChannelVolume() {
+  if (selectedTrack.value) emit('beginTrackVolume')
+  else emit('beginMasterVolume')
+}
+function commitChannelVolume() {
+  if (selectedTrack.value) emit('commitTrackVolume')
+  else emit('commitMasterVolume')
+}
+function beginChannelPan() {
+  if (selectedTrack.value) emit('beginTrackPan')
+  else emit('beginMasterPan')
+}
+function commitChannelPan() {
+  if (selectedTrack.value) emit('commitTrackPan')
+  else emit('commitMasterPan')
+}
+function normalizeLevel(value: number | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
+}
+function levelDb(value: number) {
+  return value > 0 ? 20 * Math.log10(value) : -Infinity
+}
+function meterValue(value: number) { return Math.max(-60, levelDb(value)) }
+function meterScale(value: number) { return (meterValue(value) + 60) / 60 }
+function formatLevel(value: number) { return value > 0 ? levelDb(value).toFixed(1) : '−∞' }
 
 watch(
   selectedTrack,
@@ -195,80 +257,83 @@ function applyEffectPreset(value: string) {
 <template>
   <aside class="editor-inspector" :class="{ 'editor-inspector--compact': compact }">
     <div class="editor-inspector__titlebar">
-      <div class="editor-inspector__eyebrow">{{ selectedTrack ? t('editor.trackParams') : t('editor.inspectorTitle') }}</div>
-      <div class="editor-inspector__title">
-        <n-input
-          v-if="selectedTrack && editingTrackId === selectedTrack.id"
-          ref="renameInput"
-          v-model:value="renameDraft"
-          class="editor-inspector__name-input"
-          size="small"
-          :input-props="{ 'aria-label': t('editor.inspectorFieldName') }"
-          @blur="commitRename()"
-          @keydown.stop="onRenameKeydown"
-        />
-        <button v-else-if="selectedTrack" ref="nameButton" type="button" class="editor-inspector__name"
-          :title="selectedTrack.name" :aria-label="t('editor.renameTrack', { name: selectedTrack.name })"
-          @click="beginRename" @keydown.stop>
-          <strong>{{ selectedTrack.name }}</strong>
-        </button>
-        <strong v-else>{{ t('editor.projectInfo') }}</strong>
-        <span>{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : t('editor.clipParamsIdle') }}</span>
+      <div class="editor-inspector__eyebrow" :title="selectedTrack ? t('editor.trackParams') : t('editor.plugins.masterOutput')">{{ t('editor.channelInspector') }}</div>
+      <div class="editor-inspector__channel-select">
+        <n-input v-if="selectedTrack && editingTrackId === selectedTrack.id" ref="renameInput" v-model:value="renameDraft" class="editor-inspector__name-input" size="small" :input-props="{ 'aria-label': t('editor.inspectorFieldName') }" @blur="commitRename()" @keydown.stop="onRenameKeydown" />
+        <n-select v-else class="editor-inspector__channel-picker" size="small" :value="channelValue" :options="channelOptions" :aria-label="t('editor.selectChannel')" @update:value="selectChannel" />
+        <button v-if="selectedTrack && editingTrackId !== selectedTrack.id" ref="nameButton" type="button" class="editor-inspector__name" :title="t('editor.renameTrack', { name: selectedTrack.name })" :aria-label="t('editor.renameTrack', { name: selectedTrack.name })" @click="beginRename" @keydown.stop><n-icon :component="PencilOutline" :size="14" /></button>
+        <n-button class="editor-inspector__master-button" size="tiny" secondary :type="selectedTrack ? 'default' : 'primary'" :disabled="!selectedTrack" @click="selectChannel('master')">{{ t('editor.plugins.masterOutput') }}</n-button>
       </div>
+      <span class="editor-inspector__channel-context" :title="selectedTrack ? sourceMeta : session.name">{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : session.name }}</span>
     </div>
 
     <div class="editor-inspector__scroll">
-      <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" />
-      <section v-if="selectedTrack" class="inspector-group inspector-group--primary">
+      <section class="inspector-group inspector-group--primary inspector-channel">
         <div class="inspector-group__header">
           <strong>{{ t('editor.inspectorSectionCommon') }}</strong>
-          <span>{{ t('editor.inspectorTrackContext') }}</span>
+          <span>{{ selectedTrack ? t('editor.inspectorTrackContext') : t('editor.plugins.masterOutput') }}</span>
         </div>
 
-        <div class="inspector-group__body inspector-group__body--dense">
+        <div class="inspector-group__body inspector-group__body--dense inspector-channel__body">
           <div class="dual-fields dual-fields--stacked">
             <div class="panel-field panel-field--compact">
               <div class="panel-field__split panel-field__split--compact">
-                <span class="panel-field__label">{{ t('editor.trackVolume') }}</span>
-                <strong>{{ formatTrackVolume(selectedTrack.volume) }}</strong>
+                <span class="panel-field__label">{{ channelVolumeLabel }}</span>
+                <strong>{{ formatTrackVolume(channelVolume) }}</strong>
               </div>
               <EditorParameterSlider
-                :value="selectedTrack.volume"
+                :key="channelValue"
+                :value="channelVolume"
                 :reset-value="1"
-                :label="t('editor.trackVolume')"
+                :label="channelVolumeLabel"
+                :aria-label="channelVolumeLabel"
                 :reset-label="t('editor.sliderDefaultVolume')"
                 :min="0"
                 :max="2"
                 :step="0.01"
                 :tooltip="false"
-                @update:value="(value: number) => selectedTrack && emit('setTrackVolume', selectedTrack.id, value)"
-                @dragstart="emit('beginTrackVolume')"
-                @dragend="emit('commitTrackVolume')"
+                @update:value="updateChannelVolume"
+                @dragstart="beginChannelVolume"
+                @dragend="commitChannelVolume"
               />
             </div>
 
             <div class="panel-field panel-field--compact">
               <div class="panel-field__split panel-field__split--compact">
                 <span class="panel-field__label">{{ t('editor.balance') }}</span>
-                <strong>{{ formatTrackPan(selectedTrack.pan) }}</strong>
+                <strong>{{ formatTrackPan(channelPan) }}</strong>
               </div>
               <EditorParameterSlider
-                :value="selectedTrack.pan"
+                :key="channelValue"
+                :value="channelPan"
                 :reset-value="0"
                 :label="t('editor.balance')"
+                :aria-label="t('editor.balance')"
                 :reset-label="t('editor.sliderDefaultCenter')"
                 :min="-1"
                 :max="1"
                 :step="0.01"
                 :tooltip="false"
-                @update:value="(value: number) => selectedTrack && emit('setTrackPan', selectedTrack.id, value)"
-                @dragstart="emit('beginTrackPan')"
-                @dragend="emit('commitTrackPan')"
+                @update:value="updateChannelPan"
+                @dragstart="beginChannelPan"
+                @dragend="commitChannelPan"
               />
             </div>
           </div>
+          <div class="inspector-channel__meter" :title="t('editor.channelLevelStereo', { left: formatLevel(channelLevels[0]), right: formatLevel(channelLevels[1]) })">
+            <span class="inspector-channel__meter-label">{{ t('editor.channelLevel') }}</span>
+            <div class="inspector-channel__meter-bars">
+              <div v-for="(value, index) in channelLevels" :key="index" class="inspector-channel__meter-bar" role="meter" :aria-label="`${t('editor.channelLevel')} · ${t(index === 0 ? 'editor.panLeft' : 'editor.panRight')}`" :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="meterValue(value)" :aria-valuetext="`${formatLevel(value)} dBFS`">
+                <span :class="{ 'inspector-channel__meter-fill--full': value >= 1 }" :style="{ transform: `scaleY(${meterScale(value)})` }" />
+              </div>
+              <div class="inspector-channel__meter-scale" aria-hidden="true"><span>0</span><span>−30</span><span>−60</span></div>
+            </div>
+            <strong class="inspector-channel__meter-value">{{ formatLevel(channelPeak) }}<small>dBFS</small></strong>
+          </div>
         </div>
       </section>
+
+      <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" />
 
       <details v-if="selectedTrack" class="inspector-group inspector-group--effects">
         <summary class="inspector-group__header">
@@ -548,34 +613,24 @@ function applyEffectPreset(value: string) {
   letter-spacing: 0.08em;
 }
 
-.editor-inspector__title {
-  display: grid;
-  gap: 2px;
-}
-
-.editor-inspector__title strong,
-.editor-inspector__title > span {
+.editor-inspector__channel-select { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.editor-inspector__channel-picker, .editor-inspector__name-input { min-width: 0; flex: 1; }
+.editor-inspector__master-button { flex-shrink: 0; }
+.editor-inspector__channel-context {
+  color: var(--on-surface-muted);
+  font-size: 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.editor-inspector__title strong {
-  font-size: 14px;
-  line-height: 1.15;
-}
-
-.editor-inspector__title > span {
-  color: var(--on-surface-muted);
-  font-size: 10px;
-}
-
 .editor-inspector__name {
   display: flex;
   align-items: center;
-  min-width: 0;
-  width: 100%;
-  height: 28px;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 26px;
   padding: 0;
   border: 0;
   border-radius: 5px;
@@ -583,7 +638,7 @@ function applyEffectPreset(value: string) {
   color: inherit;
   font: inherit;
   text-align: left;
-  cursor: text;
+  cursor: pointer;
 }
 
 .editor-inspector__name:hover { background: var(--primary-softer); }
@@ -617,6 +672,20 @@ function applyEffectPreset(value: string) {
 .inspector-group--primary {
   border-color: color-mix(in srgb, var(--outline) 78%, transparent);
 }
+
+.inspector-channel__body { grid-template-columns: minmax(0, 1fr) 50px; align-items: center; gap: 9px; }
+.inspector-channel__body > .dual-fields { min-width: 0; }
+.inspector-channel .panel-field__split { gap: 4px; }
+.inspector-channel .panel-field__split > strong { font-variant-numeric: tabular-nums; font-size: 10px; }
+.inspector-channel__meter { display: grid; justify-items: center; gap: 4px; min-width: 0; }
+.inspector-channel__meter-label { font-size: 9px; color: var(--on-surface-muted); }
+.inspector-channel__meter-bars { display: grid; grid-template-columns: 8px 8px 19px; gap: 3px; height: 70px; }
+.inspector-channel__meter-bar { position: relative; overflow: hidden; background: var(--surface-2); border: 1px solid var(--outline); border-radius: 2px; }
+.inspector-channel__meter-bar > span { position: absolute; inset: 0; background: var(--success, var(--primary)); transform-origin: bottom; }
+.inspector-channel__meter-bar > .inspector-channel__meter-fill--full { background: var(--error, var(--warning)); }
+.inspector-channel__meter-scale { display: flex; flex-direction: column; justify-content: space-between; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
+.inspector-channel__meter-value { font-size: 10px; line-height: 1.2; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.inspector-channel__meter-value > small { margin-left: 3px; color: var(--on-surface-muted); font-size: 8px; font-weight: 400; }
 
 .inspector-group--effects {
   border-color: color-mix(in srgb, var(--primary-border) 50%, var(--outline));
