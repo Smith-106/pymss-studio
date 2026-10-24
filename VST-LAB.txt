@@ -38,11 +38,22 @@ the plugin's native window. Native edits are observed and automatically captured
 into immutable content-addressed files; manual save and window close await the
 latest state. Failed captures remain visible and can be retried. Export renders the same native graph before
 the existing output encoding and publishing stage.
+Export sessions select offline processing during control-thread preparation.
+Plugins may choose different offline quality, latency or tail behavior. The host
+notifies VST3/VST2 effects and AUs supporting the optional OfflineRender property;
+it does not force a plugin to change its quality. Ordinary AUs without that
+property keep their current effect path. Dedicated auol/batch-offline workflows
+are outside the current adapter.
+VST3 latency/tail queries and latency-change reactivation run on the control
+thread while DSP is suspended. The worker reads an atomic timing cache; render
+startup recovery is bounded per insert, including serial effect chains.
 
 First-round boundaries
 ----------------------
-Use mono/stereo local audio with built-in effects disabled. New recording,
-instruments/MIDI, sidechains, float64-only plugins and architecture bridging
+Use mono/stereo local audio. Built-in track effects can precede the plugin chain
+in the native graph. Recording saves dry microphone takes, with native plugins
+processing accompaniment and recorded clips. Live input plugin monitoring,
+hardware latency compensation, instruments/MIDI, sidechains, float64-only plugins and architecture bridging
 are not supported. Maximum plugin tail is 30 seconds; exports report truncation.
 Stable processing-latency changes are renegotiated with the same plugin instance,
 preserving playback position, loop state and editor windows. Repeatedly unstable
@@ -65,8 +76,8 @@ Run tests/manual/vst_host_fault_smoke.py --help for delay, chain-order and
 crash/hang recovery checks. They use task-specific audio and artifact directories.
 
 Upstream provenance: native/vendor/UPSTREAM.txt.
-Future work: native plugin compatibility validation and built-in effect/recording
-parity. AAX is a separate
+Future work: native plugin compatibility validation, live input monitoring and
+recording latency calibration. AAX is a separate
 feasibility task pending verified third-party host access conditions.
 
 Validation record (Windows x64, 2026-10-23 UTC)
@@ -505,3 +516,170 @@ Full native host/tests cross-checks pass for Linux x86_64 and macOS ARM64/x86_64
 Logs: E:/pymss-vst-lab-artifacts/native-v9-* and parameter-target-v8/.
 Real plugin reset behavior and live transitions still need native acceptance;
 AAX and the built-in-effects/recording boundaries remain unchanged.
+
+Tenth iteration: built-in effects with native plugins (2026-10-24 UTC)
+--------------------------------------------------------------------
+Plugin projects can now use the existing reverb, delay, clarity and compressor
+controls. The native track path is clip gain/fades/pan and summing, then clarity,
+compressor, parallel dry/reverb/delay, plugin inserts and PDC. Track/master plugins
+and output gain keep their existing order. Live preview and plugin export use
+this same native graph; final Python encoding receives one neutral rendered track.
+
+The streaming DSP uses the worker's deterministic coefficients: one-pole highpass,
+memoryless compressor, six reverb taps and five delay echoes. It does not attempt
+bit parity with Web Audio's convolver/dynamics nodes; without-plugin processing
+is unchanged. Effects run once per summed track, rather than independently per
+clip. Highpass settling adds a relative -120 dB decay budget before serial plugin
+tails; the existing 30-second total cap and truncation report remain in effect.
+
+Configuration/ring allocation happens before the audio worker receives a mix
+update. Unchanged settings retain their filter and echo history; changed settings
+reset that track's built-in processor while keeping plugin instances/windows.
+Active effect histories have a 128 MiB aggregate limit. A single acknowledged mix
+update bounds ordinary replacement peaks to roughly 256 MiB. Failed updates do
+not replace the session specification. DSP processing performs no I/O/allocation.
+Older hosts without builtinEffects=true keep the existing explicit effect gate.
+
+Validation: frontend 1107 passed/3 skipped; native audio 59 unit tests and five
+helper integration regressions passed; Tauri default/experimental bridge tests
+42 each passed. Linux x86_64 and macOS ARM64/x86_64 full native-host/test cross-
+checks passed. The helper/FFmpeg/local-fixture export checks nonlinear ordering,
+stereo reference samples, track+master gain, IIR/tap tail length and same-session
+effect updates. It opens no editor or audio output device. This regression needs
+FFmpeg on PATH or PYMSS_TEST_FFMPEG; it reports when that optional decoder is absent.
+Logs: E:/pymss-vst-lab-artifacts/native-v10-* and builtin-effects-v9/.
+AAX, plugin-project recording and native platform/real-plugin acceptance remain
+outstanding. No release, remote CI or real third-party plugin was run this round.
+
+Eleventh iteration: recording with native accompaniment (2026-10-24 UTC)
+----------------------------------------------------------------------
+Plugin projects can now use the existing microphone recording/file lifecycle.
+This captures dry mono PCM16; plugins process backing audio and the recorded
+clip after capture. Live microphone routing through plugins and input/output
+hardware latency calibration are outside this implementation.
+
+Native playback gains a transient monitor operation for recording targets. It
+skips their decode/prefetch and silences their dry, effect and insert output,
+without editing persisted mute/solo flags or plugin state. Same-project graph
+rebuilds retain existing target IDs. Offline export clears this audition mask
+and restores it afterward, including failed/cancelled renders. Recording starts
+playback in a new epoch after the mask is acknowledged, discarding old queued audio.
+
+Capture stays in preparation while plugins load. Recorded samples own the
+recording clock; companion status updates meters and recording can continue
+after the backing timeline ends. Loop is temporarily disabled and restored.
+Late pause/status responses do not overwrite the final take position. Cancelling,
+same-ID project replacement and late microphone callbacks cannot attach data to
+a different lifecycle. Write failure or an 8 MiB PCM backlog stops input and
+cleans up the partial take after pending writes settle.
+
+Hosts must declare recording=true for plugin-project capture. Older hosts retain
+normal plugin play/seek without receiving the new monitor operation. Existing
+without-plugin recording remains available through its previous path.
+
+Validation: frontend 1132 passed/3 skipped, including nine capture lifecycle and
+70 focused playback checks. Native audio: 66 unit and seven helper integration
+tests passed; actual FFmpeg/local-fixture output is byte-identical with and
+without a preview mask. Tauri default/experimental bridge tests: 42 each.
+Linux x86_64 and both macOS native-host/test cross-checks passed. No actual
+microphone capture, output stream, editor window or real third-party plugin was opened.
+Logs: E:/pymss-vst-lab-artifacts/native-v11-* and native-recording-v10/.
+Physical capture timing, device permissions and latency remain native acceptance
+work. AAX hosting, signing/release acceptance and real plugin compatibility are
+still outstanding.
+
+Twelfth iteration: offline render context (2026-10-24 UTC)
+-------------------------------------------------------
+The load protocol now honors offline=true, and updates without the flag retain
+the session's mode. VST3 setupProcessing and all process/parameter-flush blocks
+agree on kOffline or kRealtime. VST2 processing/parameter flush callbacks report
+Offline or Realtime; editor/state/control callbacks remain User with nested and
+thread-local restoration. AUs receive the optional OfflineRender property while
+uninitialized, including AUv3 units exposed through the C compatibility bridge.
+Actual property/setup failures propagate; failed rollback prevents further use.
+Missing/read-only AU properties retain the ordinary effect implementation.
+
+Application export already owns a separate helper. A direct render request on
+a realtime helper now pauses and snapshots preview, then creates a temporary
+offline session on that helper's control/UI thread at the same sample rate.
+Its worker renders and returns ownership to the UI thread for disposal. The
+original preview mode, instance/controller, parameters, loop and monitor mask
+remain intact. Export errors and shutdown also release the temporary session.
+Offline sessions cannot open a playback stream. A mode-changing update keeps
+position/loop but does not try to resume audio when its target mode is offline.
+
+Validation: audio 67 unit + nine helper integration tests, VST2 30, portable AU
+30, VST3 21 unit + 11 integration tests and four isolated mode scenarios passed.
+FFmpeg plus local fixtures verify mode-specific gain, 11-frame PDC and combined
+track/master tails. Parameter/state retention, zero-frame flushes, invalid flags,
+mode inheritance, rejected setup and failed rollback are covered. Tauri vst-lab
+bridge: 42 tests passed. Linux x86_64 and both macOS full-host/test cross-checks
+passed. The normal pnpm vst:build entry passed typecheck/frontend production
+build and Windows debug linking. No frontend source changed; its full unit suite
+was not repeated. Logs: E:/pymss-vst-lab-artifacts/native-v12-*.
+The newly linked Tauri executable also passed ten headless --audio-host entry
+checks with the local fixture; the desktop UI, audio stream and Python runtime
+were not started. Report: native-v12-app-helper/report.json in that artifact root.
+
+These are headless/fixture and compile checks, not real-plugin, editor, device
+or macOS/Linux runtime acceptance. Separate offline instances can use different
+DSP settings and consume additional memory; actual quality is plugin-defined.
+The pre-existing VST3 latency/tail refresh path still needs an audit of SDK
+UI-thread affinity; this iteration keeps new mode setup/negotiation on the UI
+thread but does not claim to have completed that separate timing work.
+AAX hosting, signing/release acceptance, live input effects and physical capture
+latency calibration remain outstanding.
+
+Thirteenth iteration: control-thread VST3 timing (2026-10-24 UTC)
+----------------------------------------------------------------
+VST3 timing refresh no longer calls getLatencySamples/getTailSamples from the
+audio/render worker. A controller-independent timing reader validates its creating
+thread and shares the existing lifetime link. UI teardown cuts off its processor
+reference before termination/unloading. The worker consumes one atomic latency/
+tail pair and leaves restart notifications pending until a stopped UI refresh.
+
+A latency notification stops processing and deactivates/reactivates the component
+on the control thread before reading its new timing. Lifecycle flags are shared
+with the unique worker owner so processing restarts correctly. Transition failure
+blocks subsequent processing, flush, mode change and preparation until reload.
+Notifications raised by getters are retained; the host allows one further UI
+refresh within the same suspension, then fails if the plugin remains unstable.
+
+Live recovery holds the existing capture barrier while refreshing timing. Offline
+preparation/probes request the same refresh through a stopped-worker ticket and
+apply the result before PDC/output. The UI checks the ticket's deadline and cancel
+state before entering the SDK. A late queued ticket cannot query a resumed graph;
+an already running query must finish before the worker can proceed. A hung SDK
+call still requires the existing isolated-helper termination path.
+
+Rendering defers synchronous editor-close/capture idle work until completion,
+avoiding an AU close barrier waiting on the worker that awaits its UI timing reply.
+Preview sessions remain independently serviced when a temporary exporter is used.
+Startup probes now allow one timing adjustment per unique slot instead of one for
+the entire graph. Repeated changes in the same slot still fail before output.
+
+Regression evidence: the unchanged d7aa2f3 executable successfully loads a strict
+local fixture, then aborts on its worker-thread getLatencySamples during export.
+The new helper passes those strict getter/setActive thread checks. A two-insert
+startup regression also failed before the per-slot fix and now passes, including
+a notification from inside a getter; an unstable fixture still fails without WAV.
+
+Validation: audio 73 unit + 12 helper integration tests; VST3 21 unit + 11 fixture
+integration tests, four processing-mode and six timing-reader isolated scenarios;
+Tauri vst-lab bridge 42 tests passed. FFmpeg/fixture output checks both channels
+and sample alignment for track/master latency that only changes after activation.
+Expired/cancelled/in-flight tickets, AU close deferral, missing controller, released
+handles, native stop/reactivate failure and repeated export rejection are covered.
+Linux x86_64 and macOS ARM64/x86_64 full-host/test compile checks passed. No frontend
+source changed; its previous full unit suite was not repeated. Artifacts/logs:
+E:/pymss-vst-lab-artifacts/native-v13-*.
+The normal pnpm vst:build entry passed frontend typecheck/production build and
+Windows debug linking. The resulting executable passed ten headless --audio-host
+checks with strict timing, deferred activation latency and getter notifications.
+Its implementation/config/test source fingerprint remained unchanged during
+validation/build; executable/source hashes are in native-v13-build-artifact.json.
+
+No real third-party plugin, editor window, microphone or output stream was opened.
+macOS/Linux programs were not executed. These timing fixes resolve the code issue
+recorded in iteration twelve; AAX hosting, native compatibility and signed release
+acceptance remain outstanding.

@@ -36,6 +36,8 @@
 //!
 //! Not hosted yet: instruments/MIDI, sidechain/extra buses, and parameters outside the
 //! global scope. Units without a compatible custom Cocoa view retain generic parameter controls.
+//! The optional OfflineRender context is supported for these ordinary effects. Dedicated `auol`
+//! offline units require a separate preflight/priming workflow and remain outside this host.
 //!
 //! Off macOS (and on `wasm32`) the crate compiles to stubs: scans are empty and nothing can be
 //! created.
@@ -58,6 +60,8 @@ mod events;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod ffi;
+#[cfg(any(target_os = "macos", test))]
+mod offline;
 #[cfg(target_os = "macos")]
 mod plugin;
 #[cfg(target_os = "macos")]
@@ -376,6 +380,12 @@ mod unsupported {
         pub fn queue_normalized(&mut self, _: &str, _: f64, _: f32) -> bool {
             false
         }
+        pub fn set_offline(&mut self, _: bool) -> Result<(), String> {
+            Err(AuError::Unsupported.to_string())
+        }
+        pub fn is_offline(&self) -> bool {
+            false
+        }
     }
     impl Plugin for AuPlugin {
         fn info(&self) -> &'static PluginInfo {
@@ -518,6 +528,14 @@ mod tests {
             assert_eq!(parse_id(malformed), None);
             assert!(!is_v3_id(malformed));
         }
+    }
+
+    #[test]
+    fn dedicated_offline_effects_are_not_mistaken_for_normal_effects_in_offline_context() {
+        assert!(!is_supported_type(u32::from_be_bytes(*b"auol")));
+        assert!(parse_id("au:auol:norm:appl").is_none());
+        assert!(parse_id("au3:auol:norm:appl").is_none());
+        assert!(instantiate_plugin("au:auol:norm:appl").is_err());
     }
 
     #[test]

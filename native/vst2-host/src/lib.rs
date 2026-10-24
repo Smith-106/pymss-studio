@@ -100,6 +100,17 @@ pub struct Vst2Plugin {
 }
 
 impl Vst2Plugin {
+    /// Select the processing callback's realtime/offline level while audio processing is stopped.
+    /// The same instance, state, parameters and editor remain attached; VST2 batch-file/offline
+    /// interfaces are not used. May be called before the first prepare.
+    pub fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        self.instance.set_offline(offline)
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.instance.is_offline()
+    }
+
     pub fn try_prepare(
         &mut self,
         sample_rate: f32,

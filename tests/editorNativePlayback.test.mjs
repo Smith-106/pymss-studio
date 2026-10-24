@@ -13,15 +13,18 @@ const code = ts.transpileModule(source.statements.filter(item => !ts.isImportDec
 }).outputText
 const flush = async () => { await nextTick(); await new Promise(resolve => setImmediate(resolve)) }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-function environment(t, { ensureGate, statusGate } = {}) {
+function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCapabilities = { recording: true } } = {}) {
   const playback = useEditorPlaybackStore(createPinia())
   const editor = reactive({ session: { id: 'project', tracks: [], sources: [], masterVolume: 1, masterPan: 0,
     pluginChain: [{ id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false }] } })
   editor.releasePluginSession = async project => { calls.push(['unload', project.id]) }
   const calls = [], timers = new Map(), cleanup = []
-  let timerId = 0, position = 0, playing = false
+  let timerId = 0
+  const backend = { position: 0, playing: false, playEnds: false, error: undefined }
   const create = vm.runInNewContext(`${code}\nuseEditorNativePlayback`, {
     computed, watch, hasEditorPlugins, pluginProjectSignature, useEditorPlaybackStore: () => playback,
+    pluginHostCapabilities: async () => hostCapabilities,
+    i18n: { global: { t: key => key } },
     onBeforeUnmount: action => cleanup.push(action),
     setTimeout: action => { timers.set(++timerId, action); return timerId }, clearTimeout: id => timers.delete(id),
     ensurePluginSession: async project => { calls.push(['ensure', project.id]); if (ensureGate) await ensureGate.promise },
@@ -29,17 +32,18 @@ function environment(t, { ensureGate, statusGate } = {}) {
     unloadPluginSession: async projectId => { calls.push(['unload', projectId]) },
     pluginHostRequest: async request => {
       calls.push([request.op, request.projectId, request])
-      if (request.op === 'play') { playing = true; position = request.position }
-      if (request.op === 'pause') playing = false
-      if (request.op === 'seek') position = request.position
+      if (request.op === 'play') { backend.playing = !backend.playEnds; backend.position = backend.playEnds ? 10 : request.position }
+      if (request.op === 'pause') { if (pauseGate) await pauseGate.promise; backend.playing = false }
+      if (request.op === 'seek') backend.position = request.position
+      if (request.op === 'monitor' && monitorGate) await monitorGate.promise
       if (request.op === 'status' && statusGate) return statusGate.promise
-      return { projectId: request.projectId, position, playing, duration: 10, masterLevel: [0.5, 0.25] }
+      return { projectId: request.projectId, position: backend.position, playing: backend.playing, duration: 10, masterLevel: [0.5, 0.25], error: backend.error }
     },
   })
   const scope = effectScope()
   const native = scope.run(() => create(editor, () => {}))
   t.after(async () => { cleanup.forEach(action => action()); scope.stop(); await flush(); playback.$dispose() })
-  return { native, editor, playback, calls, timers, async poll() { const pending = [...timers.values()]; timers.clear(); await Promise.all(pending.map(action => action())) } }
+  return { native, editor, playback, calls, timers, backend, async poll() { const pending = [...timers.values()]; timers.clear(); await Promise.all(pending.map(action => action())) } }
 }
 
 test('native transport sends control messages and applies host meters without PCM', async t => {
@@ -89,3 +93,183 @@ test('changing projects discards delayed startup and releases the previous sessi
   assert.ok(env.calls.some(call => call[0] === 'unload' && call[1] === 'project'))
   assert.equal(env.calls.filter(call => call[0] === 'play').length, 0)
 })
+
+test('a newer seek keeps polling after an earlier status request finishes', async t => {
+  const gate = deferred()
+  const env = environment(t, { statusGate: gate })
+  await env.native.play(1)
+  const polling = env.poll()
+  env.native.seek(7)
+  await flush()
+  await env.poll()
+  gate.resolve({ projectId: 'project', position: 2, playing: true, duration: 10 })
+  await polling
+  assert.equal(env.playback.currentTime, 7)
+  assert.equal(env.timers.size, 1)
+})
+
+test('native playback synchronizes its transient monitor before play, seek and graph updates', async t => {
+  const env = environment(t)
+  env.editor.session.tracks = [{ id: 'recording', muted: false, solo: true }, { id: 'backing', muted: false, solo: false }]
+  const project = JSON.stringify(env.editor.session)
+  env.playback.setSuppressedTrackIds(['recording', 'recording'])
+  await flush()
+  assert.equal(env.calls.length, 0)
+  await env.native.play(2)
+  assert.deepEqual(env.calls.map(call => call[0]), ['ensure', 'monitor', 'play'])
+  assert.deepEqual(Array.from(env.calls[1][2].suppressedTrackIds), ['recording'])
+  env.calls.length = 0
+  env.native.seek(4)
+  await flush()
+  assert.deepEqual(env.calls.map(call => call[0]), ['ensure', 'monitor', 'seek'])
+  env.calls.length = 0
+  env.playback.setSuppressedTrackIds(['backing'])
+  await flush()
+  assert.deepEqual(env.calls.map(call => call[0]), ['monitor'])
+  assert.deepEqual(Array.from(env.calls[0][2].suppressedTrackIds), ['backing'])
+  assert.equal(JSON.stringify(env.editor.session), project)
+  env.calls.length = 0
+  env.editor.session.tracks.push({ id: 'new-track', muted: false, solo: false })
+  await flush()
+  assert.deepEqual(env.calls.map(call => call[0]), ['ensure', 'monitor'])
+  assert.deepEqual(Array.from(env.calls[1][2].suppressedTrackIds), ['backing'])
+  assert.ok(env.calls.every(call => !call[2] || !('pcm' in call[2])))
+})
+
+test('recording owns the playhead while native status continues updating meters', async t => {
+  const env = environment(t)
+  env.playback.setRecordingProjectId('project')
+  env.playback.setCurrentTime(12)
+  assert.equal(await env.native.play(12), true)
+  env.backend.position = 4
+  env.playback.setCurrentTime(14)
+  await env.poll()
+  assert.equal(env.playback.currentTime, 14)
+  assert.deepEqual(env.playback.masterLevel, [0.5, 0.25])
+  assert.equal(env.playback.status, 'playing')
+})
+
+test('recording can start after accompaniment ends and continues without looping the backing', async t => {
+  const env = environment(t)
+  env.backend.playEnds = true
+  env.playback.setRecordingProjectId('project')
+  env.playback.setLoop(true)
+  env.playback.setCurrentTime(12)
+  assert.equal(await env.native.play(12), true)
+  assert.equal(env.playback.status, 'playing')
+  assert.equal(env.calls.find(call => call[0] === 'play')[2].loop, false)
+  env.playback.setCurrentTime(18)
+  await env.poll()
+  assert.equal(env.playback.currentTime, 18)
+  assert.equal(env.playback.status, 'playing')
+  const plays = env.calls.filter(call => call[0] === 'play').length
+  env.playback.setLoop(false)
+  await flush()
+  assert.equal(env.calls.filter(call => call[0] === 'play').length, plays)
+})
+
+test('a recording owner for another project does not change normal native transport behavior', async t => {
+  const env = environment(t)
+  env.backend.playEnds = true
+  env.playback.setRecordingProjectId('another-project')
+  env.playback.setCurrentTime(12)
+  assert.equal(await env.native.play(12), false)
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.playback.currentTime, 10)
+})
+
+test('late recording pause and old status cannot overwrite the final recording cursor or resume polling', async t => {
+  const pauseGate = deferred(), statusGate = deferred()
+  const env = environment(t, { pauseGate, statusGate })
+  env.playback.setRecordingProjectId('project')
+  await env.native.play(0)
+  const polling = env.poll()
+  env.playback.setCurrentTime(13)
+  env.native.pause()
+  env.playback.setRecordingProjectId(null)
+  env.playback.setCurrentTime(14)
+  pauseGate.resolve()
+  await flush()
+  assert.equal(env.playback.currentTime, 14)
+  assert.equal(env.playback.status, 'paused')
+  statusGate.resolve({ projectId: 'project', position: 5, playing: false, duration: 10 })
+  await polling
+  assert.equal(env.playback.currentTime, 14)
+  assert.equal(env.timers.size, 0)
+})
+
+test('a recording stop with reset still leaves the final playhead to the recording owner', async t => {
+  const env = environment(t)
+  env.playback.setRecordingProjectId('project')
+  await env.native.play(0)
+  env.playback.setCurrentTime(13)
+  env.native.pause(true)
+  env.playback.setRecordingProjectId(null)
+  await flush()
+  assert.equal(env.playback.currentTime, 13)
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.timers.size, 0)
+})
+
+test('recording still exposes native playback errors', async t => {
+  const env = environment(t)
+  env.playback.setRecordingProjectId('project')
+  await env.native.play(0)
+  env.backend.error = 'Audio output disconnected'
+  await env.poll()
+  assert.equal(env.playback.status, 'error')
+  assert.equal(env.playback.error, 'Audio output disconnected')
+})
+
+test('pause cancels recording startup while its monitor request is pending', async t => {
+  const monitorGate = deferred()
+  const env = environment(t, { monitorGate })
+  env.playback.setRecordingProjectId('project')
+  const playing = env.native.play(12)
+  await flush()
+  env.native.pause()
+  env.playback.setRecordingProjectId(null)
+  monitorGate.resolve()
+  assert.equal(await playing, false)
+  await flush()
+  assert.equal(env.calls.filter(call => call[0] === 'play').length, 0)
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.timers.size, 0)
+})
+
+test('playback reset clears the recording owner and transient track suppression', () => {
+  const playback = useEditorPlaybackStore(createPinia())
+  playback.setRecordingProjectId('project')
+  playback.setSuppressedTrackIds(['recording'])
+  playback.reset()
+  assert.equal(playback.recordingProjectId, null)
+  assert.deepEqual(playback.suppressedTrackIds, [])
+  playback.$dispose()
+})
+
+for (const hostCapabilities of [{}, { recording: false }]) {
+  const capability = 'recording' in hostCapabilities ? 'disabled' : 'missing'
+  test(`ordinary native playback and seek remain compatible with ${capability} recording capability`, async t => {
+    const env = environment(t, { hostCapabilities })
+    assert.equal(await env.native.play(2), true)
+    assert.equal(env.playback.currentTime, 2)
+    env.native.seek(4)
+    await flush()
+    assert.equal(env.playback.currentTime, 4)
+    assert.equal(env.playback.status, 'playing')
+    assert.ok(env.calls.some(call => call[0] === 'seek'))
+    assert.equal(env.calls.filter(call => call[0] === 'monitor').length, 0)
+  })
+
+  for (const operation of ['play', 'seek']) {
+    test(`native ${operation} rejects suppression with ${capability} recording capability`, async t => {
+      const env = environment(t, { hostCapabilities })
+      env.playback.setSuppressedTrackIds(['recording'])
+      if (operation === 'play') assert.equal(await env.native.play(2), false)
+      else { env.native.seek(2); await flush() }
+      assert.equal(env.playback.status, 'error')
+      assert.match(env.playback.error, /recordingBlocked/)
+      assert.equal(env.calls.filter(call => ['monitor', 'play', 'seek'].includes(call[0])).length, 0)
+    })
+  }
+}

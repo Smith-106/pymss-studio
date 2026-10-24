@@ -82,6 +82,15 @@ struct FixtureBehavior {
     gui_bypass: bool,
     process_error: bool,
     dynamic_tail: bool,
+    mode_quality: bool,
+    reject_offline: bool,
+    reject_rollback: bool,
+    strict_timing: bool,
+    deferred_latency: bool,
+    getter_notification: bool,
+    no_controller: bool,
+    reject_reactivate: bool,
+    reject_stop: bool,
 }
 
 impl FixtureBehavior {
@@ -104,6 +113,15 @@ impl FixtureBehavior {
                     "gui-bypass" => behavior.gui_bypass = true,
                     "process-error" => behavior.process_error = true,
                     "dynamic-tail" => behavior.dynamic_tail = true,
+                    "mode-quality" => behavior.mode_quality = true,
+                    "reject-offline" => behavior.reject_offline = true,
+                    "reject-rollback" => { behavior.reject_offline = true; behavior.reject_rollback = true; },
+                    "strict-timing" => behavior.strict_timing = true,
+                    "deferred-latency" => behavior.deferred_latency = true,
+                    "getter-notification" => behavior.getter_notification = true,
+                    "no-controller" => behavior.no_controller = true,
+                    "reject-reactivate" => behavior.reject_reactivate = true,
+                    "reject-stop" => behavior.reject_stop = true,
                     _ => (),
                 }
             }
@@ -128,7 +146,12 @@ struct GainProcessor {
     delay: std::sync::Mutex<FixtureDelay>,
     host: std::sync::Mutex<Option<ComPtr<IComponentHandler>>>,
     actual_latency: AtomicU32,
+    pending_latency: AtomicU32,
+    getter_notified: AtomicBool,
     positive_calls: AtomicU64,
+    setup_mode: AtomicU32,
+    offline_attempted: AtomicBool,
+    control_thread: std::thread::ThreadId,
     _live: Live,
 }
 
@@ -161,6 +184,7 @@ impl IConnectionPointTrait for GainProcessor {
 
 impl IComponentTrait for GainProcessor {
     unsafe fn getControllerClassId(&self, class_id: *mut TUID) -> tresult {
+        if self.behavior.no_controller { return kResultFalse; }
         unsafe { *class_id = GAIN_CTRL_CID };
         kResultOk
     }
@@ -183,7 +207,16 @@ impl IComponentTrait for GainProcessor {
     unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        if self.behavior.strict_timing {
+            assert_eq!(std::thread::current().id(), self.control_thread, "setActive must use the control thread");
+        }
+        if state != 0 && self.behavior.reject_reactivate && self.positive_calls.load(Ordering::Relaxed) > 0 {
+            return kResultFalse;
+        }
+        if state != 0 && self.behavior.deferred_latency {
+            self.actual_latency.store(self.pending_latency.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         kResultOk
     }
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
@@ -250,15 +283,36 @@ impl IAudioProcessorTrait for GainProcessor {
         if size == SymbolicSampleSizes_::kSample32 as i32 { kResultOk } else { kNotImplemented }
     }
     unsafe fn getLatencySamples(&self) -> u32 {
+        if self.behavior.strict_timing {
+            assert_eq!(std::thread::current().id(), self.control_thread, "getLatencySamples must use the control thread");
+        }
+        if self.behavior.getter_notification && self.positive_calls.load(Ordering::Relaxed) > 0
+            && !self.getter_notified.swap(true, Ordering::Relaxed) {
+            if let Some(host) = self.host.lock().unwrap().as_ref() {
+                unsafe { host.restartComponent(RestartFlags_::kLatencyChanged as i32) };
+            }
+        }
         self.actual_latency.load(Ordering::Relaxed)
     }
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         let s = unsafe { &*setup };
+        assert_eq!(std::thread::current().id(), self.control_thread, "setupProcessing must use the creation/control thread");
         assert_eq!(s.symbolicSampleSize, SymbolicSampleSizes_::kSample32 as i32);
         assert!(s.maxSamplesPerBlock > 0 && s.sampleRate > 0.0);
+        assert!(s.processMode == ProcessModes_::kRealtime as i32 || s.processMode == ProcessModes_::kOffline as i32);
+        if s.processMode == ProcessModes_::kOffline as i32 && self.behavior.reject_offline {
+            self.offline_attempted.store(true, Ordering::Relaxed);
+            return kResultFalse;
+        }
+        if self.behavior.reject_rollback && self.offline_attempted.load(Ordering::Relaxed) { return kResultFalse; }
+        self.setup_mode.store(s.processMode as u32, Ordering::Relaxed);
+        if self.behavior.mode_quality { self.actual_latency.store(if s.processMode == ProcessModes_::kOffline as i32 {11} else {3}, Ordering::Relaxed); }
         kResultOk
     }
     unsafe fn setProcessing(&self, state: TBool) -> tresult {
+        if state == 0 && self.behavior.reject_stop && self.positive_calls.load(Ordering::Relaxed) > 0 {
+            return kResultFalse;
+        }
         if state == 0 && (self.behavior.delay || self.behavior.dynamic_delay || self.behavior.unstable_delay || self.behavior.startup_delay || self.behavior.late_delay) {
             *self.delay.lock().unwrap() = FixtureDelay::default();
         }
@@ -266,6 +320,7 @@ impl IAudioProcessorTrait for GainProcessor {
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let d = unsafe { &*data };
+        assert_eq!(d.processMode as u32, self.setup_mode.load(Ordering::Relaxed), "process and setupProcessing modes must match, including parameter flushes");
         assert!(!d.processContext.is_null());
         if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
             for i in 0..unsafe { changes.getParameterCount() } {
@@ -284,11 +339,16 @@ impl IAudioProcessorTrait for GainProcessor {
         }
         // Zero-frame parameter flushes must complete even in fault modes.
         let calls = if d.numSamples > 0 { self.positive_calls.fetch_add(1, Ordering::Relaxed) + 1 } else { self.positive_calls.load(Ordering::Relaxed) };
-        let latency = if self.behavior.dynamic_delay {
+        let latency = if self.behavior.mode_quality {
+            if d.processMode == ProcessModes_::kOffline as i32 {11} else {3}
+        } else if self.behavior.dynamic_delay || self.behavior.deferred_latency {
             if f64::from_bits(self.gain.load(Ordering::Relaxed)) >= 0.5 {11} else {3}
         } else if self.behavior.unstable_delay && calls > 0 { if calls % 2 == 1 {11} else {3} }
         else if (self.behavior.startup_delay && calls > 0) || (self.behavior.late_delay && calls >= 4) { 11 } else {3};
-        if self.actual_latency.swap(latency, Ordering::Relaxed) != latency {
+        let previous = if self.behavior.deferred_latency {
+            self.pending_latency.swap(latency, Ordering::Relaxed)
+        } else { self.actual_latency.swap(latency, Ordering::Relaxed) };
+        if previous != latency {
             *self.delay.lock().unwrap() = FixtureDelay::default();
             if let Some(host) = self.host.lock().unwrap().as_ref() {
                 assert_eq!(unsafe { host.restartComponent(RestartFlags_::kLatencyChanged as i32) }, kResultOk);
@@ -307,6 +367,7 @@ impl IAudioProcessorTrait for GainProcessor {
         let g = if f64::from_bits(self.bypass.load(Ordering::Relaxed)) >= 0.5 { 1.0 } else {
             2.0 * f64::from_bits(self.gain.load(Ordering::Relaxed)) as f32 * (1.0 + f64::from_bits(self.hidden.load(Ordering::Relaxed)) as f32)
         };
+        let g = if self.behavior.mode_quality && d.processMode == ProcessModes_::kOffline as i32 {g * 2.0} else {g};
         let (ins, outs) = unsafe { (channels(&*d.inputs, frames), channels(&*d.outputs, frames)) };
         if self.behavior.delay || self.behavior.dynamic_delay || self.behavior.unstable_delay || self.behavior.startup_delay || self.behavior.late_delay {
             let mut delay = self.delay.lock().unwrap();
@@ -331,6 +392,10 @@ impl IAudioProcessorTrait for GainProcessor {
         kResultOk
     }
     unsafe fn getTailSamples(&self) -> u32 {
+        if self.behavior.strict_timing {
+            assert_eq!(std::thread::current().id(), self.control_thread, "getTailSamples must use the control thread");
+        }
+        if self.behavior.mode_quality { return if self.setup_mode.load(Ordering::Relaxed) == ProcessModes_::kOffline as u32 {64} else {0}; }
         if !self.behavior.dynamic_tail || self.positive_calls.load(Ordering::Relaxed) == 0 {
             return 0;
         }
@@ -855,7 +920,12 @@ impl IPluginFactoryTrait for Factory {
                 delay: std::sync::Mutex::new(FixtureDelay::default()),
                 host: std::sync::Mutex::new(None),
                 actual_latency: AtomicU32::new(3),
+                pending_latency: AtomicU32::new(3),
+                getter_notified: AtomicBool::new(false),
                 positive_calls: AtomicU64::new(0),
+                setup_mode: AtomicU32::new(u32::MAX),
+                offline_attempted: AtomicBool::new(false),
+                control_thread: std::thread::current().id(),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()

@@ -145,6 +145,25 @@ fn project(request: &Value) -> Result<SessionSpec, String> {
     .map_err(|e| format!("Invalid audio project: {e}"))
 }
 
+fn monitor_tracks(request: &Value) -> Result<Vec<String>, String> {
+    let tracks = request
+        .get("suppressedTrackIds")
+        .and_then(Value::as_array)
+        .ok_or("Suppressed track identifiers must be an array of strings")?;
+    if tracks.len() > 256 {
+        return Err("Monitor suppression cannot exceed 256 tracks".into());
+    }
+    tracks
+        .iter()
+        .map(|track| {
+            track
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "Suppressed track identifiers must be an array of strings".into())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn preserve_states(next: &mut SessionSpec, previous: &SessionSpec, snapshot: &Value) {
     preserve_states_except(next, previous, snapshot, &[]);
@@ -188,10 +207,17 @@ fn host() -> i32 {
     let input = inputs();
     let mut session: Option<Session> = None;
     let mut render_request: Option<u64> = None;
+    let mut render_session: Option<Session> = None;
     while soundcraft_vst3_host::with_ui_context(|| {
-        host_tick(&input, &mut session, &mut render_request)
+        host_tick(
+            &input,
+            &mut session,
+            &mut render_request,
+            &mut render_session,
+        )
     }) {}
     soundcraft_vst3_host::with_ui_context(|| {
+        drop(render_session);
         drop(session);
         soundcraft_au_host::shutdown_ui();
         pymss_vst2_host::shutdown();
@@ -204,15 +230,18 @@ fn host_tick(
     input: &Receiver<Result<Value, String>>,
     session: &mut Option<Session>,
     render_request: &mut Option<u64>,
+    render_session: &mut Option<Session>,
 ) -> bool {
     soundcraft_vst3_host::pump_ui();
     soundcraft_au_host::pump_ui();
     pymss_vst2_host::pump_ui();
-    if let Some(current) = session.as_mut() {
+    let service = |current: &mut Session, request: &mut Option<u64>| {
+        let mut finished = false;
         current.idle();
         while let Ok(event) = current.events.try_recv() {
             match event {
                 Event::Failure(error) => current.fail(error),
+                Event::Timing(request) => current.service_timing(request),
                 Event::LatencyChanged {
                     change,
                     graph_revision,
@@ -222,12 +251,25 @@ fn host_tick(
                     }
                 }
                 Event::Render(result) => {
-                    if let Some(id) = render_request.take() {
+                    current.finish_render();
+                    if let Some(id) = request.take() {
                         respond(id, result);
                     }
+                    finished = true;
                 }
             }
         }
+        finished
+    };
+    if let Some(current) = session.as_mut() {
+        service(current, render_request);
+    }
+    if render_session
+        .as_mut()
+        .is_some_and(|exporter| service(exporter, render_request))
+    {
+        // Join and release processors/controllers on the helper UI thread.
+        render_session.take();
     }
     let message = match input.recv_timeout(Duration::from_millis(8)) {
         Ok(Ok(value)) => value,
@@ -250,6 +292,10 @@ fn host_tick(
     }
     let result = (|| -> Result<Option<Value>, String> {
         if op == "load" || op == "update" {
+            let offline = match message.get("offline") {
+                None => op == "update" && session.as_ref().is_some_and(Session::is_offline),
+                Some(value) => value.as_bool().ok_or("Offline mode must be a boolean")?,
+            };
             let mut spec = project(&message)?;
             spec.validate()?;
             let restore: Vec<String> = match message.get("stateRestoreSlotIds") {
@@ -276,6 +322,7 @@ fn host_tick(
                     if restore.is_empty()
                         && topology(&current.spec) == topology(&spec)
                         && current.can_update_in_place(&spec)
+                        && current.is_offline() == offline
                     {
                         return current.update_mix(spec).map(Some);
                     }
@@ -285,19 +332,33 @@ fn host_tick(
             let mut position = 0.0;
             let mut looping = false;
             let mut open = Vec::new();
+            let mut suppressed = Vec::new();
             if let Some(current) = session.as_mut() {
                 let status = current.status();
-                resume = op == "update" && status["playing"].as_bool().unwrap_or(false);
+                resume = op == "update" && !offline && status["playing"].as_bool().unwrap_or(false);
                 position = status["position"].as_f64().unwrap_or(0.0);
                 looping = current.looping;
                 current.pause()?;
                 if op == "update" {
+                    suppressed = current
+                        .suppressed_track_ids()
+                        .iter()
+                        .filter(|id| {
+                            spec.tracks
+                                .iter()
+                                .any(|track| track.id.as_str() == id.as_str())
+                        })
+                        .cloned()
+                        .collect();
                     let snapshot = current.snapshot()?;
                     preserve_states_except(&mut spec, &current.spec, &snapshot, &restore);
                     open = current.open_editors();
                 }
             }
-            let new_session = Session::load(spec, ffmpeg)?;
+            let mut new_session = Session::load_mode(spec, ffmpeg, offline)?;
+            if !suppressed.is_empty() {
+                new_session.monitor(suppressed)?;
+            }
             *session = Some(new_session);
             let current = session.as_mut().ok_or("Audio session is unavailable")?;
             for slot in open {
@@ -326,6 +387,7 @@ fn host_tick(
         }
         let value = match op {
             "status" => current.status(),
+            "monitor" => current.monitor(monitor_tracks(&message)?)?,
             "play" => current.play(
                 message
                     .get("position")
@@ -366,7 +428,13 @@ fn host_tick(
                         .and_then(Value::as_str)
                         .ok_or("Render output path is required")?,
                 );
-                current.start_render(path)?;
+                if current.is_offline() {
+                    current.start_render(path)?;
+                } else {
+                    let mut exporter = current.offline_copy()?;
+                    exporter.start_render(path)?;
+                    *render_session = Some(exporter);
+                }
                 *render_request = Some(id);
                 return Ok(None);
             }
@@ -456,6 +524,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn monitor_request_requires_a_bounded_string_array() {
+        assert!(monitor_tracks(&json!({})).is_err());
+        for value in [
+            Value::Null,
+            json!("track"),
+            json!(["track", 2]),
+            json!([false]),
+        ] {
+            assert!(monitor_tracks(&json!({"suppressedTrackIds":value})).is_err());
+        }
+        assert_eq!(
+            monitor_tracks(&json!({"suppressedTrackIds":[]})).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            monitor_tracks(&json!({"suppressedTrackIds":["voice"]})).unwrap(),
+            ["voice"]
+        );
+        assert!(monitor_tracks(&json!({"suppressedTrackIds": vec!["voice";257]})).is_err());
+    }
+
+    #[test]
     fn au_scan_targets_keep_versioned_registry_ids_and_reject_malformed_references() {
         for target in [
             "au:system",
@@ -527,7 +617,7 @@ mod tests {
         drop(tx);
         let mut session = None;
         let mut pending = Some(12);
-        assert!(!host_tick(&input, &mut session, &mut pending));
+        assert!(!host_tick(&input, &mut session, &mut pending, &mut None));
     }
 
     #[test]
@@ -536,7 +626,7 @@ mod tests {
         tx.send(Ok(json!({"id": 13, "op": "shutdown"}))).unwrap();
         let mut session = None;
         let mut pending = Some(12);
-        assert!(!host_tick(&input, &mut session, &mut pending));
+        assert!(!host_tick(&input, &mut session, &mut pending, &mut None));
     }
 
     #[test]

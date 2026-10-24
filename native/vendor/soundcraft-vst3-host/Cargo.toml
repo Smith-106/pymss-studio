@@ -52,6 +52,14 @@ harness = false
 name = "module_exit_shutdown"
 harness = false
 
+[[test]]
+name = "processing_mode"
+harness = false
+
+[[test]]
+name = "timing_reader"
+harness = false
+
 # An isolated unsafe helper crate (craftrules never-crash), like soundcraft-clap-host: this crate
 # opts out of the workspace `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere
 # and allows it solely on the FFI module (`src/ffi.rs`). The rest mirrors `[workspace.lints]`.

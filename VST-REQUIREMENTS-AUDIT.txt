@@ -1,6 +1,6 @@
 VST 原始需求对照检查
 检查日期：2026-10-24
-检查起点：6e95a33（保留前两轮的验证记录）
+检查起点：35955b6（保留前几轮的验证记录）
 实验分支：codex/vst3-host-lab
 工作目录：D:/项目/pymss-studio-vst-lab
 
@@ -31,8 +31,8 @@ AAX                                未实现宿主加载。识别并拒绝 .aaxp
 
 “三平台”按格式本身适用的平台核对；当前 AU 实现仅适用于 macOS。
 已说明的一阶段边界：效果器，不含 MIDI/乐器、额外总线、32 位桥接；
-Linux 不含原生 Wayland 和旧共享 Display/_XEventProc 协议。插件项目的内置效果共用及
-新录音仍有限制。这些范围不能计入已完成能力，也不在本轮伪装为已支持。
+Linux 不含原生 Wayland 和旧共享 Display/_XEventProc 协议。插件项目已接入四项内置
+轨道效果共用及伴奏下的干声录音；实时输入过插件、硬件延迟补偿仍未实现。
 
 2. 第七轮（04cde28）发现并修复的流程遗漏
 
@@ -187,3 +187,162 @@ https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extens
 
 原生旁路与参数队列改动均已独立只读审查。未进行真实插件、桌面界面或跨平台运行测试；
 具体插件的 reset 行为及实时听感仍留待实机验证。AAX 尚无加载实现，未扩大已有支持声明。
+
+8. 第十轮：内置效果与插件共用（起点 b79f846）
+
+四项现有轨道效果已接入原生图：轨道剪辑增益/淡变/声像及汇总 → clarity → compressor
+→ 干声与并联 reverb/delay → 轨道插件 → PDC → 主输出增益/插件。
+含插件工程的播放与导出使用同一原生处理；最终编码仍接收不带效果的中立轨道。
+能力 builtinEffects=true 才开放门禁，旧宿主能力缺失/false 继续明确拒绝。
+
+DSP 沿用 Worker 确定性系数（一阶高通、无记忆压缩、六点混响、五次回声），不宣称
+与 Web Audio 的卷积/动态压缩逐位一致。效果作用于汇总后的轨道；无插件路径未改。
+流式高通增加相对 -120 dB 的衰减尾音，再与并联 tap 和串联插件尾音合并，保留总上限。
+
+处理块内无分配/IO；缓冲在控制线程准备。同配置混音更新保留历史，仅更改效果配置时
+重建该轨道的内置处理器，不重建插件或窗口。活跃配置的历史总预算为 128 MiB；Mix
+增加单次有界确认，正常替换峰值约 256 MiB，避免慢插件后方积压多份大缓冲。
+失败不提交新 Session.spec，保持可明确恢复。
+
+独立审查发现并修复：高通尾音缺少 settling、prepared history 异步排队可能超预算。
+验证：
+  - 前端聚焦 70 项、全量 1107 项通过，3 项跳过；旧代码有 3 项新增回归失败。
+  - Native audio 59 项单测、5 项 helper 集成回归通过；DSP 参考、跨块一致性、状态
+    保留/reset、设置校验、总历史预算和失败更新均有覆盖。
+  - helper + FFmpeg + 本地原生夹具校验四效果的立体声参考样本、非线性处理顺序、
+    轨道/主输出增益、完整尾音时长和原地配置更新。未打开声卡或原生编辑器。
+  - Tauri 默认/实验配置各 42 项通过；Linux x64、macOS ARM64/x64 完整宿主与测试
+    代码交叉检查通过。解码集成需要 PATH 中的 FFmpeg 或 PYMSS_TEST_FFMPEG。
+  - 日志：E:/pymss-vst-lab-artifacts/native-v10-*
+          E:/pymss-vst-lab-artifacts/builtin-effects-v9/{frontend-before,frontend-focused}.log
+
+本轮未运行真实第三方插件、桌面界面或跨平台原生程序。AAX、含插件录音以及签名发布包
+仍待完成；不同后端的听感及真实插件兼容性按既定安排留待统一实机测试。
+
+9. 第十一轮：含插件工程录音（起点 35955b6）
+
+已复用现有麦克风 → mono PCM16 → 录音文件 → 工程片段链路；插件处理伴奏及录后
+片段，录音文件保存干声。实时麦克风过插件和硬件延迟补偿不在本轮实现范围。
+
+原生 monitor 为独立运行态：按 track ID 临时跳过解码、预取并屏蔽目标轨的输出和电平，
+不改工程静音/solo/插件 state。更新和同工程重建保留仍存在的 ID；导出临时清除屏蔽，
+成功、错误和取消均恢复原预览 mask。启动顺序 pause → mask ack → 新 epoch play，
+旧队列音频由新 epoch 丢弃。录音阶段状态只同步电平，不覆盖采样计数推进的录音时间。
+
+准备阶段不接受录音回调；伴奏结束可继续采集。停止时保留最终录音时间，恢复 loop。
+同 ID 工程对象替换、取消后迟到的播放/麦克风回调有生命周期隔离。写入失败立即停录，
+待写 PCM 上限 8 MiB；错误 take 不 finalize，等待既有写入结束后清理 partial。
+
+旧宿主不声明 recording=true 时仍可普通播放/seek，仅对录音明确拒绝。本轮独立审查
+发现并修复了无条件 monitor 会破坏旧宿主普通播放的问题。
+
+验证：
+  - 前端全量 1132 项通过、3 项跳过；录音生命周期 9 项、播放聚焦 70 项通过。
+  - Native audio 66 项单测、7 项 helper 集成测试通过；临时 mask 不改 spec，
+    mixer/rebuild 保留和清除、非法 ID、失败/取消恢复均有覆盖。
+  - FFmpeg 与本地原生夹具验证预览屏蔽前后的离线成品 WAV 逐字节相同，未跳过解码。
+  - Tauri 默认/实验桥接各 42 项通过；Linux x64、macOS ARM64/x64 完整宿主与测试
+    代码交叉检查通过。
+  - 日志：E:/pymss-vst-lab-artifacts/native-v11-*
+          E:/pymss-vst-lab-artifacts/native-recording-v10/
+
+本轮未进行真实麦克风采集、音频输出或第三方插件窗口交互。输入权限、设备差异、录音听感及
+物理时序仍需统一实机验证；AAX 加载和签名发布包验收仍未完成。
+
+10. 第十二轮：离线导出的插件处理模式（起点 ce76f77）
+
+发现：Tauri 导出 helper 已发送 offline=true，但 native load 忽略该标志，VST3 的
+setupProcessing/ProcessData 和 VST2 process level 固定实时；AU 未通知 OfflineRender。
+因此有独立离线质量、延迟或尾音配置的插件可能使用错误的渲染路径。
+
+现已接入：
+  - load 接受严格 boolean；update 未指定时继承，模式变化才重建，status 返回模式。
+  - VST3 setup 和全部音频/零帧参数块保持同一 mode。切换需要停止并重新 setup；
+    从控制/UI 线程创建、设置离线图，未将 setupProcessing/总线协商移入 DSP worker。
+  - VST2 处理/参数 flush 报 Offline(4)/Realtime(2)，控制/GUI/state 报 User(1)，
+    线程及嵌套上下文退出后恢复原值，不改变 state envelope 和 shell 子插件身份。
+  - AUv2/AUv3 的 C 桥接单位在未初始化时设置可选属性 37，然后初始化原配置。
+    缺失或只读时保留普通效果处理；真实 setter/query/init 错误不吞掉。
+    回滚失败持久保留错误，后续同模式请求、切换和 prepare 都拒绝，必须重载实例。
+    auol 专用离线效果需要 priming/preflight 生命周期，继续明确排除。
+
+应用原有专用导出 helper 使用初始 offline 图。对普通预览 helper 直接 render 时，
+先 pause/snapshot，再于同一 UI 线程按相同采样率创建临时离线会话。成功、失败和退出
+都在 UI 线程回收；原预览实例、控制器、模式、参数、循环及 monitor mask 保留。
+离线会话拒绝声卡播放，更新为 offline 时保留位置/循环并暂停。
+
+独立审查修复了更新为离线后错误恢复播放、AU 回滚失败后 no-op 假成功两处问题。
+验证：
+  - Audio 67 单测 + 9 项 helper 集成、VST2 30、AU 可移植 30、VST3 21 单测 +
+    11 集成及 4 个独立模式场景通过；无真实插件、原生窗口或音频流启动。
+  - 原生夹具强制 setup 使用创建线程，process 与 setup 的模式一致。验证初始离线、
+    realtime/offline 往返、参数队列和 state 保留、零帧 flush、失败恢复及禁止继续 DSP。
+  - 实际 FFmpeg 解码与夹具导出验证模式专属增益、11 样本 PDC、track/master 合并尾音，
+    并检查 monitor、sessionId、参数及 state 在导出成功/失败后保持。
+  - Tauri vst-lab 桥接 42 项通过，Linux x64、macOS ARM64/x64 宿主含测试代码编译检查通过。
+  - pnpm vst:build 完成前端类型检查/生产构建和 Windows debug 实验版链接。
+    前端源码无改动，本轮未重跑此前 1132 项全量前端单测。
+  - 日志与构建指纹：E:/pymss-vst-lab-artifacts/native-v12-*
+  - 最新实验版可执行文件以 --audio-host 运行本地夹具，10 项封装入口检查通过：
+    初始离线、预览导出副本、模式/状态/参数/monitor 保持、错误和退出。
+    未启动 Tauri 桌面窗口、音频流或 Python 环境。
+
+本轮 API 依据：
+https://raw.githubusercontent.com/steinbergmedia/vst3_pluginterfaces/master/vst/ivstaudioprocessor.h
+https://raw.githubusercontent.com/RustAudio/vst-rs/master/src/api.rs
+https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_offlinerender
+https://developer.apple.com/documentation/audiotoolbox/auaudiounit/isrenderingoffline
+
+后续代码检查项：原有 VST3 动态 latency/tail 刷新路径存在 SDK UI 线程亲和性待整改，
+本轮只保证新增模式配置/协商在控制线程，不据此宣称全部 SDK 线程契约均已完成。
+离线是否提高质量由具体插件决定；AU 不保证实现可选属性。AAX 仍无加载实现，真实插件、
+跨平台运行、签名发布、实时输入及硬件延迟校准继续留在原始目标的未完成项中。
+
+11. 第十三轮：VST3 时序查询和重新激活（起点 d7aa2f3）
+
+上一轮标记的线程问题已修复。实时 process/flush、离线导出和 PDC 更新路径只消费原子
+latency/tail 缓存，不再从音频工作线程调用这两个 SDK getter。新增 reader 独立于原生
+编辑器和 edit controller，校验创建线程；实例释放前在同一生命周期锁下切断引用。
+
+控制线程在 DSP 已停止时执行 setProcessing(false)、setActive(false/true)，再查询新值。
+active/processing 状态与 worker 共用原子字段，避免出现两份生命周期状态。原生停止或
+重新激活失败会使实例持续失效，之后 process/flush/prepare/模式切换均拒绝，要求重载。
+getter 自身产生的新通知不会被末尾清零；同一暂停范围内最多再读一次，仍不稳定则失败。
+
+实时恢复复用 SnapshotPause；离线探测由 worker 发送 Timing ticket，UI 查询后确认，
+worker 才继续缓存/PDC。ticket 在进入 SDK 前检查绝对期限及取消状态；请求已过期且
+worker 尚未来得及失效时也不会迟到执行。在途 SDK 查询则持互斥保护，worker 不能因为
+超时或取消而与它并行处理。SDK 本身挂起仍由既有隔离进程终止机制解决。
+
+审查发现并修复：
+  - ticket 仅用 active 标志时，UI 可能在 deadline 后、worker 失效前抢先进入 SDK。
+  - 直接离线会话导出时，AU 窗口关闭 idle 会等待 Barrier，而 worker 正等待 Timing。
+    现在实际渲染会话延后 idle，Event::Render 完成后恢复；独立的原预览仍正常维护。
+  - 多插件依次首次改变延迟会消耗原全图单次预算，被误判为不稳定。现按唯一 slot ID
+    各允许一次启动重协商，重复变化继续明确失败；日志不再把内部哨兵当作实际新延迟。
+
+可重复验证：
+  - 保留并校验上一轮可执行文件 SHA-256，用新严格夹具复现：load 成功，render 在
+    worker 调用 getLatencySamples 时退出 3221226505，未产生 WAV。修复版通过。
+    证据：E:/pymss-vst-lab-artifacts/native-v13-before/report.json。
+  - 新增双插件 startup 回归在修复预算前失败，修复后通过；getter 内通知也能收敛，
+    unstable-delay 仍失败且无文件。native-v13-startup-before/after.log 留有反证。
+  - Audio 73 单测 + 12 集成通过，包含 ticket 过期/取消/在途保护、模拟 AU 关闭，
+    以及真实 FFmpeg 解码和双声道逐样本对齐。两级延迟只在重新激活后生效的夹具，
+    启用后的脉冲输出与旁路基准按参数倍率逐样本一致，预览 ID、参数和 state 保留。
+  - SDK 21 单测 + 11 集成、4 模式及 6 timing 独立场景通过；覆盖无 controller、
+    错误线程、已释放 handle、getter 通知不丢、停止/激活失败持久失效。
+    自定义测试程序也验证了 --nocapture 参数不会绕过其隔离子场景。
+  - Tauri vst-lab 桥接 42 项、Linux x64 和 macOS ARM64/x64 宿主含测试代码检查通过。
+    前端源码无改动，本轮未重跑前端全量单测。
+  - 日志、源指纹和构建记录：E:/pymss-vst-lab-artifacts/native-v13-*。
+  - pnpm vst:build 已完成前端类型检查/生产构建及 Windows debug 链接。最新 exe 的
+    --audio-host 封装入口在 strict-timing、deferred-latency 和 getter-notification 下
+    通过 10 项无界面检查；源码指纹未变。未启动 Tauri 桌面或 Python 环境。
+
+官方线程/生命周期依据：
+https://raw.githubusercontent.com/steinbergmedia/vst3_pluginterfaces/master/vst/ivstaudioprocessor.h
+https://raw.githubusercontent.com/steinbergmedia/vst3_pluginterfaces/master/vst/ivsteditcontroller.h
+
+本轮没有运行真实插件、原生窗口、音频设备或 macOS/Linux 程序，未触发远程 CI 或发布。
+AAX、三平台真实兼容性、签名发布包、实时输入过插件和物理延迟校准仍未完成。

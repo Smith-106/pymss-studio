@@ -3,7 +3,7 @@ import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
-export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; experimental: boolean }
+export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; builtinEffects?: boolean; recording?: boolean; experimental: boolean }
 export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean }
 export type PluginParameter = { id: string; name: string; min: number; max: number; default: number; unit: string; taper: string; choices: string[] }
 export type PluginParameters = Partial<PluginHostStatus> & { params: PluginParameter[]; values: Record<string, number> }
@@ -111,14 +111,14 @@ export function pluginHostCapabilities() {
   capabilities ||= invoke<PluginHostCapabilities>('plugin_host_capabilities').catch(() => ({ enabled: false, platform: '', formats: [], nativeEditor: false, experimental: true }))
   return capabilities
 }
-export function assertPluginProjectSupported(project: EditorSession, formats?: readonly string[]) {
-  const reason = pluginProjectBlockReason(project, formats)
+export function assertPluginProjectSupported(project: EditorSession, formats?: readonly string[], builtinEffects = false) {
+  const reason = pluginProjectBlockReason(project, formats, builtinEffects)
   if (reason) throw new Error(String(i18n.global.t(reason === 'effects' ? 'editor.plugins.effectsBlocked' : 'editor.plugins.formatBlocked')))
 }
 
 async function ensureNow(project: EditorSession) {
   const hostCapabilities = await pluginHostCapabilities()
-  assertPluginProjectSupported(project, hostCapabilities.formats || ['vst3'])
+  assertPluginProjectSupported(project, hostCapabilities.formats || ['vst3'], hostCapabilities.builtinEffects === true)
   if (!hostCapabilities.enabled) throw new Error(String(i18n.global.t('editor.plugins.unavailable')))
   if (loaded?.unavailable) throw new Error(String(i18n.global.t('editor.plugins.stateReloadRequired')))
   if (loaded && loaded.project !== project && (loaded.dirty || loaded.error)) throw new Error(loaded.error || String(i18n.global.t('editor.plugins.stateCaptureUnavailable')))

@@ -64,6 +64,9 @@ impl HostedPlugin {
     pub(crate) fn info(&self) -> &'static PluginInfo {
         dispatch!(self, plugin, plugin.info())
     }
+    pub(crate) fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        dispatch!(self, plugin, plugin.set_offline(offline))
+    }
     pub(crate) fn param(&self, id: &str) -> Option<f32> {
         dispatch!(self, plugin, plugin.param(id))
     }
@@ -72,6 +75,12 @@ impl HostedPlugin {
     }
     pub(crate) fn state_reader(&mut self) -> Option<Box<dyn PluginStateReader>> {
         dispatch!(self, plugin, plugin.state_reader())
+    }
+    pub(crate) fn timing_reader(&mut self) -> Option<soundcraft_vst3_host::Vst3TimingReader> {
+        match self {
+            Self::Vst3(plugin) => Some(plugin.timing_reader()),
+            _ => None,
+        }
     }
     pub(crate) fn load_state(&mut self, state: &[u8]) -> bool {
         dispatch!(self, plugin, plugin.load_state(state))

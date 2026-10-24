@@ -62,6 +62,25 @@ pub struct Vst3Plugin {
     transport: Option<Transport>,
 }
 
+/// A control-thread timing handle independent of a native editor or edit controller.
+/// The host must suspend the DSP worker until refresh and timing-cache application finish.
+pub struct Vst3TimingReader {
+    link: Arc<EditorLink>,
+    host: ComWrapper<HostContext>,
+}
+
+impl Vst3TimingReader {
+    /// Whether a restart remains pending, including one raised by a timing getter itself.
+    /// This only reads host state and never calls a plugin interface.
+    pub fn is_pending(&self) -> bool {
+        self.host.latency_changed.load(Ordering::Acquire)
+    }
+
+    pub fn refresh(&mut self) -> Result<(), String> {
+        self.link.refresh_timing(&self.host)
+    }
+}
+
 impl Vst3Plugin {
     pub(crate) fn new(inst: Instance, info: &'static PluginInfo) -> Vst3Plugin {
         let ids: Vec<u32> = info.params.iter().map(|p| p.id.parse::<u32>().unwrap_or(u32::MAX)).collect();
@@ -154,6 +173,7 @@ impl Vst3Plugin {
     }
 
     pub fn try_process(&mut self, io: &mut [Vec<f32>], frames: usize) -> Result<(), String> {
+        self.inst.check_timing()?;
         if self.max_block == 0 { return Err("Plugin is not prepared".into()); }
         self.process(io, frames);
         self.refresh_latency();
@@ -162,6 +182,7 @@ impl Vst3Plugin {
 
     /// Deliver queued parameter changes without advancing the audio timeline.
     pub fn flush_pending(&mut self) -> Result<(), String> {
+        self.inst.check_timing()?;
         if self.pending.is_empty() { self.refresh_latency(); return Ok(()); }
         self.inst.process(0, &mut self.inputs, &mut self.outputs, &self.pending, &[], &[], 0,
             self.position, self.transport.as_ref()).map_err(|e| e.to_string())?;
@@ -170,21 +191,65 @@ impl Vst3Plugin {
         Ok(())
     }
 
-    /// Consume a latency notification before/after a process call on the DSP thread.
+    /// Read the control-thread timing cache. Pending notifications return a changed sentinel,
+    /// leaving the request intact until the host suspends DSP and refreshes its timing reader.
     pub fn refresh_latency(&mut self) -> usize {
-        if self.inst.host().latency_changed.swap(false, Ordering::Relaxed) {
-            self.latency = self.inst.latency() as usize;
-        }
+        self.refresh_latency_control();
+        if self.inst.host().latency_changed.load(Ordering::Acquire) { self.latency ^ 1 }
+        else { self.latency }
+    }
+
+    /// Apply a pair atomically published by the control-thread timing reader. Never calls SDK
+    /// getters; the host must refresh the reader before renegotiating latency or an export tail.
+    pub fn refresh_latency_control(&mut self) -> usize {
+        let (latency, tail) = self.inst.timing();
+        self.latency = latency as usize;
+        self.tail = tail as usize;
         self.latency
     }
 
-    /// Refresh processor timing while processing is stopped. A tail-only parameter or
-    /// preset change need not issue a latency notification.
-    pub fn refresh_latency_control(&mut self) -> usize {
-        self.inst.host().latency_changed.store(false, Ordering::Relaxed);
-        self.latency = self.inst.latency() as usize;
-        self.tail = self.inst.tail() as usize;
-        self.latency
+    pub fn timing_reader(&mut self) -> Vst3TimingReader {
+        Vst3TimingReader { link: self.inst.state_link(), host: self.inst.host_ref() }
+    }
+
+    /// Select processing mode on the same control/UI thread used for preparation.
+    /// No process call may be in flight; the processor is deactivated and configured again.
+    pub fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        self.inst.check_timing()?;
+        if let Some(error) = &self.failure { return Err(error.clone()); }
+        if self.inst.is_offline() == offline { return Ok(()); }
+        if self.max_block == 0 {
+            self.inst.set_offline(offline);
+            return Ok(());
+        }
+        let previous = self.inst.is_offline();
+        let rate = self.inst.sample_rate();
+        self.inst.set_offline(offline);
+        let configured = self.configure_audio(rate, self.max_block);
+        if let Err(error) = configured {
+            self.inst.set_offline(previous);
+            if let Err(restoration) = self.configure_audio(rate, self.max_block) {
+                let message = format!("{error}; unable to restore processing mode: {restoration}");
+                self.failure = Some(message.clone());
+                self.max_block = 0;
+                return Err(message);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn is_offline(&self) -> bool { self.inst.is_offline() }
+
+    fn configure_audio(&mut self, rate: f64, block: usize) -> Result<(), String> {
+        let layout = self.inst.configure(rate, block, self.channels == 1).map_err(|error| error.to_string())?;
+        self.inputs = BusBuffers::new(&layout.inputs, block);
+        self.outputs = BusBuffers::new(&layout.outputs, block);
+        self.has_input = layout.inputs.first().is_some_and(|&channels| channels > 0);
+        self.has_output = layout.outputs.first().is_some_and(|&channels| channels > 0);
+        self.event_input = layout.event_input;
+        self.refresh_latency_control();
+        Ok(())
     }
 
     /// Queue a value converted on the UI thread. Never calls an edit controller.
@@ -254,8 +319,7 @@ impl Plugin for Vst3Plugin {
                 self.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
                 self.event_input = layout.event_input;
                 self.max_block = mb;
-                self.latency = self.inst.latency() as usize;
-                self.tail = self.inst.tail() as usize;
+                self.refresh_latency_control();
                 self.midi_map = self.inst.midi_mapping();
             }
             Err(e) => {
@@ -313,9 +377,7 @@ impl Plugin for Vst3Plugin {
         if frames == 0 || ch == 0 {
             return;
         }
-        if self.inst.host().latency_changed.swap(false, Ordering::Relaxed) {
-            self.latency = self.inst.latency() as usize;
-        }
+        self.refresh_latency_control();
         let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
         for e in &mut self.notes {
             if e.time() > last {

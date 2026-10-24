@@ -8,6 +8,9 @@ locally extended to AUv2/AUv3 effects and adapted to fallible DSP, queued parame
 stopped-worker property refresh, bounded state and a generic parameter controller.
 Native Cocoa view hosting and AUEventListener integration are local adaptations;
 view/unit lifetime follows the helper's stopped-worker and UI-thread teardown.
+Optional AU OfflineRender notification, stopped-unit transitions and persistent
+failure after an unsuccessful rollback are local additions. Dedicated auol units
+requiring a priming/preflight lifecycle remain excluded.
 AUv3 uses Apple's documented AudioComponentInstantiate and RequestViewController
 C compatibility bridge. Bounded main-runloop waits, late-result retirement,
 retained view controllers and distinct au3: identities are local additions.
@@ -22,6 +25,13 @@ and processing; normalized parameter delivery without controller calls on the au
 thread; host message/attribute COM objects; hidden/bypass parameter and preset refresh
 synchronization; controlled process lifecycle and error propagation; macOS helper event-loop
 and autorelease scopes; Linux X11/XEmbed windows and per-context/frame IRunLoop ownership.
+VST3 realtime/offline setup and process modes, same-instance stopped mode changes,
+and isolated processing-mode fixture contracts are local adaptations. Mode setup
+and bus negotiation run on the helper control/UI thread.
+Timing readers, lifecycle flags shared with the worker and an atomic latency/tail
+pair are local additions. SDK timing queries and latency-change reactivation run
+on the creating control thread while the application suspends DSP. Getter-raised
+notifications remain pending; failed transitions prevent further processing.
 Application integrations
 are maintained in native/audio-host, not in the upstream FFI implementation.
 

@@ -4,6 +4,7 @@
 //! the same frame while it returns `false`, then retry that block. Filesystem and
 //! process I/O happen only when creating a timeline or on decoder worker threads.
 
+use crate::effects::{EffectSettings, TrackEffects};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,7 @@ const MAX_SOURCES: usize = 4096;
 const MAX_CLIPS: usize = 65_536;
 const MAX_PLUGIN_SLOTS: usize = 1024;
 const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_EFFECT_HISTORY_FRAMES: usize = 128 * 1024 * 1024 / std::mem::size_of::<[f32; 2]>();
 
 fn unity() -> f64 {
     1.0
@@ -185,28 +187,8 @@ impl SessionSpec {
             in_range(track.pan, -1.0, 1.0, "Track pan")?;
             in_range(track.fade_in, 0.0, MAX_DURATION_SECONDS, "Track fade-in")?;
             in_range(track.fade_out, 0.0, MAX_DURATION_SECONDS, "Track fade-out")?;
-            if let Some(effects) = &track.effects {
-                if !effects.is_null() && !effects.is_object() {
-                    return Err(format!(
-                        "Track {} has invalid built-in effect settings",
-                        track.id
-                    ));
-                }
-                for key in ["reverb", "delay", "clarity", "compressor"] {
-                    if let Some(value) = effects.get(key) {
-                        let value = value.as_f64().ok_or_else(|| {
-                            format!("Track {} has an invalid {key} setting", track.id)
-                        })?;
-                        in_range(value, 0.0, 1.0, "Built-in effect amount")?;
-                        if value > 0.0 {
-                            return Err(format!(
-                                "Track {} uses built-in effects; disable them before using the native audio backend",
-                                track.id
-                            ));
-                        }
-                    }
-                }
-            }
+            EffectSettings::parse(track.effects.as_ref())
+                .map_err(|error| format!("Track {}: {error}", track.id))?;
             let audible = !track.muted && (!has_solo || track.solo);
             if has_clips(track) {
                 for clip in track.clips.as_ref().expect("non-empty clips") {
@@ -418,6 +400,7 @@ pub struct PreparedMixUpdate {
     spec: SessionSpec,
     tracks: Vec<RuntimeTrack>,
     sample_rate: u32,
+    pub(crate) effects: Vec<Option<TrackEffects>>,
 }
 
 pub struct Timeline {
@@ -426,6 +409,7 @@ pub struct Timeline {
     chunk_frames: u64,
     sources: Vec<Arc<DecodeSource>>,
     tracks: Vec<RuntimeTrack>,
+    suppressed: Vec<bool>,
     jobs: Option<Sender<DecodeJob>>,
     results: Receiver<DecodeResult>,
     pending: HashSet<ChunkKey>,
@@ -435,6 +419,39 @@ pub struct Timeline {
     generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     clock: u64,
+}
+
+/// Validates a transient recording-monitor mask without modifying the saved mixer state.
+pub(crate) fn monitor_mask(spec: &SessionSpec, ids: &[String]) -> Result<Vec<bool>, String> {
+    if ids.len() > 256 {
+        return Err("Monitor suppression cannot exceed 256 tracks".into());
+    }
+    let mut mask = vec![false; spec.tracks.len()];
+    for id in ids {
+        let index = spec
+            .tracks
+            .iter()
+            .position(|track| track.id == *id)
+            .ok_or_else(|| format!("Monitor track is unavailable ({id})"))?;
+        if mask[index] {
+            return Err("Monitor track identifiers must be unique".into());
+        }
+        mask[index] = true;
+    }
+    Ok(mask)
+}
+
+fn retained_monitor_mask(previous: &SessionSpec, mask: &[bool], next: &SessionSpec) -> Vec<bool> {
+    next.tracks
+        .iter()
+        .map(|track| {
+            previous
+                .tracks
+                .iter()
+                .position(|old| old.id == track.id)
+                .is_some_and(|index| mask.get(index).copied().unwrap_or(false))
+        })
+        .collect()
 }
 
 fn frame_at(seconds: f64, sample_rate: u32) -> u64 {
@@ -530,6 +547,7 @@ fn same_sources(previous: &SessionSpec, next: &SessionSpec) -> bool {
 pub fn prepare_mix_update(
     spec: SessionSpec,
     sample_rate: u32,
+    previous: Option<&SessionSpec>,
 ) -> Result<PreparedMixUpdate, String> {
     spec.validate()?;
     if !(8000..=192_000).contains(&sample_rate) {
@@ -537,11 +555,46 @@ pub fn prepare_mix_update(
     }
     let sources = compile_sources(&spec, sample_rate);
     let tracks = compile_tracks(&spec, &sources, sample_rate);
+    let effects = prepare_track_effects(&spec, previous, sample_rate)?;
     Ok(PreparedMixUpdate {
         spec,
         tracks,
         sample_rate,
+        effects,
     })
+}
+
+pub(crate) fn prepare_track_effects(
+    spec: &SessionSpec,
+    previous: Option<&SessionSpec>,
+    sample_rate: u32,
+) -> Result<Vec<Option<TrackEffects>>, String> {
+    if !(8000..=192_000).contains(&sample_rate) {
+        return Err("Native audio sample rate must be between 8000 and 192000 Hz".into());
+    }
+    let settings = spec
+        .tracks
+        .iter()
+        .map(|track| EffectSettings::parse(track.effects.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    settings.iter().try_fold(0usize, |total, settings| {
+        total
+            .checked_add(settings.history_frames(sample_rate))
+            .filter(|frames| *frames <= MAX_EFFECT_HISTORY_FRAMES)
+            .ok_or("Built-in effect delay buffers exceed the 128 MiB session limit")
+    })?;
+    Ok(settings
+        .into_iter()
+        .enumerate()
+        .map(|(index, settings)| {
+            let unchanged = previous
+                .and_then(|previous| previous.tracks.get(index))
+                .filter(|track| track.id == spec.tracks[index].id)
+                .and_then(|track| EffectSettings::parse(track.effects.as_ref()).ok())
+                == Some(settings);
+            (!unchanged).then(|| TrackEffects::new(settings, sample_rate))
+        })
+        .collect())
 }
 
 impl Timeline {
@@ -577,12 +630,14 @@ impl Timeline {
                     format!("Could not start an audio decoder worker: {error}")
                 })?;
         }
+        let suppressed = vec![false; tracks.len()];
         Ok(Self {
             spec,
             sample_rate,
             chunk_frames: CHUNK_SECONDS * u64::from(sample_rate),
             sources,
             tracks,
+            suppressed,
             jobs: Some(jobs_tx),
             results: results_rx,
             pending: HashSet::with_capacity(CACHE_CHUNKS),
@@ -604,6 +659,7 @@ impl Timeline {
     /// change invalidates old work while ordinary gain/clip edits keep caches.
     pub fn update(&mut self, spec: SessionSpec) -> Result<(), String> {
         spec.validate()?;
+        let suppressed = retained_monitor_mask(&self.spec, &self.suppressed, &spec);
         if !same_sources(&self.spec, &spec) {
             self.clear_pending();
             self.ready.clear();
@@ -612,6 +668,7 @@ impl Timeline {
             self.sources = compile_sources(&spec, self.sample_rate);
         }
         self.tracks = compile_tracks(&spec, &self.sources, self.sample_rate);
+        self.suppressed = suppressed;
         self.spec = spec;
         Ok(())
     }
@@ -623,8 +680,21 @@ impl Timeline {
         if prepared.sample_rate != self.sample_rate || !same_sources(&self.spec, &prepared.spec) {
             return Err("Audio sources or sample rate changed; reload the audio graph".into());
         }
+        self.suppressed = retained_monitor_mask(&self.spec, &self.suppressed, &prepared.spec);
         self.tracks = prepared.tracks;
         self.spec = prepared.spec;
+        Ok(())
+    }
+
+    pub(crate) fn set_monitor_mask(&mut self, mask: Vec<bool>) -> Result<(), String> {
+        if mask.len() != self.tracks.len() {
+            return Err("Monitor track topology changed".into());
+        }
+        self.suppressed = mask;
+        self.required.clear();
+        self.prefetch.clear();
+        // In-flight chunks may also serve an accompanying track. Preserve their jobs/cache;
+        // subsequent required/prefetch collection omits every suppressed track.
         Ok(())
     }
 
@@ -672,8 +742,11 @@ impl Timeline {
         self.clock = self.clock.wrapping_add(1);
         self.required.clear();
         self.prefetch.clear();
-        for track in &self.tracks {
-            if !track.audible || (track.gain_left == 0.0 && track.gain_right == 0.0) {
+        for (index, track) in self.tracks.iter().enumerate() {
+            if self.suppressed[index]
+                || !track.audible
+                || (track.gain_left == 0.0 && track.gain_right == 0.0)
+            {
                 continue;
             }
             for clip in &track.clips {
@@ -692,8 +765,11 @@ impl Timeline {
         let prefetch_limit = CACHE_CHUNKS - self.required.len();
         // Prefetch failure does not prevent the current block from playing.
         // The combined desired working set never exceeds cache capacity.
-        for track in &self.tracks {
-            if !track.audible || (track.gain_left == 0.0 && track.gain_right == 0.0) {
+        for (index, track) in self.tracks.iter().enumerate() {
+            if self.suppressed[index]
+                || !track.audible
+                || (track.gain_left == 0.0 && track.gain_right == 0.0)
+            {
                 continue;
             }
             for clip in &track.clips {
@@ -742,8 +818,11 @@ impl Timeline {
         if !complete {
             return Ok(false);
         }
-        for (track, bus) in self.tracks.iter().zip(output.iter_mut()) {
-            if !track.audible || (track.gain_left == 0.0 && track.gain_right == 0.0) {
+        for (index, (track, bus)) in self.tracks.iter().zip(output.iter_mut()).enumerate() {
+            if self.suppressed[index]
+                || !track.audible
+                || (track.gain_left == 0.0 && track.gain_right == 0.0)
+            {
                 continue;
             }
             let (left, right) = bus.split_at_mut(1);
@@ -1222,6 +1301,71 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_monitor_tracks_skip_decode_prefetch_and_keep_saved_mute_unchanged() {
+        let (_directory, spec) = fixture(1.0);
+        let mut timeline = Timeline::new(spec.clone(), "unused-ffmpeg".into(), 8000).unwrap();
+        timeline
+            .set_monitor_mask(monitor_mask(&spec, &["track".into()]).unwrap())
+            .unwrap();
+        let mut buses = output(1, 32);
+        assert!(timeline.render_dry(0, 32, &mut buses).unwrap());
+        assert!(timeline.required.is_empty());
+        assert!(timeline.prefetch.is_empty());
+        assert!(timeline.pending.is_empty());
+        assert!(
+            buses
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|sample| *sample == 0.0)
+        );
+        assert!(!timeline.spec().tracks[0].muted);
+        assert_eq!(
+            serde_json::to_value(timeline.spec()).unwrap(),
+            serde_json::to_value(spec).unwrap()
+        );
+    }
+
+    #[test]
+    fn monitor_survives_mix_update_and_clear_restores_cached_audio() {
+        let (_directory, spec) = fixture(1.0);
+        let mut timeline = cached(spec.clone(), 0.25, -0.5);
+        timeline
+            .set_monitor_mask(monitor_mask(&spec, &["track".into()]).unwrap())
+            .unwrap();
+        let mut next = spec;
+        next.tracks[0].volume = 0.5;
+        let prepared = prepare_mix_update(next.clone(), 8000, Some(timeline.spec())).unwrap();
+        timeline.apply_mix_update(prepared).unwrap();
+        let mut buses = output(1, 32);
+        assert!(timeline.render_dry(0, 32, &mut buses).unwrap());
+        assert!(
+            buses
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|sample| *sample == 0.0)
+        );
+        timeline
+            .set_monitor_mask(monitor_mask(&next, &[]).unwrap())
+            .unwrap();
+        assert!(timeline.render_dry(0, 32, &mut buses).unwrap());
+        assert!(buses[0][0].iter().all(|sample| *sample == 0.125));
+        assert!(buses[0][1].iter().all(|sample| *sample == -0.25));
+        assert!(!timeline.spec().tracks[0].muted);
+    }
+
+    #[test]
+    fn monitor_ids_reject_unknown_duplicate_and_oversized_lists() {
+        let (_directory, spec) = fixture(1.0);
+        assert_eq!(monitor_mask(&spec, &[]).unwrap(), vec![false]);
+        assert_eq!(monitor_mask(&spec, &["track".into()]).unwrap(), vec![true]);
+        assert!(monitor_mask(&spec, &["missing".into()]).is_err());
+        assert!(monitor_mask(&spec, &["track".into(), "track".into()]).is_err());
+        assert!(monitor_mask(&spec, &vec!["track".into(); 257]).is_err());
+    }
+
+    #[test]
     fn legacy_defaults_unknown_metadata_and_duration_include_muted_clips() {
         let (_directory, mut spec) = fixture(1.0);
         spec.tracks[0].muted = true;
@@ -1263,10 +1407,10 @@ mod tests {
     }
 
     #[test]
-    fn validation_blocks_effects_and_active_offline_or_multichannel_sources() {
+    fn validation_accepts_built_in_effects_but_blocks_active_offline_or_multichannel_sources() {
         let (_directory, mut spec) = fixture(1.0);
         spec.tracks[0].effects = Some(json!({"reverb": 0.1}));
-        assert!(spec.validate().unwrap_err().contains("built-in effects"));
+        assert!(spec.validate().is_ok());
         spec.tracks[0].effects = None;
         spec.sources[0].missing = true;
         assert!(spec.validate().unwrap_err().contains("offline"));
@@ -1282,6 +1426,56 @@ mod tests {
         spec.sources[0].sample_rate = 8000;
         spec.sources[0].path = "relative.wav".into();
         assert!(spec.validate().unwrap_err().contains("absolute file path"));
+    }
+
+    #[test]
+    fn effect_preparation_reuses_unchanged_processors_and_rejects_excessive_total_history() {
+        let (_directory, mut spec) = fixture(0.01);
+        spec.tracks[0].effects = Some(json!({"delay":0.8,"delayTime":0.05}));
+        let initial = prepare_track_effects(&spec, None, 48000).unwrap();
+        assert_eq!(initial[0].as_ref().unwrap().tail_samples(), 12000);
+        let mut next = spec.clone();
+        next.tracks[0].volume = 0.4;
+        next.tracks[0].pan = -0.3;
+        assert!(
+            prepare_mix_update(next.clone(), 48000, Some(&spec))
+                .unwrap()
+                .effects[0]
+                .is_none()
+        );
+        next.tracks[0].effects = Some(json!({"delay":0.8,"delayTime":0.1}));
+        assert_eq!(
+            prepare_mix_update(next, 48000, Some(&spec))
+                .unwrap()
+                .effects[0]
+                .as_ref()
+                .unwrap()
+                .tail_samples(),
+            24000
+        );
+        spec.tracks[0].effects = Some(json!({"delay":1.0,"delayTime":1.2}));
+        spec.tracks = vec![spec.tracks[0].clone(); MAX_TRACKS];
+        assert!(
+            prepare_track_effects(&spec, None, 192000)
+                .err()
+                .unwrap()
+                .contains("128 MiB")
+        );
+    }
+
+    #[test]
+    fn invalid_effect_values_are_rejected_even_when_the_track_is_muted() {
+        let (_directory, mut spec) = fixture(0.01);
+        spec.tracks[0].muted = true;
+        for settings in [
+            json!({"delayTime":0.0}),
+            json!({"delay":null}),
+            json!({"compressor":1.1}),
+            json!([]),
+        ] {
+            spec.tracks[0].effects = Some(settings);
+            assert!(spec.validate().is_err());
+        }
     }
 
     #[test]
@@ -1505,7 +1699,7 @@ mod tests {
         let mut timeline = cached(spec.clone(), 1.0, 1.0);
         let mut next = spec;
         next.tracks[0].volume = 0.5;
-        let prepared = prepare_mix_update(next.clone(), 8000).unwrap();
+        let prepared = prepare_mix_update(next.clone(), 8000, None).unwrap();
         // Control-thread validation already ran. Rendering must not perform
         // filesystem calls or fail after a file disappears behind cached audio.
         std::fs::remove_file(&next.sources[0].path).unwrap();
@@ -1522,14 +1716,14 @@ mod tests {
         let mut timeline = cached(spec.clone(), 1.0, 1.0);
         let mut next = spec.clone();
         next.sources[0].sample_rate = 16000;
-        let prepared = prepare_mix_update(next, 8000).unwrap();
+        let prepared = prepare_mix_update(next, 8000, None).unwrap();
         assert!(
             timeline
                 .apply_mix_update(prepared)
                 .unwrap_err()
                 .contains("reload")
         );
-        let prepared = prepare_mix_update(spec, 16000).unwrap();
+        let prepared = prepare_mix_update(spec, 16000, None).unwrap();
         assert!(
             timeline
                 .apply_mix_update(prepared)

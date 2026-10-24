@@ -1,6 +1,7 @@
 //! Effect-only AUv2 adapter. Allocation and format negotiation happen while stopped.
 
 use crate::ffi::Instance;
+use crate::offline::OfflineState;
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport};
 
 /// A loaded synchronous Audio Unit effect with a main-thread Cocoa editor/controller.
@@ -14,6 +15,7 @@ pub struct AuPlugin {
     latency: usize,
     tail: usize,
     reset_failure: Option<i32>,
+    offline: OfflineState,
 }
 
 impl AuPlugin {
@@ -39,7 +41,34 @@ impl AuPlugin {
             latency: 0,
             tail: 0,
             reset_failure: None,
+            offline: OfflineState::default(),
         }
+    }
+
+    /// Changes the host's render context on this same unit. DSP must be stopped. Effects without
+    /// the optional OfflineRender property retain their existing processing implementation.
+    pub fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        self.offline.check()?;
+        if self.offline.requested() == offline {
+            return Ok(());
+        }
+        self.flush_pending()?;
+        let result = self.offline.set(&mut self.inst, offline);
+        // A failed rollback leaves the unit deliberately unprepared. Preserve the original
+        // error instead of querying timing/parameter properties on that failed configuration.
+        if result.is_ok() || self.inst.is_ready() {
+            self.refresh_values();
+            self.refresh_latency_control();
+        }
+        if result.is_ok() {
+            self.reset_failure = None;
+        }
+        result
+    }
+
+    /// The host's requested context; an AU may omit the optional optimization property.
+    pub fn is_offline(&self) -> bool {
+        self.offline.requested()
     }
 
     fn refresh_values(&mut self) {
@@ -57,6 +86,7 @@ impl AuPlugin {
         max_block: usize,
         channels: usize,
     ) -> Result<(), String> {
+        self.offline.check()?;
         if !sample_rate.is_finite()
             || !(8_000.0..=384_000.0).contains(&sample_rate)
             || max_block == 0

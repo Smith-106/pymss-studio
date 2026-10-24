@@ -144,6 +144,8 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
   let nativePlaying = false, nativePosition = 0
   const createNative = vm.runInNewContext(`${nativeCode}\nuseEditorNativePlayback`, {
     computed, watch, hasEditorPlugins, pluginProjectSignature, useEditorPlaybackStore,
+    pluginHostCapabilities: async () => ({ recording: true }),
+    i18n: { global: { t: key => key } },
     onBeforeUnmount: callback => unmount.push(callback),
     setTimeout: () => 1, clearTimeout() {}, ensurePluginSession: async () => {},
     async pluginHostRequest(request) {

@@ -53,7 +53,7 @@ mod plugin;
 mod registry;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use plugin::Vst3Plugin;
+pub use plugin::{Vst3Plugin, Vst3TimingReader};
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};

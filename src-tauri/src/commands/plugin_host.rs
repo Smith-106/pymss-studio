@@ -112,6 +112,8 @@ pub fn plugin_host_capabilities() -> Value {
     json!({
         "enabled": capabilities.enabled, "platform": std::env::consts::OS,
         "formats": formats, "nativeEditorFormats": native_editor_formats,
+        "builtinEffects": capabilities.enabled,
+        "recording": capabilities.enabled,
         "nativeEditor": capabilities.native_editor, "experimental": true,
     })
 }
@@ -759,6 +761,7 @@ fn supported_operation(operation: &str) -> bool {
             | "shutdown"
             | "param"
             | "parameters"
+            | "monitor"
     )
 }
 

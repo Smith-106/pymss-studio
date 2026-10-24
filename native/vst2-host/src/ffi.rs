@@ -136,8 +136,14 @@ impl Drop for LoadingGuard {
 
 struct ProcessLevelGuard(isize);
 impl ProcessLevelGuard {
-    fn realtime() -> Self {
-        Self(PROCESS_LEVEL.with(|level| level.replace(2)))
+    fn processing(offline: bool) -> Self {
+        Self::enter(if offline { 4 } else { 2 })
+    }
+    fn user() -> Self {
+        Self::enter(1)
+    }
+    fn enter(level: isize) -> Self {
+        Self(PROCESS_LEVEL.with(|current| current.replace(level)))
     }
 }
 impl Drop for ProcessLevelGuard {
@@ -405,6 +411,7 @@ unsafe fn dispatch(
     let dispatcher = unsafe { effect.as_ref().dispatcher };
     let host = unsafe { (effect.as_ref().reserved1 as *const HostContext).as_ref() };
     let _context = host.map(LoadingGuard::new);
+    let _level = ProcessLevelGuard::user();
     dispatcher.map_or(0, |dispatcher| unsafe {
         dispatcher(effect.as_ptr(), opcode, index, value, data, opt)
     })
@@ -564,11 +571,13 @@ impl Shared {
         }
         let state = lock(&self.ui);
         let effect = NonNull::new(state.effect as *mut Effect)?;
+        let _level = ProcessLevelGuard::user();
         Some(operation(effect))
     }
 
     fn read_values(&self, effect: NonNull<Effect>, record_edits: bool) {
         let _context = LoadingGuard::new(&self.host);
+        let _level = ProcessLevelGuard::user();
         // SAFETY: effect is protected by the UI lease or exclusively owned by Instance.
         let Some(get) = (unsafe { effect.as_ref().get_parameter }) else {
             return;
@@ -832,6 +841,7 @@ pub(crate) struct Instance {
     inputs: usize,
     outputs: usize,
     active: bool,
+    offline: bool,
 }
 
 // AEffect's processor belongs to this unique owner; UI operations use the separate lifecycle
@@ -901,6 +911,7 @@ impl Instance {
             inputs: 0,
             outputs: 0,
             active: false,
+            offline: false,
         };
         unsafe {
             dispatch(effect, OPEN, 0, 0, ptr::null_mut(), 0.0);
@@ -1166,6 +1177,34 @@ impl Instance {
     pub(crate) fn channels(&self) -> (usize, usize) {
         (self.inputs, self.outputs)
     }
+
+    pub(crate) fn is_offline(&self) -> bool {
+        self.offline
+    }
+
+    pub(crate) fn set_offline(&mut self, offline: bool) -> Result<(), String> {
+        // This is a stopped control operation. Waiting for editor idle here does not put a
+        // lock in processing; all render/parameter flush paths retain their lock-free contract.
+        let _ui = lock(&self.shared.ui);
+        if self.shared.retired.load(Ordering::Acquire) {
+            return Err("The VST2 instance is closed".into());
+        }
+        self.validate_effect()?;
+        let effect = unsafe { self.effect.as_ref() };
+        if effect.parameters as usize != self.shared.host.count.load(Ordering::Relaxed) {
+            return Err("The VST2 plugin changed its parameter layout; reload the plugin".into());
+        }
+        if self.active {
+            self.check_layout()?;
+            // The worker is stopped, so also reject an unannounced bus change instead of
+            // reporting successful mode switching for an invalid prepared instance.
+            if effect.inputs as usize != self.inputs || effect.outputs as usize != self.outputs {
+                return Err("The VST2 plugin changed its channel layout; reload the plugin".into());
+            }
+        }
+        self.offline = offline;
+        Ok(())
+    }
     pub(crate) fn sample_rate(&self) -> f64 {
         f64::from_bits(self.shared.host.sample_rate.load(Ordering::Relaxed))
     }
@@ -1217,7 +1256,7 @@ impl Instance {
     }
 
     pub(crate) fn flush_pending(&self) {
-        let _level = ProcessLevelGuard::realtime();
+        let _level = ProcessLevelGuard::processing(self.offline);
         self.shared.flush(self.effect);
     }
 
@@ -1233,7 +1272,7 @@ impl Instance {
         let input_pointers = [inputs[0].as_ptr(), inputs[1].as_ptr()];
         let mut output_pointers = [outputs[0].as_mut_ptr(), outputs[1].as_mut_ptr()];
         if let Some(process) = unsafe { self.effect.as_ref().process_replacing } {
-            let _level = ProcessLevelGuard::realtime();
+            let _level = ProcessLevelGuard::processing(self.offline);
             unsafe {
                 process(
                     self.effect.as_ptr(),
@@ -1279,6 +1318,7 @@ impl Instance {
             return false;
         }
         let _context = LoadingGuard::new(&self.shared.host);
+        let _level = ProcessLevelGuard::user();
         match state {
             State::Chunk(data) if self.shared.flags & PROGRAM_CHUNKS != 0 => {
                 // Plugins may retain/mutate input only for the duration of effSetChunk.
@@ -1551,6 +1591,10 @@ mod tests {
         open_current_id: AtomicI64,
         set_current_id: AtomicI64,
         close_current_id: AtomicI64,
+        process_level: AtomicI64,
+        set_level: AtomicI64,
+        get_level: AtomicI64,
+        dispatch_level: AtomicI64,
         tail_queries: AtomicUsize,
     }
 
@@ -1574,6 +1618,10 @@ mod tests {
         _opt: f32,
     ) -> isize {
         let fake = unsafe { &mut *((*effect).object as *mut Fake) };
+        fake.events.dispatch_level.store(
+            unsafe { callback(effect, 23, 0, 0, ptr::null_mut(), 0.0) } as i64,
+            Ordering::Relaxed,
+        );
         match opcode {
             OPEN => {
                 fake.events.opens.fetch_add(1, Ordering::Relaxed);
@@ -1694,6 +1742,10 @@ mod tests {
         let fake = unsafe { &mut *((*effect).object as *mut Fake) };
         fake.parameters[index as usize] = value;
         fake.events.sets.fetch_add(1, Ordering::Relaxed);
+        fake.events.set_level.store(
+            unsafe { callback(effect, 23, 0, 0, ptr::null_mut(), 0.0) } as i64,
+            Ordering::Relaxed,
+        );
         fake.events.set_current_id.store(
             unsafe { callback(ptr::null_mut(), 2, 0, 0, ptr::null_mut(), 0.0) } as i64,
             Ordering::Relaxed,
@@ -1701,7 +1753,12 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_get(effect: *mut Effect, index: i32) -> f32 {
-        unsafe { (&*((*effect).object as *mut Fake)).parameters[index as usize] }
+        let fake = unsafe { &*((*effect).object as *mut Fake) };
+        fake.events.get_level.store(
+            unsafe { callback(effect, 23, 0, 0, ptr::null_mut(), 0.0) } as i64,
+            Ordering::Relaxed,
+        );
+        fake.parameters[index as usize]
     }
 
     unsafe extern "C" fn fake_process(
@@ -1711,6 +1768,10 @@ mod tests {
         frames: i32,
     ) {
         let fake = unsafe { &mut *((*effect).object as *mut Fake) };
+        fake.events.process_level.store(
+            unsafe { callback(effect, 23, 0, 0, ptr::null_mut(), 0.0) } as i64,
+            Ordering::Relaxed,
+        );
         let time = unsafe { callback(effect, 7, 0, 0, ptr::null_mut(), 0.0) } as *const TimeInfo;
         let time = unsafe { time.read() };
         fake.events
@@ -1811,6 +1872,7 @@ mod tests {
                 inputs: 0,
                 outputs: 0,
                 active: false,
+                offline: false,
             },
             events,
         )
@@ -2284,7 +2346,7 @@ mod tests {
         let level = || unsafe { callback(effect as *mut Effect, 23, 0, 0, ptr::null_mut(), 0.0) };
         assert_eq!(level(), 1);
         {
-            let _processing = ProcessLevelGuard::realtime();
+            let _processing = ProcessLevelGuard::processing(false);
             assert_eq!(level(), 2);
             let ui_level = std::thread::spawn(move || unsafe {
                 callback(effect as *mut Effect, 23, 0, 0, ptr::null_mut(), 0.0)
@@ -2296,12 +2358,125 @@ mod tests {
                 "another callback thread remains in user context"
             );
             {
-                let _nested = ProcessLevelGuard::realtime();
+                let _nested = ProcessLevelGuard::processing(false);
                 assert_eq!(level(), 2);
             }
             assert_eq!(level(), 2);
         }
         assert_eq!(level(), 1);
+    }
+
+    #[test]
+    fn offline_mode_reports_process_and_parameter_levels_without_replacing_the_instance() {
+        let (mut plugin, events) = plugin(2, 2);
+        let effect = plugin.instance.effect;
+        let mut editor = plugin.editor().unwrap();
+        let mut reader = plugin.state_reader().unwrap();
+        assert!(!plugin.is_offline());
+        plugin.set_offline(true).unwrap();
+        assert!(plugin.is_offline());
+        plugin.try_prepare(48_000.0, 4, 2).unwrap();
+        assert!(
+            plugin.is_offline(),
+            "preparation keeps the selected processing mode"
+        );
+        plugin.set_param("0", 0.25);
+        let mut audio = vec![vec![1.0; 4], vec![0.5; 4]];
+        plugin.try_process(&mut audio, 4).unwrap();
+        assert_eq!(events.process_level.load(Ordering::Relaxed), 4);
+        assert_eq!(events.set_level.load(Ordering::Relaxed), 4);
+        assert_eq!(audio, vec![vec![0.25; 4], vec![0.125; 4]]);
+        assert!(reader.save_state().is_some());
+        assert_eq!(events.get_level.load(Ordering::Relaxed), 1);
+        assert_eq!(editor.value_text("0", 0.25), Some("50 %".into()));
+        assert_eq!(events.dispatch_level.load(Ordering::Relaxed), 1);
+        plugin.set_offline(false).unwrap();
+        assert!(!plugin.is_offline());
+        assert_eq!(plugin.instance.effect, effect);
+        assert_eq!(plugin.param("0"), Some(0.25));
+        assert_eq!(editor.normalize("0", 0.4), Some(f64::from(0.4f32)));
+        assert!(reader.save_state().is_some());
+        plugin.set_param("0", 0.75);
+        plugin.flush_pending().unwrap();
+        assert_eq!(events.set_level.load(Ordering::Relaxed), 2);
+        plugin.try_process(&mut audio, 4).unwrap();
+        assert_eq!(events.process_level.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn processing_modes_are_scoped_across_instances_nested_calls_and_gui_threads() {
+        let (mut offline, offline_events) = plugin(2, 2);
+        let (mut realtime, realtime_events) = plugin(2, 2);
+        offline.set_offline(true).unwrap();
+        offline.try_prepare(48_000.0, 4, 2).unwrap();
+        realtime.try_prepare(48_000.0, 4, 2).unwrap();
+        let mut editor = offline.editor().unwrap();
+        let effect = offline.instance.effect.as_ptr() as usize;
+        let level = || unsafe { callback(effect as *mut Effect, 23, 0, 0, ptr::null_mut(), 0.0) };
+        let mut audio = vec![vec![1.0; 4], vec![0.5; 4]];
+        {
+            let _outer = ProcessLevelGuard::processing(true);
+            assert_eq!(level(), 4);
+            realtime.try_process(&mut audio, 4).unwrap();
+            assert_eq!(realtime_events.process_level.load(Ordering::Relaxed), 2);
+            assert_eq!(level(), 4);
+            {
+                let _inner = ProcessLevelGuard::processing(false);
+                offline.set_param("0", 0.25);
+                offline.flush_pending().unwrap();
+                assert_eq!(offline_events.set_level.load(Ordering::Relaxed), 4);
+                assert_eq!(level(), 2);
+                assert!(editor.value_text("0", 0.25).is_some());
+                assert_eq!(offline_events.dispatch_level.load(Ordering::Relaxed), 1);
+                assert_eq!(level(), 2);
+            }
+            assert_eq!(level(), 4);
+            offline.try_process(&mut audio, 4).unwrap();
+            assert_eq!(offline_events.process_level.load(Ordering::Relaxed), 4);
+            let gui_level = std::thread::spawn(move || unsafe {
+                callback(effect as *mut Effect, 23, 0, 0, ptr::null_mut(), 0.0)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(gui_level, 1);
+        }
+        assert_eq!(level(), 1);
+        assert!(offline.is_offline());
+        assert!(!realtime.is_offline());
+    }
+
+    #[test]
+    fn failed_mode_switch_preserves_the_mode_and_pending_parameter_state() {
+        let (mut plugin, events) = plugin(2, 2);
+        plugin.try_prepare(48_000.0, 4, 2).unwrap();
+        plugin.set_offline(true).unwrap();
+        plugin.set_param("0", 0.25);
+        unsafe {
+            (*plugin.instance.effect.as_ptr()).outputs = 4;
+            callback(
+                plugin.instance.effect.as_ptr(),
+                13,
+                0,
+                0,
+                ptr::null_mut(),
+                0.0,
+            );
+        }
+        assert!(plugin.set_offline(false).is_err());
+        assert!(
+            plugin.set_offline(true).is_err(),
+            "a no-op request must still reject invalid state"
+        );
+        assert!(plugin.is_offline());
+        assert_eq!(plugin.param("0"), Some(0.25));
+        assert_ne!(plugin.pending.host.pending[0].load(Ordering::Acquire), NONE);
+        assert_eq!(events.sets.load(Ordering::Relaxed), 0);
+        assert!(
+            plugin
+                .try_process(&mut [vec![1.0; 4], vec![1.0; 4]], 4)
+                .is_err()
+        );
+        assert_eq!(events.process_level.load(Ordering::Relaxed), 0);
     }
 
     #[test]

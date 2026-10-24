@@ -1930,26 +1930,26 @@ export const useEditorStore = defineStore('editor', () => {
     exportRenderController = renderController
     const pluginRenderRequired = hasEditorPlugins(snapshot)
     let pluginTailLimited = false
-    const renderRequired = snapshot.tracks.some(track => hasEditorEffects(track.effects))
+    const renderRequired = !pluginRenderRequired && snapshot.tracks.some(track => hasEditorEffects(track.effects))
     exporting.value = true
     exportCancelling.value = false
     exportCancelRequested = false
     exportProgress.value = { phase: 'preparing', completed: 0, total: 100, current: '' }
     lastError.value = null
     try {
-      if (pluginRenderRequired) assertPluginProjectSupported(snapshot)
       await ensureEditorExportListener()
       if (exportCancelRequested) throw new EditorExportCancelledError()
       const prepared = pluginRenderRequired
         ? await (async () => {
             const hostCapabilities = await pluginHostCapabilities()
             if (!hostCapabilities.enabled) throw new Error(String(i18n.global.t('editor.plugins.unavailable')))
+            assertPluginProjectSupported(exportProject, hostCapabilities.formats || ['vst3'], hostCapabilities.builtinEffects === true)
             await capturePluginState(exportProject, true)
             if (exportCancelRequested) throw new EditorExportCancelledError()
             // Capture can wait while the project is edited. Freeze its complete
             // post-capture version instead of mixing fresh plugin states into an older mix.
             snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
-            assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'])
+            assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'], hostCapabilities.builtinEffects === true)
             nativeRenderTaskId = taskId
             exportProgress.value = { phase: 'rendering', completed: 0, total: 100, current: '' }
             try {

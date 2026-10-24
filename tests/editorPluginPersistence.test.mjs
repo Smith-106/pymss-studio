@@ -10,10 +10,13 @@ Object.defineProperty(globalThis,'navigator',{value:{language:'en'},configurable
 const { useEditorStore }=await vite.ssrLoadModule('/src/stores/editor.ts')
 const host=await vite.ssrLoadModule('/src/utils/pluginHost.ts')
 const environments=[]
+const hostCapabilities={enabled:true,formats:['vst3','vst2','au']}
 const flush=async()=>{for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve))}
 function deferred(){let resolve;const promise=new Promise(done=>{resolve=done});return{promise,resolve}}
-function environment(t){
+function environment(t,{builtinEffects}={}){
   t.mock.timers.enable({apis:['setTimeout','Date'],now:100000})
+  if(builtinEffects===undefined)delete hostCapabilities.builtinEffects
+  else hostCapabilities.builtinEffects=builtinEffects
   const callbacks=new Map(), listeners=new Map();let callbackId=0
   const calls=[], controls={projectId:'project',revision:0,sessionId:'native-1',states:{slot:'sha256:initial'},snapshotError:false,statusError:false,updateError:false,partialSnapshot:false,omittedSlots:[],unavailablePlugins:[],openEditors:[],snapshotGate:null,parameterGate:null,parameterValues:{gain:0.5}}
   const status=()=>({projectId:controls.projectId,sessionId:controls.sessionId,stateRevision:controls.revision,openEditors:[...controls.openEditors],unavailablePlugins:[...controls.unavailablePlugins],position:0,playing:false,duration:2})
@@ -21,7 +24,7 @@ function environment(t){
     calls.push({command,args:JSON.parse(JSON.stringify(args||{}))})
     if(command==='plugin:event|listen'){listeners.set(args.handler,{event:args.event,handler:callbacks.get(args.handler)});return args.handler}
     if(command==='plugin:event|unlisten'){listeners.delete(args.eventId);return}
-    if(command==='plugin_host_capabilities')return{enabled:true,formats:['vst3','vst2','au']}
+    if(command==='plugin_host_capabilities')return hostCapabilities
     if(command==='plugin_host_request'){
       const request=args.request
       if(request.op==='update'&&controls.updateError)throw new Error('Plugin Missing Effect [missing] could not be loaded')
@@ -613,4 +616,59 @@ test('queued parameter writes allow opaque state captured by the same controller
  await capturing;await editing
  assert.equal(env.controls.parameterValues.gain,0.75)
  assert.equal(env.editor.session.pluginChain[0].state,'sha256:captured-live')
+})
+
+const builtinTrack=effects=>({id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,effects})
+const builtinSettings={reverb:0.2,delay:0.3,delayTime:0.4,clarity:0.5,compressor:0.6}
+
+test('a capable host receives all built-in effects for plugin playback and subsequent updates',async t=>{
+ const env=environment(t,{builtinEffects:true})
+ env.editor.session.tracks=[builtinTrack({...builtinSettings})]
+ await host.ensurePluginSession(env.editor.session)
+ await host.pluginHostRequest({op:'play',projectId:'project',position:0})
+ const load=env.calls.find(call=>call.args?.request?.op==='load').args.request
+ assert.deepEqual(load.project.tracks[0].effects,builtinSettings)
+ assert.ok(env.calls.some(call=>call.args?.request?.op==='play'))
+ env.editor.session.tracks[0].effects={...builtinSettings,delayTime:0.7,compressor:0.25}
+ await host.ensurePluginSession(env.editor.session)
+ const update=env.calls.findLast(call=>call.args?.request?.op==='update').args.request
+ assert.deepEqual(update.project.tracks[0].effects,env.editor.session.tracks[0].effects)
+})
+
+for(const builtinEffects of [undefined,false]){
+ test(`a host with ${builtinEffects===undefined?'missing':'disabled'} built-in effects capability keeps rejecting plugin effects`,async t=>{
+  const env=environment(t,{builtinEffects})
+  env.editor.session.tracks=[builtinTrack({...builtinSettings})]
+  try{
+   await assert.rejects(host.ensurePluginSession(env.editor.session),/built-in effects|内置效果/)
+   assert.equal(env.calls.filter(call=>call.args?.request?.op==='load').length,0)
+   await assert.rejects(env.editor.exportMix(),/built-in effects|内置效果/)
+   assert.equal(env.calls.filter(call=>call.command==='plugin_host_render').length,0)
+  }finally{env.editor.session.tracks=[]}
+ })
+}
+
+test('plugin export freezes built-in effects changed during capture and encodes a neutral track',async t=>{
+ const env=environment(t,{builtinEffects:true})
+ env.editor.session.tracks=[builtinTrack({...builtinSettings,reverb:0.1})]
+ await host.ensurePluginSession(env.editor.session)
+ await env.tick(900)
+ env.controls.snapshotGate=deferred()
+ const exporting=env.editor.exportMix({format:'wav'})
+ await flush()
+ env.editor.session.tracks=[builtinTrack({...builtinSettings})]
+ env.editor.setMasterVolume(0.35)
+ env.controls.snapshotGate.resolve()
+ await exporting
+ const rendered=env.calls.find(call=>call.command==='plugin_host_render').args.project
+ assert.equal(rendered.masterVolume,0.35)
+ assert.deepEqual(rendered.tracks[0].effects,builtinSettings)
+ const encoded=env.calls.find(call=>call.command==='start_editor_mix_export').args.payload.project
+ assert.equal(encoded.masterVolume,1)
+ assert.equal(encoded.masterPan,0)
+ assert.equal(encoded.tracks.length,1)
+ assert.equal(encoded.tracks[0].effects,undefined)
+ assert.equal(encoded.tracks[0].volume,1)
+ assert.equal(encoded.assets[0].path,'C:/native-render.wav')
+ assert.equal(env.calls.filter(call=>call.command==='cleanup_editor_export_render').length,0)
 })

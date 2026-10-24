@@ -1,4 +1,5 @@
 mod discovery;
+mod effects;
 mod engine;
 mod graph;
 mod output;

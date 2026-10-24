@@ -52,6 +52,7 @@ const PROP_PARAMETER_VALUE_STRINGS: u32 = 16;
 const PROP_TAIL_TIME: u32 = 20;
 const PROP_SET_RENDER_CALLBACK: u32 = 23;
 const PROP_HOST_CALLBACKS: u32 = 27;
+const PROP_OFFLINE_RENDER: u32 = 37;
 
 const SCOPE_GLOBAL: u32 = 0;
 const SCOPE_INPUT: u32 = 1;
@@ -1429,6 +1430,86 @@ impl Instance {
         };
         release(plist);
         st == 0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RenderConfiguration {
+    sample_rate: f64,
+    max_frames: usize,
+    channels: usize,
+}
+
+impl crate::offline::OfflineUnit for Instance {
+    type Configuration = RenderConfiguration;
+
+    fn configuration(&self) -> Option<Self::Configuration> {
+        self.initialized.then_some(RenderConfiguration {
+            sample_rate: self.sample_rate,
+            max_frames: self.max_frames,
+            channels: self.channels,
+        })
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        if self.initialized {
+            // SAFETY: the caller stopped processing before entering a mode transition.
+            let status = unsafe { AudioUnitUninitialize(self.unit) };
+            if status != 0 {
+                return Err(format!(
+                    "AudioUnitUninitialize failed while changing render mode ({status})"
+                ));
+            }
+            self.initialized = false;
+        }
+        Ok(())
+    }
+
+    fn supports_offline(&self) -> Result<bool, String> {
+        let mut size = 0;
+        let mut writable = 0;
+        // SAFETY: OfflineRender metadata uses UInt32 size and a Boolean writability flag.
+        let status = unsafe {
+            AudioUnitGetPropertyInfo(
+                self.unit,
+                PROP_OFFLINE_RENDER,
+                SCOPE_GLOBAL,
+                0,
+                &mut size,
+                &mut writable,
+            )
+        };
+        crate::offline::optional_property(status, size, writable != 0)
+    }
+
+    fn write_offline(&mut self, offline: bool) -> Result<(), String> {
+        let status = self.set_property(PROP_OFFLINE_RENDER, SCOPE_GLOBAL, 0, &u32::from(offline));
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("Audio Unit OfflineRender change failed ({status})"))
+        }
+    }
+
+    fn restart(&mut self, configuration: Self::Configuration) -> Result<(), String> {
+        self.configure(
+            configuration.sample_rate,
+            configuration.max_frames,
+            configuration.channels,
+        )?;
+        Ok(())
+    }
+
+    fn invalidate(&mut self) {
+        // Do not render a partly restored configuration. Disposal still owns the same unit,
+        // editor link and callback allocations, even if this final cleanup attempt fails.
+        if self.initialized {
+            unsafe {
+                AudioUnitUninitialize(self.unit);
+            }
+        }
+        self.initialized = false;
+        self.max_frames = 0;
     }
 }
 

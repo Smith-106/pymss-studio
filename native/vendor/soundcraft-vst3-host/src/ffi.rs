@@ -567,9 +567,8 @@ impl Bundle {
             connections: None,
             component_initialized: true,
             controller_initialized: false,
-            active: false,
-            processing: false,
             max_frames: 0,
+            offline: false,
             in_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             out_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
             in_events: ComWrapper::new(EventList::new(EVENT_CAP)),
@@ -622,7 +621,8 @@ impl Bundle {
             }
         }
         inst.editor = Arc::new(EditorLink {
-            inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), controller: inst.controller.clone(), ..EditorInner::default() }),
+            inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), processor: inst.processor.clone(), controller: inst.controller.clone(), owner: Some(std::thread::current().id()), ..EditorInner::default() }),
+            ..EditorLink::default()
         });
         Ok(inst)
     }
@@ -1171,9 +1171,8 @@ pub(crate) struct Instance {
     connections: Option<(ComPtr<sv::IConnectionPoint>, ComPtr<sv::IConnectionPoint>)>,
     component_initialized: bool,
     controller_initialized: bool,
-    active: bool,
-    processing: bool,
     max_frames: usize,
+    offline: bool,
     in_params: ComWrapper<ParamChanges>,
     out_params: ComWrapper<ParamChanges>,
     in_events: ComWrapper<EventList>,
@@ -1188,10 +1187,10 @@ pub(crate) struct Instance {
     bundle: Arc<Bundle>,
 }
 
-// SAFETY: an `Instance` is used through `&mut self` only, so calls into the plugin are always
-// serialised. SoundCraft creates instances on the engine/UI thread and then moves them into the
-// mix engine (documented limitation: VST3 expects `setActive`, controller calls etc. on the UI
-// thread; they may then happen on the audio thread).
+// SAFETY: the processor owner is used through `&mut self`. Shared editor/state handles protect
+// their lifetime with EditorLink's lock; timing handles additionally require the host's DSP
+// suspension barrier. Lifecycle flags and the paired timing cache are shared atomically.
+// Configuration and component activation remain control/UI-thread operations.
 unsafe impl Send for Instance {}
 
 impl Instance {
@@ -1336,18 +1335,28 @@ impl Instance {
         ok(unsafe { c.getParamStringByValue(id, normalized.clamp(0.0, 1.0), &mut s) }).then(|| read_c16(&s)).filter(|t| !t.is_empty())
     }
 
-    pub fn latency(&self) -> u32 {
-        // SAFETY: valid processor.
-        self.processor().map_or(0, |p| unsafe { p.getLatencySamples() })
+    pub fn timing(&self) -> (u32, u32) {
+        let value = self.editor.timing.load(Ordering::Acquire);
+        ((value >> 32) as u32, value as u32)
     }
 
-    pub fn tail(&self) -> u32 {
-        // SAFETY: valid processor.
-        self.processor().map_or(0, |p| unsafe { p.getTailSamples() })
+    pub fn check_timing(&self) -> Result<(), String> {
+        if self.editor.poisoned.load(Ordering::Acquire) {
+            Err("Plugin timing refresh failed; reload the plugin".into())
+        } else { Ok(()) }
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.editor.active.load(Ordering::Acquire) && !self.editor.poisoned.load(Ordering::Acquire)
+    }
+
+    pub fn is_offline(&self) -> bool { self.offline }
+    pub fn sample_rate(&self) -> f64 { self.context.sampleRate }
+
+    /// Control/UI thread only. A mode change requires setupProcessing before processing resumes.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.shutdown();
+        self.offline = offline;
     }
 
     fn bus_count(&self, media: sv::MediaTypes, dir: sv::BusDirections) -> i32 {
@@ -1380,6 +1389,7 @@ impl Instance {
     /// asked, falling back to stereo and then to the plugin's own choice), activates the main
     /// buses, sets up 32-bit processing and activates the component.
     pub fn configure(&mut self, sample_rate: f64, max_frames: usize, mono: bool) -> Result<Layout, Vst3Error> {
+        self.check_timing().map_err(Vst3Error::Process)?;
         self.shutdown();
         let audio = sv::MediaTypes_::kAudio;
         let event = sv::MediaTypes_::kEvent;
@@ -1438,7 +1448,7 @@ impl Instance {
         }
         let max = i32::try_from(max_frames).unwrap_or(i32::MAX);
         let mut setup = sv::ProcessSetup {
-            processMode: sv::ProcessModes_::kRealtime as i32,
+            processMode: if self.offline { sv::ProcessModes_::kOffline } else { sv::ProcessModes_::kRealtime } as i32,
             symbolicSampleSize: sample32,
             maxSamplesPerBlock: max,
             sampleRate: sample_rate,
@@ -1451,7 +1461,8 @@ impl Instance {
         if !ok(unsafe { self.component.setActive(1) }) {
             return Err(Vst3Error::Process("setActive failed".into()));
         }
-        self.active = true;
+        self.editor.active.store(true, Ordering::Release);
+        self.editor.configured.store(true, Ordering::Release);
         self.max_frames = max_frames;
         self.context.sampleRate = sample_rate;
         self.context.tempo = 120.0;
@@ -1461,24 +1472,26 @@ impl Instance {
         #[allow(clippy::unnecessary_cast)]
         let flags = (sv::ProcessContext_::StatesAndFlags_::kTempoValid | sv::ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
         self.context.state = flags;
-        self.host.latency_changed.store(false, Ordering::Relaxed);
+        // Consume configuration notifications before querying, retaining any new notification
+        // raised by a getter itself. These SDK calls run on the configuring control thread.
+        self.host.latency_changed.swap(false, Ordering::AcqRel);
+        self.editor.publish_timing(&p);
         Ok(layout)
     }
 
     /// `setProcessing(false)` + `setActive(false)` when needed.
     pub fn shutdown(&mut self) {
-        if self.processing {
+        if self.editor.processing.swap(false, Ordering::AcqRel) {
             if let Some(p) = self.processor() {
                 // SAFETY: valid processor in the processing state.
                 unsafe { p.setProcessing(0) };
             }
-            self.processing = false;
         }
-        if self.active {
+        if self.editor.active.swap(false, Ordering::AcqRel) {
             // SAFETY: valid, active component.
             unsafe { self.component.setActive(0) };
-            self.active = false;
         }
+        self.editor.configured.store(false, Ordering::Release);
     }
 
     /// Runs one `process` call over `frames` frames: `params` become one point each at offset 0,
@@ -1487,12 +1500,11 @@ impl Instance {
     /// `offset`.
     /// Stop and restart processing after a seek, keeping the controller and window alive.
     pub fn reset_processing(&mut self) {
-        if self.processing {
+        if self.editor.processing.swap(false, Ordering::AcqRel) {
             if let Some(p) = self.processor.as_ref() {
                 // SAFETY: processing thread owns this active processor; no process call is in flight.
                 unsafe { p.setProcessing(0); }
             }
-            self.processing = false;
         }
     }
 
@@ -1508,18 +1520,18 @@ impl Instance {
         project_time: i64,
         transport: Option<&Transport>,
     ) -> Result<(), Vst3Error> {
-        if !self.active {
+        self.check_timing().map_err(Vst3Error::Process)?;
+        if !self.editor.active.load(Ordering::Acquire) {
             return Err(Vst3Error::Process("not active".into()));
         }
         if frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
             return Err(Vst3Error::Process("block larger than the configured size".into()));
         }
         let p = self.processor.clone().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?;
-        if !self.processing {
+        if !self.editor.processing.swap(true, Ordering::AcqRel) {
             // Many plugins return kNotImplemented here; that is not an error.
             // SAFETY: valid, active processor.
             unsafe { p.setProcessing(1) };
-            self.processing = true;
         }
         self.in_params.clear();
         for &(id, v) in params.iter().take(PARAM_QUEUE_CAP) {
@@ -1549,7 +1561,7 @@ impl Instance {
             None => self.context.projectTimeSamples = project_time,
         }
         let mut data = sv::ProcessData {
-            processMode: sv::ProcessModes_::kRealtime as i32,
+            processMode: if self.offline { sv::ProcessModes_::kOffline } else { sv::ProcessModes_::kRealtime } as i32,
             symbolicSampleSize: sv::SymbolicSampleSizes_::kSample32 as i32,
             numSamples: i32::try_from(frames).unwrap_or(0),
             numInputs: i32::try_from(inputs.bufs.len()).unwrap_or(0),
@@ -1669,6 +1681,8 @@ fn rect_size(r: &sb::ViewRect) -> (f64, f64) {
 struct EditorInner {
     /// `None` once the instance is gone.
     component: Option<ComPtr<sv::IComponent>>,
+    processor: Option<ComPtr<sv::IAudioProcessor>>,
+    owner: Option<std::thread::ThreadId>,
     /// `None` once the instance is gone, or without an edit controller.
     controller: Option<ComPtr<sv::IEditController>>,
     view: Option<ComPtr<sb::IPlugView>>,
@@ -1682,12 +1696,77 @@ struct EditorInner {
 /// `getState` on the UI thread). All such calls happen under this lock, and the instance closes
 /// the view and drops the component and controller references under the same lock before it
 /// terminates, so a handle never calls into a dead plugin.
+/// Timing refresh additionally requires the host to suspend DSP; this mutex alone does not
+/// serialize the processing thread against control-thread SDK calls.
 #[derive(Default)]
 pub(crate) struct EditorLink {
     inner: Mutex<EditorInner>,
+    active: AtomicBool,
+    processing: AtomicBool,
+    configured: AtomicBool,
+    poisoned: AtomicBool,
+    timing: AtomicU64,
 }
 
 impl EditorLink {
+    fn publish_timing(&self, processor: &ComPtr<sv::IAudioProcessor>) {
+        // SAFETY: the caller runs on the control thread with no process call in flight.
+        let (latency, tail) = unsafe { (processor.getLatencySamples(), processor.getTailSamples()) };
+        self.timing.store((u64::from(latency) << 32) | u64::from(tail), Ordering::Release);
+    }
+
+    /// The host must hold its DSP suspension barrier until this call and cache application finish.
+    pub fn refresh_timing(&self, host: &HostContext) -> Result<(), String> {
+        let g = self.lock();
+        if g.owner != Some(std::thread::current().id()) {
+            return Err("Plugin timing must be read on its creating control thread".into());
+        }
+        let processor = g.processor.as_ref().ok_or("The plugin has been released")?;
+        let component = g.component.as_ref().ok_or("The plugin has been released")?;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err("Plugin timing refresh failed; reload the plugin".into());
+        }
+        if !self.configured.load(Ordering::Acquire) {
+            return Err("The plugin has not been configured".into());
+        }
+        if host.latency_changed.swap(false, Ordering::AcqRel) {
+            // SDK kLatencyChanged requires a stopped processing cycle and reactivation before
+            // querying the new latency. Shared flags keep the unique worker owner consistent.
+            if self.processing.swap(false, Ordering::AcqRel) {
+                // SAFETY: caller guarantees no process call is in flight.
+                let status = unsafe { processor.setProcessing(0) };
+                if !ok(status) && status != sb::kNotImplemented {
+                    self.processing.store(true, Ordering::Release);
+                    self.poisoned.store(true, Ordering::Release);
+                    host.latency_changed.store(true, Ordering::Release);
+                    return Err(format!("Cannot stop plugin processing for timing refresh ({status}); reload the plugin"));
+                }
+            }
+            if self.active.swap(false, Ordering::AcqRel) {
+                if !ok(unsafe { component.setActive(0) }) {
+                    // The failed transition may have left the component active. Keep teardown
+                    // responsible for a final deactivation attempt; poison blocks processing.
+                    self.active.store(true, Ordering::Release);
+                    self.poisoned.store(true, Ordering::Release);
+                    host.latency_changed.store(true, Ordering::Release);
+                    return Err("Cannot deactivate the plugin for timing refresh; reload the plugin".into());
+                }
+            }
+            if !ok(unsafe { component.setActive(1) }) {
+                self.active.store(true, Ordering::Release);
+                self.poisoned.store(true, Ordering::Release);
+                host.latency_changed.store(true, Ordering::Release);
+                return Err("Cannot reactivate the plugin for timing refresh; reload the plugin".into());
+            }
+            self.active.store(true, Ordering::Release);
+            // The completed activation cycle covers notifications generated by that cycle.
+            // Never clear after the getters: they may publish a newer restart request.
+            host.latency_changed.swap(false, Ordering::AcqRel);
+        }
+        self.publish_timing(processor);
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, EditorInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1936,6 +2015,7 @@ impl EditorLink {
             }
         }
         g.component = None;
+        g.processor = None;
         g.controller = None;
         leaked
     }

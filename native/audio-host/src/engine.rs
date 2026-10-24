@@ -1,14 +1,14 @@
 use crate::graph::{BLOCK, Graph, GraphError, LatencyChange, UiSlot, UnavailablePlugin};
 use crate::output::{self, Clock, Frame, Output};
-use crate::timeline::{PreparedMixUpdate, SessionSpec, prepare_mix_update};
+use crate::timeline::{PreparedMixUpdate, SessionSpec, monitor_mask, prepare_mix_update};
 use base64::Engine;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use rtrb::{Consumer, Producer};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,8 @@ enum Control {
     Play(u64, bool, u64),
     Pause,
     Seek(u64, u64),
-    Mix(SessionSpec, PreparedMixUpdate),
+    Mix(SessionSpec, PreparedMixUpdate, Sender<Result<(), String>>),
+    Monitor(Vec<String>, Sender<Result<(), String>>),
     Param(String, String, f64, f32),
     Params(Vec<(String, String, f64, f32)>),
     Barrier(Sender<Result<(), String>>, Arc<AtomicBool>),
@@ -27,6 +28,82 @@ enum Control {
 /// A capture owns the pause; releasing it cannot be blocked by a full command
 /// queue. In particular, an expired request must not leave a late barrier held.
 struct SnapshotPause(Arc<AtomicBool>);
+
+/// A rare stopped-worker timing handoff. The lock covers the control-thread SDK calls,
+/// so timeout/cancellation cannot let DSP resume concurrently with an in-flight query.
+pub(crate) struct TimingRequest {
+    active: Arc<Mutex<bool>>,
+    cancel: Arc<AtomicBool>,
+    deadline: Instant,
+    reply: Sender<Result<(), String>>,
+}
+
+impl TimingRequest {
+    fn service(self, refresh: impl FnOnce() -> Result<(), String>) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*active {
+            return;
+        }
+        if self.cancel.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            *active = false;
+            let error = if self.cancel.load(Ordering::Acquire) {
+                "Audio rendering cancelled"
+            } else {
+                "Plugin timing refresh timed out"
+            };
+            let _ = self.reply.try_send(Err(error.into()));
+            return;
+        }
+        let result = refresh();
+        *active = false;
+        let _ = self.reply.try_send(result);
+    }
+}
+
+fn request_timing_refresh(
+    events: &Sender<Event>,
+    cancel: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Audio rendering cancelled".into());
+    }
+    let active = Arc::new(Mutex::new(true));
+    let deadline = Instant::now() + timeout;
+    let (reply, completed) = bounded(1);
+    events
+        .try_send(Event::Timing(TimingRequest {
+            active: Arc::clone(&active),
+            cancel: Arc::clone(cancel),
+            deadline,
+            reply,
+        }))
+        .map_err(|_| "Plugin timing request queue is unavailable".to_string())?;
+    let result = loop {
+        if cancel.load(Ordering::Acquire) {
+            break Err("Audio rendering cancelled".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err("Plugin timing refresh timed out".into());
+        }
+        match completed.recv_timeout(remaining.min(Duration::from_millis(20))) {
+            Ok(result) => break result,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                break Err("Plugin timing response is unavailable".into());
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    // If service already entered the SDK, wait for it to leave even after a timeout.
+    // Otherwise invalidate the ticket before any late UI event can touch the processor.
+    *active.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    if cancel.load(Ordering::Acquire) {
+        Err("Audio rendering cancelled".into())
+    } else {
+        result
+    }
+}
 
 fn collect_editor_edits(id: &str, slot: &mut UiSlot, edits: &mut Vec<(String, String, f64, f32)>) {
     let Some(editor) = &mut slot.editor else {
@@ -73,6 +150,7 @@ impl Drop for SnapshotPause {
 
 pub(crate) enum Event {
     Failure(String),
+    Timing(TimingRequest),
     LatencyChanged {
         change: LatencyChange,
         graph_revision: u64,
@@ -88,6 +166,9 @@ struct Meter {
 pub(crate) struct Session {
     pub spec: SessionSpec,
     pub sample_rate: u32,
+    offline: bool,
+    rendering: bool,
+    ffmpeg: PathBuf,
     tx: Sender<Control>,
     pub events: Receiver<Event>,
     clock: Arc<Clock>,
@@ -106,6 +187,7 @@ pub(crate) struct Session {
     transport_playing: bool,
     graph_revision: u64,
     unavailable_plugins: Vec<UnavailablePlugin>,
+    suppressed_track_ids: Vec<String>,
 }
 
 fn session_id() -> String {
@@ -122,14 +204,28 @@ fn session_id() -> String {
 }
 
 impl Session {
+    #[cfg(test)]
     pub fn load(spec: SessionSpec, ffmpeg: PathBuf) -> Result<Self, String> {
+        Self::load_mode(spec, ffmpeg, false)
+    }
+
+    pub fn load_mode(spec: SessionSpec, ffmpeg: PathBuf, offline: bool) -> Result<Self, String> {
         use cpal::traits::{DeviceTrait, HostTrait};
         let rate = cpal::default_host()
             .default_output_device()
             .and_then(|d| d.default_output_config().ok())
             .map(|c| c.sample_rate())
             .unwrap_or(48000);
-        let (graph, ui) = Graph::load(spec.clone(), ffmpeg, rate)?;
+        Self::load_at_rate(spec, ffmpeg, rate, offline)
+    }
+
+    fn load_at_rate(
+        spec: SessionSpec,
+        ffmpeg: PathBuf,
+        rate: u32,
+        offline: bool,
+    ) -> Result<Self, String> {
+        let (graph, ui) = Graph::load_mode(spec.clone(), ffmpeg.clone(), rate, offline)?;
         let unavailable_plugins = graph.unavailable_plugins.clone();
         let clock = Arc::new(Clock::default());
         let meters: Arc<Vec<Meter>> = Arc::new(
@@ -171,6 +267,9 @@ impl Session {
         Ok(Self {
             spec,
             sample_rate: rate,
+            offline,
+            rendering: false,
+            ffmpeg,
             tx,
             events,
             clock,
@@ -189,6 +288,7 @@ impl Session {
             transport_playing: false,
             graph_revision: 0,
             unavailable_plugins,
+            suppressed_track_ids: Vec::new(),
         })
     }
 
@@ -216,13 +316,20 @@ impl Session {
             .collect();
         json!({ "projectId": self.spec.id, "sessionId": self.session_id, "stateRevision": self.state_revision,
             "openEditors": self.open_editors(), "unavailablePlugins": self.unavailable_plugins, "position": self.clock.position() as f64 / f64::from(self.sample_rate),
-            "duration": self.spec.duration(), "sampleRate": self.sample_rate,
+            "duration": self.spec.duration(), "sampleRate": self.sample_rate, "offline": self.offline,
             "playing": self.playback_intent(), "recovering": self.clock.recovering.load(Ordering::Acquire), "levels": levels,
             "masterLevel": [f32::from_bits(self.master_meter.left.load(Ordering::Relaxed)), f32::from_bits(self.master_meter.right.load(Ordering::Relaxed))],
-            "loop": self.looping, "underruns": self.clock.underruns.load(Ordering::Relaxed), "error": self.error })
+            "loop": self.looping, "suppressedTrackIds": self.suppressed_track_ids,
+            "underruns": self.clock.underruns.load(Ordering::Relaxed), "error": self.error })
     }
 
     pub fn play(&mut self, position: f64, looping: bool) -> Result<Value, String> {
+        if self.offline {
+            return Err(
+                "Offline sessions cannot play to an audio device; reload the project for preview"
+                    .into(),
+            );
+        }
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -346,6 +453,11 @@ impl Session {
     }
 
     pub fn idle(&mut self) {
+        // A render worker can be awaiting a control-thread timing reply. AU close/capture
+        // housekeeping may synchronously wait for that same worker; defer it until export ends.
+        if self.rendering {
+            return;
+        }
         if self.clock.device_failed.swap(false, Ordering::AcqRel) {
             let _ = self.send(Control::Pause);
             self.fail("Audio output device failed. Reload the project to reconnect".into());
@@ -425,8 +537,19 @@ impl Session {
     }
 
     pub fn update_mix(&mut self, spec: SessionSpec) -> Result<Value, String> {
-        let prepared = prepare_mix_update(spec.clone(), self.sample_rate)?;
-        self.send(Control::Mix(spec.clone(), prepared))?;
+        let prepared = prepare_mix_update(spec.clone(), self.sample_rate, Some(&self.spec))?;
+        let (reply, applied) = bounded(1);
+        self.send(Control::Mix(spec.clone(), prepared, reply))?;
+        // Admit one prepared update at a time. Large effect histories must not
+        // accumulate in the command queue behind a slow or blocked processor.
+        let result = applied
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Audio processing did not apply the mix update".to_string())
+            .and_then(|result| result);
+        if let Err(error) = result {
+            self.fail(error.clone());
+            return Err(error);
+        }
         if self
             .spec
             .slots()
@@ -437,6 +560,28 @@ impl Session {
             self.latency_recovery_used = false;
         }
         self.spec = spec;
+        Ok(self.status())
+    }
+
+    pub fn suppressed_track_ids(&self) -> &[String] {
+        &self.suppressed_track_ids
+    }
+
+    /// A transient monitor update affects subsequent rendering, without changing project mute
+    /// flags or transport. Recording starts a fresh playback epoch after this acknowledgement.
+    pub fn monitor(&mut self, ids: Vec<String>) -> Result<Value, String> {
+        monitor_mask(&self.spec, &ids)?;
+        let (reply, applied) = bounded(1);
+        self.send(Control::Monitor(ids.clone(), reply))?;
+        let result = applied
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Audio processing did not apply the monitor update".to_string())
+            .and_then(|result| result);
+        if let Err(error) = result {
+            self.fail(error.clone());
+            return Err(error);
+        }
+        self.suppressed_track_ids = ids;
         Ok(self.status())
     }
 
@@ -452,8 +597,39 @@ impl Session {
     }
 
     pub fn start_render(&mut self, path: PathBuf) -> Result<(), String> {
+        if !self.offline {
+            return Err("Rendering requires an offline session".into());
+        }
         self.pause()?;
-        self.send(Control::Render(path))
+        self.send(Control::Render(path))?;
+        self.rendering = true;
+        Ok(())
+    }
+
+    pub(crate) fn finish_render(&mut self) {
+        self.rendering = false;
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.offline
+    }
+
+    /// Build on the helper UI thread: plugin setup/state APIs must not run on the DSP worker.
+    /// The preview graph and its controllers retain their mode and ownership.
+    pub fn offline_copy(&mut self) -> Result<Self, String> {
+        self.pause()?;
+        let snapshot = self.snapshot()?;
+        let mut spec = self.spec.clone();
+        for slot in spec.plugin_chain.iter_mut().chain(
+            spec.tracks
+                .iter_mut()
+                .flat_map(|track| &mut track.plugin_chain),
+        ) {
+            if let Some(state) = snapshot["states"].get(&slot.id).and_then(Value::as_str) {
+                slot.state = Some(state.into());
+            }
+        }
+        Self::load_at_rate(spec, self.ffmpeg.clone(), self.sample_rate, true)
     }
 
     pub fn open_editors(&self) -> Vec<String> {
@@ -498,8 +674,8 @@ impl Session {
         }
         if self.latency_recovery_used {
             return Err(format!(
-                "Plugin latency remained unstable after automatic recovery ({}: {} to {} samples). Reload the project before retrying",
-                change.slot, change.previous, change.current
+                "Plugin latency remained unstable after automatic recovery ({}; previous latency {} samples). Reload the project before retrying",
+                change.slot, change.previous
             ));
         }
         self.latency_recovery_used = true;
@@ -522,6 +698,10 @@ impl Session {
         }
         let looping = self.looping;
         let seconds = position as f64 / f64::from(self.sample_rate);
+        {
+            let _pause = SnapshotPause::acquire(&self.tx, Duration::from_secs(5))?;
+            self.refresh_timing()?;
+        }
         let (reply, completed) = bounded(1);
         self.send(Control::Renegotiate(reply))?;
         self.graph_revision = completed
@@ -538,6 +718,32 @@ impl Session {
             self.seek(seconds)?;
         }
         Ok(())
+    }
+
+    /// Called only after a capture barrier or while the render worker awaits this ticket.
+    fn refresh_timing(&mut self) -> Result<(), String> {
+        for (id, slot) in &mut self.ui {
+            if let Some(reader) = &mut slot.timing {
+                // A getter can publish a fresh restart after returning its previous value.
+                // Complete one further cycle while DSP remains stopped; bound noisy plugins.
+                for _ in 0..2 {
+                    reader.refresh().map_err(|error| format!("{id}: {error}"))?;
+                    if !reader.is_pending() {
+                        break;
+                    }
+                }
+                if reader.is_pending() {
+                    return Err(format!(
+                        "Plugin timing remained unstable ({id}); reload the plugin"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn service_timing(&mut self, request: TimingRequest) {
+        request.service(|| self.refresh_timing());
     }
 }
 
@@ -559,18 +765,44 @@ impl Drop for Session {
     }
 }
 
-fn render_file(graph: &mut Graph, path: PathBuf, cancel: &AtomicBool) -> Result<Value, String> {
+fn render_file(
+    graph: &mut Graph,
+    path: PathBuf,
+    cancel: &AtomicBool,
+    refresh: &mut impl FnMut() -> Result<(), String>,
+) -> Result<Value, String> {
+    if !graph.is_offline() {
+        return Err("Rendering requires offline plugin configuration".into());
+    }
+    let suppressed = graph.suppressed_track_ids();
+    graph.set_monitor(&[])?;
+    let result = render_unmasked_file(graph, path, cancel, refresh);
+    let restored = graph.set_monitor(&suppressed);
+    graph.reset();
+    match (result, restored) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+fn render_unmasked_file(
+    graph: &mut Graph,
+    path: PathBuf,
+    cancel: &AtomicBool,
+    refresh: &mut impl FnMut() -> Result<(), String>,
+) -> Result<Value, String> {
     if !path.is_absolute() || path.exists() {
         return Err("Render output must be a new absolute path".into());
     }
     // Apply pending edits before querying control-only latency/tail properties. Rebuild PDC
     // on these same instances, then run the startup probes against the refreshed timings.
-    graph.renegotiate_latency()?;
+    refresh_render_timing(graph, refresh)?;
     let started = Instant::now();
     // Detect parameter/startup latency changes before creating an output file.
     // These trial blocks are reset and never advance the final render.
     let mut trial = 0;
-    let mut renegotiated = false;
+    let mut renegotiated = HashSet::new();
     while trial < 2 {
         loop {
             if cancel.load(Ordering::Acquire) {
@@ -585,9 +817,10 @@ fn render_file(graph: &mut Graph, path: PathBuf, cancel: &AtomicBool) -> Result<
                     thread::sleep(Duration::from_millis(2))
                 }
                 Ok(false) => return Err("Audio decoder timed out during render preparation".into()),
-                Err(GraphError::LatencyChanged(_)) if !renegotiated => {
-                    graph.renegotiate_latency()?;
-                    renegotiated = true;
+                Err(GraphError::LatencyChanged(change))
+                    if renegotiated.insert(change.slot.clone()) =>
+                {
+                    refresh_render_timing(graph, refresh)?;
                     trial = 0;
                 }
                 Err(error) => {
@@ -600,7 +833,7 @@ fn render_file(graph: &mut Graph, path: PathBuf, cancel: &AtomicBool) -> Result<
     }
     // Some processors expose their new tail only after processing. Capture it after the
     // successful probes and before reset; querying after reset could discard startup timing.
-    graph.renegotiate_latency()?;
+    refresh_render_timing(graph, refresh)?;
     let handle = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -674,6 +907,15 @@ fn render_file(graph: &mut Graph, path: PathBuf, cancel: &AtomicBool) -> Result<
     )
 }
 
+fn refresh_render_timing(
+    graph: &mut Graph,
+    refresh: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    graph.flush_params()?;
+    refresh()?;
+    graph.renegotiate_latency()
+}
+
 fn process(
     mut graph: Graph,
     commands: Receiver<Control>,
@@ -740,12 +982,26 @@ fn process(
                         }
                     }
                 }
-                Control::Mix(spec, prepared) => {
-                    if let Err(e) = graph.update_mix(spec, prepared) {
-                        let _ = events.try_send(Event::Failure(e));
+                Control::Mix(spec, prepared, reply) => {
+                    let result = graph.update_mix(spec, prepared);
+                    if let Err(e) = &result {
+                        let _ = events.try_send(Event::Failure(e.clone()));
                         active = false;
                         clock.finish(generation);
                     }
+                    let _ = reply.try_send(result);
+                }
+                Control::Monitor(ids, reply) => {
+                    let result = graph.set_monitor(&ids);
+                    if result.is_ok() {
+                        for (meter, suppressed) in meters.iter().zip(graph.monitor_mask()) {
+                            if *suppressed {
+                                meter.left.store(0, Ordering::Relaxed);
+                                meter.right.store(0, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let _ = reply.try_send(result);
                 }
                 Control::Barrier(reply, hold) => {
                     suspended = Some(hold);
@@ -764,7 +1020,9 @@ fn process(
                 }
                 Control::Render(path) => {
                     active = false;
-                    let result = render_file(&mut graph, path, &cancel);
+                    let result = render_file(&mut graph, path, &cancel, &mut || {
+                        request_timing_refresh(&events, &cancel, Duration::from_secs(5))
+                    });
                     let _ = events.try_send(Event::Render(result));
                 }
             }
@@ -872,6 +1130,236 @@ fn process(
 mod tests {
     use super::*;
 
+    #[test]
+    fn expired_timing_tickets_never_call_back_into_a_resumed_processor() {
+        let (events, received) = bounded(1);
+        assert!(
+            request_timing_refresh(&events, &Arc::new(AtomicBool::new(false)), Duration::ZERO)
+                .unwrap_err()
+                .contains("timed out")
+        );
+        let Event::Timing(request) = received.recv().unwrap() else {
+            panic!("Expected one timing request");
+        };
+        request.service(|| panic!("An expired ticket must not query the plugin"));
+        // An already cancelled worker does not publish another ticket.
+        assert!(
+            request_timing_refresh(
+                &events,
+                &Arc::new(AtomicBool::new(true)),
+                Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .contains("cancelled")
+        );
+        assert!(received.is_empty());
+        events
+            .send(Event::Failure("earlier failure".into()))
+            .unwrap();
+        assert!(
+            request_timing_refresh(
+                &events,
+                &Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .contains("queue is unavailable")
+        );
+    }
+
+    #[test]
+    fn timing_handoff_propagates_native_errors_and_abandoned_responses() {
+        for respond in [true, false] {
+            let (events, received) = bounded(1);
+            let worker = thread::spawn(move || {
+                request_timing_refresh(
+                    &events,
+                    &Arc::new(AtomicBool::new(false)),
+                    Duration::from_secs(1),
+                )
+            });
+            let Event::Timing(request) = received.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("Expected one timing request");
+            };
+            if respond {
+                request.service(|| Err("effect: native activation failed".into()));
+            } else {
+                drop(request);
+            }
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.contains(if respond {
+                "native activation failed"
+            } else {
+                "response is unavailable"
+            }));
+        }
+    }
+
+    #[test]
+    fn timing_service_checks_deadline_and_cancellation_before_worker_invalidation() {
+        for cancelled in [false, true] {
+            let active = Arc::new(Mutex::new(true));
+            let (reply, completed) = bounded(1);
+            let request = TimingRequest {
+                active: Arc::clone(&active),
+                cancel: Arc::new(AtomicBool::new(cancelled)),
+                deadline: Instant::now()
+                    + if cancelled {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::ZERO
+                    },
+                reply,
+            };
+            request.service(|| panic!("The ticket must expire without entering the SDK"));
+            let error = completed.recv().unwrap().unwrap_err();
+            assert!(error.contains(if cancelled { "cancelled" } else { "timed out" }));
+            assert!(!*active.lock().unwrap());
+        }
+    }
+
+    #[test]
+    fn timing_handoff_cancels_promptly_and_invalidates_a_queued_ui_request() {
+        let (events, received) = bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let worker =
+            thread::spawn(move || request_timing_refresh(&events, &stop, Duration::from_secs(30)));
+        let Event::Timing(request) = received.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("Expected one timing request");
+        };
+        let started = Instant::now();
+        cancel.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        request.service(|| panic!("A cancelled ticket must not query the plugin"));
+    }
+
+    #[test]
+    fn timing_cancellation_cannot_resume_dsp_until_an_inflight_ui_query_finishes() {
+        let (events, received) = bounded(1);
+        let (result, completed) = bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            let outcome = request_timing_refresh(&events, &stop, Duration::from_secs(30));
+            result.send(outcome).unwrap();
+        });
+        let Event::Timing(request) = received.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("Expected one timing request");
+        };
+        let (entered, reading) = bounded(1);
+        let (release, released) = bounded(1);
+        let ui = thread::spawn(move || {
+            request.service(|| {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            });
+        });
+        reading.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel.store(true, Ordering::Release);
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            completed.try_recv().is_err(),
+            "DSP must remain stopped during the query"
+        );
+        release.send(()).unwrap();
+        ui.join().unwrap();
+        assert!(
+            completed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn monitor_acknowledgement_commits_only_applied_transient_state() {
+        let spec: SessionSpec =
+            serde_json::from_value(json!({"id":"monitor", "name":"Audio", "sources":[],
+            "tracks":[{"id":"voice","clips":[]},{"id":"backing","clips":[]}]}))
+            .unwrap();
+        let saved = serde_json::to_value(&spec).unwrap();
+        let mut session = Session::load(spec, "ffmpeg".into()).unwrap();
+        assert!(session.monitor(vec!["missing".into()]).is_err());
+        assert!(session.suppressed_track_ids().is_empty());
+        assert!(session.error.is_none());
+        let before_revision = session.state_revision;
+        let status = session.monitor(vec!["voice".into()]).unwrap();
+        assert_eq!(status["suppressedTrackIds"], json!(["voice"]));
+        assert_eq!(session.state_revision, before_revision);
+        assert_eq!(serde_json::to_value(&session.spec).unwrap(), saved);
+        let (commands, receives) = bounded(1);
+        session.tx = commands;
+        let rejected = thread::spawn(move || match receives.recv().unwrap() {
+            Control::Monitor(_, reply) => reply
+                .send(Err("Monitor update was rejected".into()))
+                .unwrap(),
+            _ => panic!("Expected one monitor command"),
+        });
+        assert!(session.monitor(vec!["backing".into()]).is_err());
+        rejected.join().unwrap();
+        assert_eq!(session.suppressed_track_ids(), ["voice"]);
+        assert_eq!(serde_json::to_value(&session.spec).unwrap(), saved);
+    }
+
+    #[test]
+    fn realtime_graph_cannot_render_or_mutate_its_preview_mask() {
+        let spec: SessionSpec = serde_json::from_value(json!({"id":"preview","name":"Audio",
+            "sources":[],"tracks":[{"id":"voice","clips":[]}]}))
+        .unwrap();
+        let (mut graph, _) = Graph::load(spec, "ffmpeg".into(), 8000).unwrap();
+        graph.set_monitor(&["voice".into()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("preview.wav");
+        let error = render_file(
+            &mut graph,
+            output.clone(),
+            &AtomicBool::new(false),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("offline plugin configuration"));
+        assert!(!output.exists());
+        assert_eq!(graph.suppressed_track_ids(), ["voice"]);
+    }
+
+    #[test]
+    fn cancelled_or_invalid_offline_export_restores_preview_monitor() {
+        let spec: SessionSpec =
+            serde_json::from_value(json!({"id":"monitor", "name":"Audio", "sources":[],
+            "tracks":[{"id":"voice","clips":[]},{"id":"backing","clips":[]}]}))
+            .unwrap();
+        let saved = serde_json::to_value(&spec).unwrap();
+        let (mut graph, _) = Graph::load_mode(spec, "ffmpeg".into(), 8000, true).unwrap();
+        graph.set_monitor(&["voice".into()]).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("cancelled.wav");
+        assert!(
+            render_file(&mut graph, output.clone(), &cancelled, &mut || Ok(()))
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert!(!output.exists());
+        assert_eq!(graph.suppressed_track_ids(), ["voice"]);
+        assert!(
+            render_file(
+                &mut graph,
+                "relative.wav".into(),
+                &cancelled,
+                &mut || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(graph.suppressed_track_ids(), ["voice"]);
+        assert_eq!(serde_json::to_value(&graph.spec).unwrap(), saved);
+    }
+
     struct ParameterController;
     impl soundcraft_dsp::PluginEditor for ParameterController {
         fn open(&mut self) -> Result<(), String> {
@@ -948,6 +1436,7 @@ mod tests {
                     delivered: false,
                 })),
                 reader: None,
+                timing: None,
                 values: HashMap::from([("gain".into(), 0.5)]),
                 plain_values: HashMap::from([("gain".into(), 1.0)]),
                 was_open: true,
@@ -961,6 +1450,70 @@ mod tests {
         session.idle();
         assert_eq!(session.state_revision, before + 2);
     }
+
+    #[test]
+    fn exporting_defers_au_close_barriers_until_timing_tickets_have_finished() {
+        use soundcraft_dsp::{Category, PluginInfo};
+        static INFO: PluginInfo = PluginInfo {
+            id: "effect",
+            name: "Effect",
+            short_name: "Effect",
+            category: Category::Other,
+            is_instrument: false,
+            audiosuite: true,
+            params: &[],
+        };
+        let spec: SessionSpec = serde_json::from_value(json!({"id":"export-close","name":"Audio",
+            "sources":[],"tracks":[]}))
+        .unwrap();
+        let mut session = Session::load_at_rate(spec, "ffmpeg".into(), 8000, true).unwrap();
+        session.ui.insert(
+            "slot".into(),
+            UiSlot {
+                format: "au".into(),
+                info: &INFO,
+                editor: Some(Box::new(FinalValueController {
+                    closed: false,
+                    delivered: false,
+                })),
+                reader: None,
+                timing: None,
+                values: HashMap::from([("gain".into(), 0.5)]),
+                plain_values: HashMap::from([("gain".into(), 1.0)]),
+                was_open: true,
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("export.wav");
+        session.start_render(output.clone()).unwrap();
+        let mut queries = 0;
+        loop {
+            match session.events.recv_timeout(Duration::from_secs(1)).unwrap() {
+                Event::Timing(request) => {
+                    let started = Instant::now();
+                    session.idle();
+                    assert!(started.elapsed() < Duration::from_secs(1));
+                    assert_eq!(session.ui["slot"].plain_values["gain"], 1.0);
+                    session.service_timing(request);
+                    queries += 1;
+                }
+                Event::Render(result) => {
+                    result.unwrap();
+                    session.finish_render();
+                    break;
+                }
+                _ => panic!("Unexpected export event"),
+            }
+        }
+        assert_eq!(
+            queries, 2,
+            "Both preflight and post-probe replies must complete"
+        );
+        assert!(output.is_file());
+        session.idle();
+        assert_eq!(session.ui["slot"].plain_values["gain"], 2.0);
+    }
+
     impl soundcraft_dsp::PluginEditor for ClosingController {
         fn open(&mut self) -> Result<(), String> {
             Ok(())
@@ -1016,6 +1569,7 @@ mod tests {
                     closed: Arc::clone(&closed),
                 })),
                 reader: None,
+                timing: None,
                 values: HashMap::new(),
                 plain_values: HashMap::new(),
                 was_open: true,
@@ -1060,6 +1614,7 @@ mod tests {
                 info: &INFO,
                 editor: Some(Box::new(ParameterController)),
                 reader: None,
+                timing: None,
                 values: HashMap::from([("gain".into(), 0.5)]),
                 plain_values: HashMap::from([("gain".into(), 1.0)]),
                 was_open: false,
@@ -1158,7 +1713,6 @@ mod tests {
                 LatencyChange {
                     slot: "processor".into(),
                     previous: 3,
-                    current: 11,
                 },
                 0,
             )
@@ -1177,7 +1731,6 @@ mod tests {
                 LatencyChange {
                     slot: "processor".into(),
                     previous: 3,
-                    current: 11,
                 },
                 0,
             )
@@ -1202,5 +1755,20 @@ mod tests {
         session.clock.recovering.store(false, Ordering::Release);
         session.fail("Plugin processing failed".into());
         assert!(!session.can_update_in_place(&spec));
+    }
+
+    #[test]
+    fn rejected_worker_mix_does_not_commit_a_different_session_spec() {
+        let spec: SessionSpec =
+            serde_json::from_value(json!({"id":"ack", "name":"Audio", "sources":[], "tracks":[]}))
+                .unwrap();
+        let mut session = Session::load(spec.clone(), "ffmpeg".into()).unwrap();
+        let next: SessionSpec = serde_json::from_value(json!({"id":"ack", "name":"Audio",
+            "sources":[{"id":"unused", "path":"", "duration":0}], "tracks":[]}))
+        .unwrap();
+        let error = session.update_mix(next).unwrap_err();
+        assert!(error.contains("reload"));
+        assert!(session.spec.sources.is_empty());
+        assert!(session.error.is_some());
     }
 }

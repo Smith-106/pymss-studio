@@ -78,8 +78,8 @@ export function pluginProjectVersion(project: EditorSession) {
   return hasEditorPlugins(project) ? 4 : 3
 }
 
-export function pluginProjectBlockReason(project: EditorSession, formats: readonly string[] = ['vst3', 'vst2', 'au']): 'effects' | 'format' | null {
-  if (project.tracks.some(track => ['reverb', 'delay', 'clarity', 'compressor'].some(key =>
+export function pluginProjectBlockReason(project: EditorSession, formats: readonly string[] = ['vst3', 'vst2', 'au'], builtinEffects = false): 'effects' | 'format' | null {
+  if (!builtinEffects && project.tracks.some(track => ['reverb', 'delay', 'clarity', 'compressor'].some(key =>
     Number(track.effects?.[key as keyof NonNullable<typeof track.effects>] || 0) > 0))) return 'effects'
   if (projectPluginSlots(project).some(slot => !slot.bypassed && !formats.includes(slot.format))) return 'format'
   return null
