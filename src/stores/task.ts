@@ -90,6 +90,8 @@ export type SeparationTask = {
   progressDetail?: string
   files: string[]
   outputs: StemOutput[]
+  /** Plugin graph leaf values (ASR text, measurements, MIDI paths) by node. */
+  nodeValues?: { nodeId: number; nodeType: string; slot: number; value: string }[]
   logs: string[]
   error?: string
   runConfig?: SeparationRunConfig
@@ -1438,6 +1440,7 @@ export const useTaskStore = defineStore('task', () => {
       task.progressTotal = undefined
       task.progressDetail = undefined
       task.files = event.payload?.files || []
+      if (Array.isArray(event.payload?.nodeValues)) task.nodeValues = event.payload.nodeValues
       if (event.payload?.outputDir) {
         task.output = event.payload.outputDir
         if (task.runConfig?.outputLayout === 'flat') task.jobOutput = event.payload.outputDir

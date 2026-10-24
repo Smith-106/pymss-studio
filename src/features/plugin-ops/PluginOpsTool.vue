@@ -6,14 +6,16 @@
  * file inputs, number/enum/boolean/string params generated from the
  * OperationSpec. One shared implementation — no per-plugin Vue code.
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
+import { pluginRevision } from '../plugin-marketplace/composable'
 import { usePluginOps, type OperationParamSchema, type OperationSpec } from '../plugin-ops/composable'
 
 const { t } = useI18n()
 const message = useMessage()
 const { state, loading, error, refresh, run } = usePluginOps()
+watch(pluginRevision, refresh)
 
 const selectedId = ref('')
 const selected = computed<OperationSpec | null>(
@@ -37,7 +39,7 @@ watch(selected, (spec) => {
   }
 })
 
-onMounted(refresh)
+onActivated(refresh)
 
 async function execute() {
   if (!selected.value || running.value) return
@@ -77,13 +79,13 @@ async function reveal(path?: string) {
 
 <template>
   <div class="plugin-ops-tool">
-    <n-empty v-if="!loading && !state.available" :description="state.unavailableReason || t('pluginOps.unavailable')" />
+    <n-empty v-if="!loading && !state.available" :description="state.unavailableReason || t('tools.pluginOps.unavailable')" />
     <n-spin v-else-if="loading" class="plugin-ops-loading" />
     <template v-else-if="state.specs.length">
       <n-select
         v-model:value="selectedId"
         :options="state.specs.map((s: OperationSpec) => ({ label: s.title || s.id, value: s.id }))"
-        :placeholder="t('pluginOps.selectOperation')"
+        :placeholder="t('tools.pluginOps.selectOperation')"
         filterable
         class="plugin-ops-select"
       />
@@ -91,10 +93,10 @@ async function reveal(path?: string) {
         <p v-if="selected.description" class="plugin-ops-description">{{ selected.description }}</p>
 
         <div v-for="(schema, name) in selected.inputs" :key="`in-${name}`" class="plugin-ops-field">
-          <label v-if="schema.type === 'audio'">{{ t('pluginOps.audioInput', { name }) }}</label>
+          <label v-if="schema.type === 'audio'">{{ t('tools.pluginOps.audioInput', { name }) }}</label>
           <n-input
             v-model:value="fileInputs[name]"
-            :placeholder="t('pluginOps.filePath')"
+            :placeholder="t('tools.pluginOps.filePath')"
             clearable
           />
         </div>
@@ -118,7 +120,7 @@ async function reveal(path?: string) {
         </div>
 
         <n-button type="primary" :loading="running" :disabled="!selectedId" @click="execute">
-          {{ t('pluginOps.run') }}
+          {{ t('tools.pluginOps.run') }}
         </n-button>
 
         <n-alert v-if="runError" type="error" class="plugin-ops-error">{{ runError }}</n-alert>
@@ -132,7 +134,7 @@ async function reveal(path?: string) {
         </div>
       </template>
     </template>
-    <n-empty v-else :description="t('pluginOps.noOperations')" />
+    <n-empty v-else :description="t('tools.pluginOps.noOperations')" />
     <n-alert v-if="error" type="warning" class="plugin-ops-error">{{ error }}</n-alert>
   </div>
 </template>

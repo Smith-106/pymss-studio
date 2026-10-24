@@ -24,7 +24,8 @@
     "settings": "Settings",
     "workflows": "Workflows",
     "workflow-node-editor": "Node Editor",
-    "debug": "Debug"
+    "debug": "Debug",
+    "plugins": "Plugins"
   },
   "common": {
     "cancel": "Cancel",
@@ -55,7 +56,9 @@
     "loop": "Loop",
     "reset": "Back to start",
     "continueUsing": "Keep Using",
-    "copy": "Copy"
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Copy failed"
   },
   "tools": {
     "title": "Tools",
@@ -373,8 +376,10 @@
       "filePath": "Audio file path",
       "run": "Run"
     },
-    "pluginOpsTitle": "Plugin operations",
-    "pluginOpsDescription": "Run operations contributed by pymss plugins (loudness, analysis, custom processing)."
+    "categoryPlugins": "Plugins",
+    "midiModelAuto": "Auto (download on first use)",
+    "midiModelAutoHint": "Apple Silicon: gamemlx medium model downloads automatically",
+    "midiModelUseAuto": "Use auto model"
   },
   "separate": {
     "subtitle": "Configure input audio, the separation model, and output options to start a task.",
@@ -854,7 +859,8 @@
     "removeFilesConfirmContentSingle": "{failed} of {total} output file(s) could not be moved to trash. Remove this item from the results list anyway?",
     "removeFilesConfirmContentMultiple": "{failed} of {total} output file(s) could not be moved to trash. Remove these items from the results list anyway?",
     "removeFilesKeptSingle": "The result was kept so you can retry file deletion later.",
-    "removeFilesKeptMultiple": "The results were kept so you can retry file deletion later."
+    "removeFilesKeptMultiple": "The results were kept so you can retry file deletion later.",
+    "nodeValues": "Node outputs"
   },
   "projects": {
     "blankProject": "Blank Project",
@@ -1728,7 +1734,8 @@
         "output": "Output",
         "audioTools": "Audio Tools",
         "string": "String",
-        "builtin": "Built-in"
+        "builtin": "Built-in",
+        "plugins": "Plugins"
       },
       "nodes": {
         "input_audio": "Input Audio",
@@ -1769,7 +1776,21 @@
         "StringFormat": "Format String",
         "RegexReplace": "Regex Replace",
         "RegexExtract": "Regex Extract",
-        "JsonExtractString": "Extract JSON String"
+        "JsonExtractString": "Extract JSON String",
+        "AnalysisMeasureLUFS": "Measure Loudness (LUFS)",
+        "AnalysisTruePeak": "Measure True Peak",
+        "AnalysisRMS": "Measure RMS",
+        "AsrTranscribe": "Speech to Text",
+        "DynamicsCompressor": "Compressor",
+        "DynamicsLimiter": "Limiter",
+        "DynamicsDeEsser": "De-esser",
+        "GameVocalToMidi": "Vocal to MIDI (GAME)",
+        "NormalizeLUFS": "Normalize Loudness (LUFS)",
+        "SpectralHighpass": "Highpass Filter",
+        "SpectralLowpass": "Lowpass Filter",
+        "SpectralPeakEQ": "Peak EQ",
+        "TimingPitchShift": "Pitch Shift",
+        "TimingTimeStretch": "Time Stretch"
       },
       "fields": {
         "invertedAudio": "Inverted Audio",
@@ -1926,5 +1947,51 @@
     "metricLinks": "Links",
     "inputSlots": "Runtime input slots",
     "comfyReadOnlyHint": "Advanced (comfy) workflows are free-form; this page shows a read-only overview. Edit the graph in the advanced editor; the inference page uses the shared input-file list."
+  },
+  "plugins": {
+    "title": "Plugin marketplace",
+    "subtitle": "Discover audio extensions and manage plugins for your current runtime.",
+    "installSource": "Install from source",
+    "refresh": "Refresh",
+    "runtimeRequired": "Install and activate a runtime in Settings to use plugins.",
+    "runtimeScope": "Current runtime",
+    "search": "Search names, descriptions, and tags",
+    "checkUpdates": "Check for updates",
+    "runOperations": "Run plugin operations",
+    "browse": "Browse",
+    "installed": "Installed",
+    "install": "Install",
+    "uninstall": "Uninstall",
+    "update": "Update",
+    "repair": "Repair dependencies",
+    "catalogUnavailable": "The plugin catalog is unavailable. Installed plugins can still be managed.",
+    "noMatches": "No matching plugins",
+    "installedHint": "These plugins and their additional dependencies belong to the current runtime. Existing manually installed pymss plugins remain available through plugin operations.",
+    "loaded": "Loaded",
+    "loadFailed": "Load failed",
+    "updateAvailable": "Update available: {version}",
+    "upToDate": "Up to date",
+    "operationCount": "{count} operations available",
+    "noOperations": "This plugin loaded successfully and contributes no generic operations.",
+    "noInstalled": "No marketplace plugins installed in this runtime yet",
+    "working": "Managing plugins: {name}",
+    "operationLog": "Plugin activity",
+    "showLog": "Show log",
+    "hideLog": "Hide log",
+    "sourceHint": "Enter a plugin name, a Git repository URL, or choose a local plugin folder. Repository subfolders use URL#path/to/plugin.",
+    "sourcePlaceholder": "loudnorm, https://github.com/author/plugin, or a local folder",
+    "chooseFolder": "Choose plugin folder",
+    "installTitle": "Install plugin",
+    "installConfirm": "Install {source} into the current runtime? The plugin runs Python code with your user permissions. Core runtime packages are kept unchanged.",
+    "uninstallConfirm": "Remove {name} and its additional dependencies from this runtime?",
+    "actionComplete": "Plugin operation completed",
+    "verificationUnavailable": "Plugin verification could not finish; loading status is unknown.",
+    "notVerified": "Not verified",
+    "busyRetry": "Plugin management is busy. Retry when the current request finishes.",
+    "sdkLocale": "en",
+    "workspaceSubtitle": "Plugin page for {plugin}",
+    "openView": "Open {title}",
+    "workspaceMissing": "This plugin page is unavailable. The plugin may be disabled or uninstalled.",
+    "manuallyInstalled": "Manually installed pymss plugin. Manage its files and dependencies outside this marketplace."
   }
 }

@@ -24,7 +24,8 @@
     "settings": "设置",
     "workflows": "工作流",
     "workflow-node-editor": "节点编辑器",
-    "debug": "调试"
+    "debug": "调试",
+    "plugins": "插件"
   },
   "common": {
     "cancel": "取消",
@@ -55,7 +56,9 @@
     "loop": "循环播放",
     "reset": "回到起点",
     "continueUsing": "继续使用",
-    "copy": "复制"
+    "copy": "复制",
+    "copied": "已复制",
+    "copyFailed": "复制失败"
   },
   "tools": {
     "title": "小工具",
@@ -373,8 +376,10 @@
       "filePath": "音频文件路径",
       "run": "运行"
     },
-    "pluginOpsTitle": "插件操作",
-    "pluginOpsDescription": "运行 pymss 插件提供的操作（响度、分析、自定义处理）。"
+    "categoryPlugins": "插件",
+    "midiModelAuto": "自动（首次使用时下载）",
+    "midiModelAutoHint": "Apple Silicon：自动下载 gamemlx medium 模型",
+    "midiModelUseAuto": "改用自动模型"
   },
   "separate": {
     "subtitle": "配置输入音频、分离模型与输出参数后，即可发起分离任务。",
@@ -854,7 +859,8 @@
     "removeFilesConfirmContentSingle": "共有 {total} 个输出文件需要删除，其中 {failed} 个未能移到回收站。是否仍仅从结果列表移除此项？",
     "removeFilesConfirmContentMultiple": "共有 {total} 个输出文件需要删除，其中 {failed} 个未能移到回收站。是否仍仅从结果列表移除这些项？",
     "removeFilesKeptSingle": "结果已保留，方便稍后重试删除文件",
-    "removeFilesKeptMultiple": "结果已保留，方便稍后重试删除文件"
+    "removeFilesKeptMultiple": "结果已保留，方便稍后重试删除文件",
+    "nodeValues": "节点输出"
   },
   "projects": {
     "blankProject": "空工程",
@@ -1728,7 +1734,8 @@
         "output": "输出",
         "audioTools": "音频工具",
         "string": "字符串",
-        "builtin": "内置节点"
+        "builtin": "内置节点",
+        "plugins": "插件"
       },
       "nodes": {
         "input_audio": "输入音频",
@@ -1769,7 +1776,21 @@
         "StringFormat": "格式化字符串",
         "RegexReplace": "正则替换",
         "RegexExtract": "正则提取",
-        "JsonExtractString": "提取 JSON 字符串"
+        "JsonExtractString": "提取 JSON 字符串",
+        "AnalysisMeasureLUFS": "响度测量 (LUFS)",
+        "AnalysisTruePeak": "真峰值测量",
+        "AnalysisRMS": "RMS 电平测量",
+        "AsrTranscribe": "语音转文字",
+        "DynamicsCompressor": "压缩器",
+        "DynamicsLimiter": "限制器",
+        "DynamicsDeEsser": "齿音消除",
+        "GameVocalToMidi": "人声转 MIDI (GAME)",
+        "NormalizeLUFS": "响度归一化 (LUFS)",
+        "SpectralHighpass": "高通滤波",
+        "SpectralLowpass": "低通滤波",
+        "SpectralPeakEQ": "参量均衡",
+        "TimingPitchShift": "变调",
+        "TimingTimeStretch": "变速"
       },
       "fields": {
         "invertedAudio": "反相音频",
@@ -1926,5 +1947,51 @@
     "metricLinks": "连线",
     "inputSlots": "运行时输入槽",
     "comfyReadOnlyHint": "高级(comfy)工作流为自由结构，此处仅展示概览。请使用高级编辑器修改图；推理页使用统一输入文件列表。"
+  },
+  "plugins": {
+    "title": "插件市场",
+    "subtitle": "发现音频扩展，管理当前运行环境中的插件。",
+    "installSource": "从来源安装",
+    "refresh": "刷新",
+    "runtimeRequired": "请先在设置中安装并启用运行环境，再使用插件。",
+    "runtimeScope": "当前运行环境",
+    "search": "搜索名称、描述和标签",
+    "checkUpdates": "检查更新",
+    "runOperations": "运行插件操作",
+    "browse": "浏览",
+    "installed": "已安装",
+    "install": "安装",
+    "uninstall": "卸载",
+    "update": "更新",
+    "repair": "修复依赖",
+    "catalogUnavailable": "暂时无法获取插件目录，仍可管理已安装的插件。",
+    "noMatches": "没有匹配的插件",
+    "installedHint": "这里的插件及其额外依赖归属当前运行环境。原先手动安装的 pymss 插件仍可通过插件操作使用。",
+    "loaded": "已加载",
+    "loadFailed": "加载失败",
+    "updateAvailable": "可更新至 {version}",
+    "upToDate": "已是最新版本",
+    "operationCount": "提供 {count} 个操作",
+    "noOperations": "插件已成功加载，未提供通用操作。",
+    "noInstalled": "当前运行环境尚未安装市场插件",
+    "working": "正在管理插件：{name}",
+    "operationLog": "插件操作日志",
+    "showLog": "展开日志",
+    "hideLog": "收起日志",
+    "sourceHint": "输入插件名称、Git 仓库地址，或选择本地插件文件夹。仓库子目录使用 URL#path/to/plugin。",
+    "sourcePlaceholder": "loudnorm、https://github.com/author/plugin 或本地文件夹",
+    "chooseFolder": "选择插件文件夹",
+    "installTitle": "安装插件",
+    "installConfirm": "将 {source} 安装到当前运行环境？插件将以你的用户权限运行 Python 代码，核心运行环境中的包会保持原版本。",
+    "uninstallConfirm": "从当前运行环境移除 {name} 及其额外依赖？",
+    "actionComplete": "插件操作已完成",
+    "verificationUnavailable": "插件验证未完成，当前无法确认加载状态。",
+    "notVerified": "未验证",
+    "busyRetry": "插件管理正忙，请等待当前请求结束后重试。",
+    "sdkLocale": "zh-CN",
+    "workspaceSubtitle": "{plugin} 插件页面",
+    "openView": "打开{title}",
+    "workspaceMissing": "该插件页面不可用，插件可能已被停用或卸载。",
+    "manuallyInstalled": "手动安装的 pymss 插件，请在市场外管理其文件及依赖。"
   }
 }
