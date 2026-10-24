@@ -35,45 +35,29 @@ def _loudnorm_fixture() -> Path:
     fixture = Path(tempfile.mkdtemp()) / "loudnorm"
     fixture.mkdir()
     (fixture / "pyproject.toml").write_text(
-        '[project]
-name="pymss-plugin-loudnorm"
-version="0.2.0"
-requires-python=">=3.10"
-dependencies=[]
-
-'
-        '[project.entry-points."pymss.plugins"]
-loudnorm="loudnorm"
-
-'
-        '[tool.pymss.plugin]
-id="pymss.loudnorm"
-api_version=1
-'
+        '[project]\n'
+        'name="pymss-plugin-loudnorm"\n'
+        'version="0.2.0"\n'
+        'requires-python=">=3.10"\n'
+        'dependencies=[]\n\n'
+        '[project.entry-points."pymss.plugins"]\n'
+        'loudnorm="loudnorm"\n\n'
+        '[tool.pymss.plugin]\n'
+        'id="pymss.loudnorm"\n'
+        'api_version=1\n'
     )
     (fixture / "__init__.py").write_text(
-        'def setup(plugin):
-'
-        '    plugin.register_operation(
-'
-        '        id="pymss.loudnorm.normalize", title="Normalize Loudness (LUFS)",
-'
-        '        description="LUFS loudness normalization",
-'
-        '        inputs={"audio": {"type": "audio"}},
-'
-        '        params={"type": "object", "properties": {
-'
-        '            "target_lufs": {"type": "number", "default": -14.0, "minimum": -70.0, "maximum": -5.0},
-'
-        '        }, "additionalProperties": False},
-'
-        '        outputs={"audio": {"type": "audio"}},
-'
-        '        run=lambda ctx, inputs, params: {"audio": inputs["audio"]},
-'
-        '    )
-'
+        'def setup(plugin):\n'
+        '    plugin.register_operation(\n'
+        '        id="pymss.loudnorm.normalize", title="Normalize Loudness (LUFS)",\n'
+        '        description="LUFS loudness normalization",\n'
+        '        inputs={"audio": {"type": "audio"}},\n'
+        '        params={"type": "object", "properties": {\n'
+        '            "target_lufs": {"type": "number", "default": -14.0, "minimum": -70.0, "maximum": -5.0},\n'
+        '        }, "additionalProperties": False},\n'
+        '        outputs={"audio": {"type": "audio"}},\n'
+        '        run=lambda ctx, inputs, params: {"audio": inputs["audio"]},\n'
+        '    )\n'
     )
     return fixture
 
