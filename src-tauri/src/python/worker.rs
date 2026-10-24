@@ -98,7 +98,7 @@ fn select_worker_python(
 fn acquire_runtime_access<'a>(
     access: &'a Mutex<RuntimeAccess>, command: &str,
 ) -> AppResult<Option<RuntimeAccessGuard<'a>>> {
-    let updating = command == "update_runtime_core";
+    let updating = matches!(command, "update_runtime_core" | "manage_plugin" | "activate_runtime" | "delete_runtime" | "install_runtime");
     if !updating && requires_bootstrap_python(command) {
         return Ok(None);
     }
@@ -254,22 +254,16 @@ fn resolve_active_runtime_record(file: &PathBuf) -> Option<(String, Option<Strin
     let content = std::fs::read_to_string(file).ok()?;
     let record: ActiveRuntimeRecord = serde_json::from_str(&content).ok()?;
     let python = PathBuf::from(&record.python_path);
-    // Absolute path – check directly
-    if python.is_absolute() {
-        return python
-            .canonicalize()
-            .ok()
-            .filter(|path| path.is_file())
-            .map(|path| (path.to_string_lossy().to_string(), record.source));
-    }
-    // Relative path – resolve against the directory containing the file
-    let parent = file.parent()?;
-    let resolved = parent.join(&python);
-    resolved
-        .canonicalize()
-        .ok()
-        .filter(|path| path.is_file())
-        .map(|path| (path.to_string_lossy().to_string(), record.source))
+    // Resolve the directory, but retain the interpreter filename. On Unix a venv
+    // python is usually a symlink to the base interpreter; canonicalizing that
+    // final component both loses the venv and breaks backend ownership checks.
+    let resolved = if python.is_absolute() {
+        python
+    } else {
+        file.parent()?.join(python)
+    };
+    let executable = resolved.parent()?.canonicalize().ok()?.join(resolved.file_name()?);
+    executable.is_file().then(|| (executable.to_string_lossy().to_string(), record.source))
 }
 
 fn bundled_runtime_envs_dir(app: &AppHandle) -> AppResult<Option<PathBuf>> {
@@ -603,6 +597,11 @@ fn build_worker_command(
     let python_for_log = python.clone();
     let worker_for_log = worker.clone();
     let mut cmd = Command::new(&python);
+    #[cfg(unix)]
+    if command == "manage_plugin" {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     isolate_python_environment(&mut cmd);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -933,6 +932,9 @@ fn is_background_terminal_event(command: &str, event_type: &str) -> bool {
         "manage_optional_package" => {
             matches!(event_type, "error" | "optional_package_status" | "task_cancelled")
         }
+        "manage_plugin" => {
+            matches!(event_type, "error" | "plugin_manage_result" | "task_cancelled")
+        }
         "import_custom_model" => matches!(
             event_type,
             "error" | "custom_model_import_finished" | "task_cancelled"
@@ -944,6 +946,7 @@ fn is_background_terminal_event(command: &str, event_type: &str) -> bool {
         "run_operation" => {
             matches!(event_type, "error" | "operation_result" | "task_cancelled")
         }
+        "list_nodes" => matches!(event_type, "error" | "nodes_list"),
         "export_editor_mix" => {
             matches!(event_type, "error" | "editor_mix_exported" | "task_cancelled")
         }
@@ -1304,7 +1307,7 @@ pub fn spawn_worker_background(
                                 mark_task_terminal(&app, request_id);
                             } else {
                                 let message = worker_error_message(&envelope);
-                                if command_name == "update_runtime_core" {
+                                if matches!(command_name.as_str(), "update_runtime_core" | "manage_plugin") {
                                     core_terminal_error = Some(message);
                                 } else {
                                     emit_task_error_to_all(&app, &registered_task_ids, message);
@@ -1319,7 +1322,7 @@ pub fn spawn_worker_background(
                             mark_task_terminal(&app, &task_id);
                         }
                     }
-                    if command_name == "update_runtime_core"
+                    if matches!(command_name.as_str(), "update_runtime_core" | "manage_plugin")
                         && is_background_terminal_event(&command_name, envelope.event_type.as_str())
                     {
                         core_terminal_events.push(envelope);
@@ -1386,6 +1389,12 @@ pub fn spawn_worker_background(
             for registered_task_id in &registered_task_ids {
                 if cancelled.remove(registered_task_id) {
                     terminal_task_ids.insert(registered_task_id.clone());
+                    if command_name == "manage_plugin" {
+                        let _ = app.emit("pymss://worker-event", serde_json::json!({
+                            "type": "task_cancelled", "taskId": registered_task_id,
+                            "payload": { "message": "Cancelled" }
+                        }));
+                    }
                 }
             }
         }
@@ -1412,12 +1421,12 @@ pub fn spawn_worker_background(
                 }
                 Some(status)
                     if status.success()
-                        && matches!(command_name.as_str(), "audio_tools" | "export_editor_mix") =>
+                        && matches!(command_name.as_str(), "audio_tools" | "export_editor_mix" | "manage_plugin") =>
                 {
                     emit_task_error_to_all(
                         &app,
                         &missing_terminal_task_ids,
-                        "worker exited without an audio tool result".to_string(),
+                        "worker exited without a result".to_string(),
                     );
                 }
                 _ => {}
@@ -1485,6 +1494,30 @@ mod tests {
         }
         drop(update);
         assert!(super::acquire_runtime_access(&access, "infer").is_ok());
+    }
+
+    #[test]
+    fn plugin_management_excludes_execution_and_runtime_switching() {
+        let access = std::sync::Mutex::new(super::RuntimeAccess::default());
+        let operation = super::acquire_runtime_access(&access, "run_operation").unwrap();
+        assert!(super::acquire_runtime_access(&access, "manage_plugin").is_err());
+        drop(operation);
+        let management = super::acquire_runtime_access(&access, "manage_plugin").unwrap();
+        for command in ["infer", "list_operations", "list_nodes", "plugin_marketplace", "manage_plugin",
+                        "activate_runtime", "delete_runtime", "update_runtime_core"] {
+            assert!(super::acquire_runtime_access(&access, command).is_err(), "{command}");
+        }
+        drop(management);
+        assert!(super::acquire_runtime_access(&access, "plugin_marketplace").is_ok());
+    }
+
+    #[test]
+    fn plugin_management_result_is_terminal_but_logs_are_not() {
+        assert!(is_background_terminal_event("manage_plugin", "plugin_manage_result"));
+        assert!(is_background_terminal_event("manage_plugin", "error"));
+        assert!(is_background_terminal_event("manage_plugin", "task_cancelled"));
+        assert!(!is_background_terminal_event("manage_plugin", "plugin_stage"));
+        assert!(!is_background_terminal_event("manage_plugin", "plugin_log"));
     }
 
     #[test]
@@ -1682,6 +1715,34 @@ mod tests {
         let missing = fixture.0.join("missing");
         assert_eq!(super::distinct_bundled_runtime_env(None, Some(missing.clone())), None);
         assert_eq!(super::distinct_bundled_runtime_env(canonical_user, Some(missing.clone())), Some(missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_venv_interpreter_remains_usable_by_business_commands() {
+        use std::os::unix::fs::symlink;
+        let unique = temp_root("venv-python-symlink");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.tmp").join(unique.file_name().unwrap());
+        fs::create_dir_all(&root).unwrap();
+        let fixture = ResourceFixture(root);
+        let base = fixture.0.join("base/bin/python3");
+        let python = fixture.0.join("runtime-envs/mlx/bin/python");
+        fixture.file(&base);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        symlink(&base, &python).unwrap();
+        let pointer = fixture.0.join("runtime-envs/active-runtime.json");
+        let expected = python.parent().unwrap().canonicalize().unwrap().join("python");
+        for recorded in [python.to_string_lossy().to_string(), "mlx/bin/python".to_string()] {
+            fs::write(&pointer, serde_json::to_vec(&json!({
+                "pythonPath": recorded, "backend": "mlx"
+            })).unwrap()).unwrap();
+            let resolved = super::resolve_active_runtime_record(&pointer).unwrap().0;
+            let active = super::active_path_backend_matches(&pointer, &resolved).then_some(resolved);
+            let selected = super::select_worker_python("plugin_marketplace", "bootstrap", active);
+            assert!(selected.is_ok(), "an installed MLX venv was rejected: {selected:?}");
+            assert_eq!(selected.unwrap(), expected.to_string_lossy());
+        }
     }
 
     #[test]

@@ -1011,6 +1011,17 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
     if getattr(graph, "PROGRESS_EVENT_VERSION", 0) < 1:
         raise RuntimeError("This pymss runtime does not support structured workflow progress. Update the runtime core in Settings and retry.")
 
+    # Activate marketplace plugins so plugin-contributed graph node types are
+    # registered (graph node registry and plugin nodes share one pool). Readers
+    # only take the shared lock for recovery; writers stay unblocked.
+    try:
+        from worker_plugins import operation_runtime
+
+        operation_runtime()
+    except Exception as exc:  # noqa: BLE001 — missing plugins never block built-in graphs
+        import sys
+        print(f"[workflow] plugin nodes unavailable: {exc}", file=sys.stderr)
+
     runtime_payload, runtime_inputs = _prepare_legacy_global_input(payload, input_path, inputs)
     primary = input_path or (list(runtime_inputs.values())[0] if runtime_inputs else "")
     workflow_definition = runtime_payload.get("workflow")
@@ -1097,11 +1108,13 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             graph_output_dir = Path(cleanup.enter_context(tempfile.TemporaryDirectory(
                 prefix=".pymss-ensemble-", dir=task_output_dir,
             )))
+        node_results: dict[int, Any] = {}
         saved = graph.run_dag(
             dag,
             output_dir=graph_output_dir,
             input_path=input_path,
             inputs=runtime_inputs or None,
+            node_results=node_results,
             progress_event_callback=_emit_progress(task_id),
             device=_resolve_device(payload),
             model_dir=payload.get("modelDir") or None,
@@ -1151,12 +1164,36 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             item["sampleRate"] = rec.sample_rate
         outputs.append(item)
 
-    return {
+    # Non-output leaf nodes (plugin STRING producers: ASR text, measurements,
+    # MIDI paths) surface as nodeValues so the task result carries their work.
+    node_values: list[dict[str, Any]] = []
+    try:
+        from pymss.graph.core import StringArtifact
+
+        for node in dag.nodes:
+            result = node_results.get(node.id)
+            if result is None or not getattr(result, "outputs", None):
+                continue
+            for slot, artifact in result.outputs.items():
+                if isinstance(artifact, StringArtifact):
+                    node_values.append({
+                        "nodeId": node.id,
+                        "nodeType": str(node.type),
+                        "slot": slot,
+                        "value": str(artifact.value),
+                    })
+    except Exception:
+        pass
+
+    result_payload = {
         "files": saved_paths,
         "outputs": outputs,
         "outputDir": str(task_output_dir.resolve()),
         "outputFormat": output_format,
     }
+    if node_values:
+        result_payload["nodeValues"] = node_values
+    return result_payload
 
 
 def cmd_infer_workflow(payload: dict[str, Any]) -> int:

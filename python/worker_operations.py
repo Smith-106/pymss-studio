@@ -16,19 +16,17 @@ from worker_protocol import emit, emit_error
 
 
 def _runtime():
-    from pymss.plugins import ensure_plugins_loaded
+    from worker_plugins import operation_runtime
 
-    ensure_plugins_loaded()
-    from pymss.operations import default_runtime
-
-    return default_runtime()
+    return operation_runtime()
 
 
 def cmd_list_operations(payload: dict[str, Any]) -> int:
     try:
         runtime = _runtime()
         ops = runtime.list_operations()
-        report = runtime.plugin_report()
+        from worker_plugins import plugin_reports
+        report = plugin_reports(runtime)
         emit(
             "operations_list",
             {
@@ -78,7 +76,8 @@ def _resolve_input(value: Any) -> Any:
         from pymss.graph.core import AudioArtifact
 
         arr = np.asarray(audio, dtype=np.float32)
-        return AudioArtifact(arr, int(sr), channel_layout="stereo")
+        layout = "stereo" if arr.ndim == 2 and arr.shape[0] == 2 else "mono"
+        return AudioArtifact(arr, int(sr), source_path=str(value["path"]), channel_layout=layout)
     return value
 
 
@@ -99,7 +98,11 @@ def _serialize_output(name: str, value: Any, output_dir: Path) -> Any:
     if isinstance(value, np.ndarray):
         return {"kind": "array", "shape": list(value.shape), "dtype": str(value.dtype)}
     if isinstance(value, dict):
-        return {"kind": "object", "value": {k: _serialize_output(k, v, output_dir)["value"] if isinstance(v, (str, int, float, bool)) else str(v) for k, v in value.items()}}
+        return {"kind": "object", "value": {k: _serialize_output(k, v, output_dir)["value"] for k, v in value.items()}}
+    if isinstance(value, (list, tuple)):
+        return {"kind": "array", "value": [_serialize_output(name, item, output_dir)["value"] for item in value]}
+    if isinstance(value, Path):
+        return {"kind": "scalar", "value": str(value)}
     return {"kind": "opaque", "value": str(value)}
 
 
@@ -128,6 +131,8 @@ def cmd_run_operation(payload: dict[str, Any]) -> int:
             }, request_id=request_id)
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        from worker_plugins import validate_operation
+        validate_operation(runtime, operation_id)
         result = runtime.run(
             operation_id,
             inputs=inputs,

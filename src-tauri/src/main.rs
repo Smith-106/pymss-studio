@@ -3,6 +3,7 @@
 mod commands;
 mod error;
 mod model_dir_migration;
+mod plugin_views;
 mod python;
 mod session_log;
 mod single_instance;
@@ -13,6 +14,7 @@ mod update_manager;
 
 use state::AppState;
 use tauri::{Emitter, Manager};
+
 
 fn main() {
     if let Some(code) = update_manager::run_helper_from_args() {
@@ -38,6 +40,9 @@ fn main() {
     terminal::attach_parent();
 
     let builder = tauri::Builder::default()
+        .register_uri_scheme_protocol("pymss-plugin", |ctx, request| {
+            plugin_views::serve_view(ctx.app_handle(), &request)
+        })
         .on_page_load(|webview, _payload| {
             let window = webview.window();
             if !cfg!(target_os = "macos") {
@@ -98,6 +103,10 @@ fn main() {
             commands::app_cmd::start_audio_tool,
             commands::app_cmd::start_operation_task,
             commands::app_cmd::list_operations,
+            commands::app_cmd::list_nodes,
+            commands::app_cmd::plugin_marketplace,
+            commands::app_cmd::manage_plugin,
+            commands::app_cmd::set_plugin_view_root,
             commands::app_cmd::describe_operation,
             commands::app_cmd::get_app_paths,
             commands::app_cmd::get_env_info,
