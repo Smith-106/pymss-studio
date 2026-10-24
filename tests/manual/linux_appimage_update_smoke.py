@@ -19,6 +19,12 @@ def main(image: Path, appdir: Path) -> None:
         (miniature / "usr/bin").mkdir(parents=True)
         (miniature / "usr/share/applications").mkdir(parents=True)
         shutil.copy2(appdir / "AppRun", miniature / "AppRun")
+        wrapped = appdir / "AppRun.wrapped"
+        if wrapped.is_file() or wrapped.is_symlink():
+            shutil.copy2(wrapped, miniature / "AppRun.wrapped", follow_symlinks=False)
+        # The packaged AppRun sources linuxdeploy's GTK/GStreamer startup hooks.
+        if (appdir / "apprun-hooks").is_dir():
+            shutil.copytree(appdir / "apprun-hooks", miniature / "apprun-hooks")
         for directory in (Path(), Path("usr/share/applications")):
             for desktop in (appdir / directory).glob("*.desktop"):
                 shutil.copyfile(desktop, miniature / directory / desktop.name)

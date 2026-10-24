@@ -57,6 +57,8 @@ jobs:
           bash scripts/prepare-linux-bundled-tools.sh src-tauri/resources/bin
       - name: Build AppImage
         env:
+          # linuxdeploy's bundled strip can reject modern ELF relocation sections.
+          NO_STRIP: 'true'
           PYMSS_BUILD_GIT_COMMIT: ${{ github.sha }}
           PYMSS_BUILD_GIT_TAG: ${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
           PYMSS_BUILD_GIT_REF: ${{ github.ref_name }}
@@ -69,6 +71,7 @@ jobs:
           PYMSS_BUILD_VARIANT: linux-x64-appimage
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
         run: |
+          set -o pipefail
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -81,7 +84,17 @@ jobs:
           }}
           Path('src-tauri/tauri.bundle.resources.json').write_text(json.dumps(config))
           PY
-          pnpm tauri build --bundles appimage --config src-tauri/tauri.bundle.resources.json
+          mkdir -p "$RUNNER_TEMP/pymss-linux-build"
+          pnpm tauri build --verbose --bundles appimage --config src-tauri/tauri.bundle.resources.json 2>&1 \
+            | tee "$RUNNER_TEMP/pymss-linux-build/appimage-build.log"
+      - name: Upload AppImage failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage-build-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pymss-linux-build/appimage-build.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Verify packaged interpreter, tools, and first environment installation
         run: |
           bash scripts/verify-linux-appimage.sh

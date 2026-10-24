@@ -173,3 +173,57 @@ print(json.dumps({'origin': xmlrpc.client.__file__}))
 
     def test_posix_prune_with_venv_preserves_xmlrpc_for_the_package_installer(self) -> None:
         self._check_posix_xmlrpc_survives_pruning(keep_venv=True)
+
+    def _check_posix_native_tk_pruning(self, *, keep_venv: bool) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is required for the POSIX pruning script test")
+        runtime, site_packages = self._write_sample_runtime(windows=False)
+        library = runtime / "lib"
+        stdlib = library / "python3.12"
+        removed_files = [
+            stdlib / "lib-dynload/_tkinter.cpython-312-x86_64-linux-gnu.so",
+            stdlib / "lib-dynload/_tkinter.abi3.so",
+            library / "libtcl9.0.so",
+            library / "libtcl9tk9.0.so",
+            library / "libtk8.6.so.0",
+            library / "libtcl9.0.dylib",
+            library / "libtk8.6.dylib",
+        ]
+        removed_directories = [
+            stdlib / "tkinter", library / "tcl9", library / "tcl9.0", library / "tk9.0",
+            library / "itcl4.3.5", library / "thread3.0.4",
+        ]
+        for directory in removed_directories:
+            removed_files.append(directory / "libtcl-extension.so")
+        retained_files = [
+            library / "libpython3.12.so.1.0", library / "libssl.so.3",
+            stdlib / "lib-dynload/_ssl.cpython-312-x86_64-linux-gnu.so",
+            stdlib / "lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so",
+            stdlib / "xmlrpc/client.py", stdlib / "venv/__init__.py",
+            stdlib / "ensurepip/__init__.py", library / "threadpool/data",
+            site_packages / "tkinter_helpers/__init__.py",
+        ]
+        for path in [*removed_files, *retained_files]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"runtime fixture")
+        script = Path(__file__).resolve().parents[2] / "scripts/prune-python-runtime.sh"
+        result = subprocess.run(
+            [bash, str(script), str(runtime), *(["--keep-venv"] if keep_venv else [])],
+            capture_output=True, text=True, cwd=runtime,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in [*removed_files, *removed_directories]:
+            self.assertFalse(path.exists(), str(path.relative_to(runtime)))
+        for path in retained_files:
+            if path.parent.name in {"venv", "ensurepip"}:
+                self.assertEqual(path.exists(), keep_venv)
+            else:
+                self.assertEqual(path.read_bytes(), b"runtime fixture")
+        self._check_packaging_dependencies(site_packages)
+
+    def test_posix_prune_removes_native_tk_dependencies(self) -> None:
+        self._check_posix_native_tk_pruning(keep_venv=False)
+
+    def test_posix_prune_with_venv_removes_native_tk_dependencies(self) -> None:
+        self._check_posix_native_tk_pruning(keep_venv=True)

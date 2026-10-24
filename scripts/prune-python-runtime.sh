@@ -35,6 +35,17 @@ else
   \) -prune -exec rm -rf {} + 2>/dev/null || true
 fi
 find "$RUNTIME_DIR/lib" -maxdepth 2 -type f \( -name 'turtle.py' \) -delete 2>/dev/null || true
+# Standalone Python also ships native Tcl/Tk components. Removing only tkinter's
+# Python package leaves ELF dependencies that linuxdeploy still tries to bundle.
+find "$RUNTIME_DIR/lib" -maxdepth 3 \( -type f -o -type l \) -name '_tkinter*.so' -delete
+find "$RUNTIME_DIR/lib" -maxdepth 1 \( -type f -o -type l \) \( \
+  -name 'libtcl*.so*' -o -name 'libtk*.so*' -o \
+  -name 'libtcl*.dylib' -o -name 'libtk*.dylib' \
+\) -delete
+find "$RUNTIME_DIR/lib" -maxdepth 1 -type d \( \
+  -name 'tcl[0-9]*' -o -name 'tk[0-9]*' -o \
+  -name 'itcl[0-9]*' -o -name 'thread[0-9]*' \
+\) -prune -exec rm -rf {} +
 find "$RUNTIME_DIR" -type d \( -name '__pycache__' -o -name 'test' -o -name 'tests' -o -name 'testsuite' -o -name 'examples' -o -name 'example' -o -name 'benchmarks' -o -name 'docs' -o -name 'doc' \) \
   -not -path '*/site-packages/torch/testing' \
   -prune -exec rm -rf {} + || true
