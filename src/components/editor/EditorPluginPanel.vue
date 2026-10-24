@@ -7,7 +7,7 @@ import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import type { EditorSession } from '@/types/editor'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
-import { observePluginSession, openPluginEditor, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type UnavailablePlugin } from '@/utils/pluginHost'
+import { observePluginSession, openPluginEditor, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
@@ -17,6 +17,11 @@ const playback = useEditorPlaybackStore()
 const capabilities = ref<PluginHostCapabilities | null>(null)
 const busy = ref(false)
 const scanning = ref(false)
+const scanStatus = ref<PluginScanStatus | null>(null)
+const scanBlacklist = ref<PluginScanBlacklistEntry[]>([])
+const scanActionPending = ref<'skip' | 'cancel' | null>(null)
+const scanStopRequested = ref(false)
+const scanFeedback = ref('')
 const managerOpen = ref(false)
 const managerCard = ref<{ $el: HTMLElement } | null>(null)
 const manageButton = ref<{ $el: HTMLElement } | null>(null)
@@ -40,6 +45,15 @@ const parameterSlotId = ref<string | null>(null)
 const STORAGE_KEY = 'pymss-plugin-library-directories-v1'
 let scanGeneration = 0
 let disposed = false
+let scanSequence = 0
+let blacklistGeneration = 0
+type ActiveScan = { id: string; generation: number; project: EditorSession; controlled: boolean; timer: ReturnType<typeof setTimeout> | null }
+let activeScan: ActiveScan | null = null
+const canSkipScan = computed(() => scanning.value && scanStatus.value?.phase === 'scanning' && Boolean(scanStatus.value?.canSkip && scanStatus.value.currentPath) && !scanActionPending.value && !scanStopRequested.value)
+const canStopScan = computed(() => scanning.value && !scanActionPending.value && !scanStopRequested.value && !['finished', 'cancelled'].includes(scanStatus.value?.phase || ''))
+const scanPhaseLabel = computed(() => t(scanStatus.value?.phase === 'scanning' ? 'editor.plugins.scanPhaseScanning'
+  : scanStatus.value?.phase === 'finished' ? 'editor.plugins.scanPhaseFinished'
+  : scanStatus.value?.phase === 'cancelled' ? 'editor.plugins.scanPhaseCancelled' : 'editor.plugins.scanPhaseCollecting'))
 const workflowStep = computed(() => !directories.value.length ? 1 : !scanReport.value ? 2 : 3)
 const canChooseAudioUnits = computed(() => capabilities.value?.platform === 'macos' && capabilities.value.formats.includes('au'))
 const targetOptions = computed(() => [
@@ -113,11 +127,13 @@ onMounted(async () => {
     const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
     if (Array.isArray(stored)) directories.value = [...new Set(stored.filter((path): path is string => typeof path === 'string' && Boolean(path.trim()) && (path !== 'au:system' || canChooseAudioUnits.value)))]
   } catch { /* An invalid preference must not prevent opening the inspector. */ }
+  if (capabilities.value?.scanControl) await refreshBlacklist()
 })
 onScopeDispose(() => window.removeEventListener('resize', recenterManager))
-onScopeDispose(() => { disposed = true; scanGeneration++ })
+onScopeDispose(() => { disposed = true; cancelActiveScan(); scanGeneration++; blacklistGeneration++ })
 
 function invalidateCatalog() {
+  cancelActiveScan()
   scanGeneration++
   error.value = ''
   scanReport.value = null
@@ -125,14 +141,19 @@ function invalidateCatalog() {
   selectedPluginId.value = null
   librarySearch.value = ''
   feedback.value = ''
+  scanFeedback.value = ''
 }
 function directoryLabel(path: string) {
   return path === 'au:system' ? t('editor.plugins.systemAudioUnits') : path.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || path
+}
+function scanItemName(path: string, name?: string | null) {
+  return path === 'au:system' ? directoryLabel(path) : name || directoryLabel(path)
 }
 
 function openManager(slotId?: string) {
   if (slotId) parameterSlotId.value = slotId
   managerOpen.value = true
+  if (capabilities.value?.scanControl) void refreshBlacklist()
 }
 function focusManager() {
   const element = managerCard.value?.$el
@@ -217,22 +238,135 @@ async function chooseAudioUnits() {
   saveDirectories()
   await scan()
 }
+function isCurrentScan(scan: ActiveScan) {
+  return !disposed && activeScan === scan && scan.generation === scanGeneration && props.session === scan.project
+}
+function clearScanPoll(scan: ActiveScan) {
+  if (scan.timer) clearTimeout(scan.timer)
+  scan.timer = null
+}
+function cancelActiveScan() {
+  const scan = activeScan
+  if (!scan) return
+  clearScanPoll(scan)
+  activeScan = null
+  busy.value = false
+  scanning.value = false
+  scanStatus.value = null
+  scanActionPending.value = null
+  scanStopRequested.value = false
+  if (scan.controlled) void invoke('plugin_host_cancel_scan', { scanId: scan.id }).catch(() => undefined)
+}
+async function pollScanStatus(scan: ActiveScan) {
+  if (!isCurrentScan(scan)) return
+  try {
+    const status = await invoke<PluginScanStatus | null>('plugin_host_scan_status', { scanId: scan.id })
+    if (!isCurrentScan(scan)) return
+    if (status?.scanId === scan.id) scanStatus.value = status
+  } catch (cause) {
+    if (isCurrentScan(scan)) {
+      scanStatus.value = null
+      error.value = cause instanceof Error ? cause.message : String(cause)
+    }
+  } finally {
+    if (isCurrentScan(scan) && !['finished', 'cancelled'].includes(scanStatus.value?.phase || '')) {
+      scan.timer = setTimeout(() => { scan.timer = null; void pollScanStatus(scan) }, 400)
+    }
+  }
+}
+async function refreshBlacklist(project = props.session, generation = scanGeneration) {
+  if (!capabilities.value?.scanControl || disposed) return
+  const refresh = ++blacklistGeneration
+  try {
+    const entries = await invoke<PluginScanBlacklistEntry[]>('plugin_host_scan_blacklist')
+    if (!disposed && props.session === project && scanGeneration === generation && refresh === blacklistGeneration) scanBlacklist.value = entries
+  } catch (cause) {
+    if (!disposed && props.session === project && scanGeneration === generation && refresh === blacklistGeneration) error.value = cause instanceof Error ? cause.message : String(cause)
+  }
+}
+async function skipCurrentScanPlugin() {
+  const scan = activeScan
+  const status = scanStatus.value
+  if (!scan?.controlled || !isCurrentScan(scan) || !canSkipScan.value || !status?.currentPath) return
+  const path = status.currentPath
+  const name = scanItemName(path, status.currentName)
+  scanActionPending.value = 'skip'
+  try {
+    const result = await invoke<{ skipped: boolean }>('plugin_host_skip_scan', { scanId: scan.id, path })
+    if (!isCurrentScan(scan)) return
+    scanFeedback.value = t(result.skipped ? 'editor.plugins.scanPluginSkipped' : 'editor.plugins.scanPluginAlreadyFinished', { name })
+    if (result.skipped) void refreshBlacklist(scan.project, scan.generation)
+  } catch (cause) {
+    if (isCurrentScan(scan)) error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally { if (isCurrentScan(scan)) scanActionPending.value = null }
+}
+async function stopScan() {
+  const scan = activeScan
+  if (!scan?.controlled || !isCurrentScan(scan) || !canStopScan.value) return
+  scanActionPending.value = 'cancel'
+  scanStopRequested.value = true
+  try {
+    const result = await invoke<{ cancelled: boolean }>('plugin_host_cancel_scan', { scanId: scan.id })
+    if (!isCurrentScan(scan)) return
+    if (!result.cancelled) scanStopRequested.value = false
+    scanFeedback.value = t(result.cancelled ? 'editor.plugins.scanStopping' : 'editor.plugins.scanPhaseFinished')
+  } catch (cause) {
+    if (isCurrentScan(scan)) {
+      scanStopRequested.value = false
+      error.value = cause instanceof Error ? cause.message : String(cause)
+    }
+  } finally { if (isCurrentScan(scan)) scanActionPending.value = null }
+}
+async function removeBlacklistedPlugin(path: string) {
+  if (busy.value || !capabilities.value?.scanControl) return
+  await run(async () => {
+    const project = props.session
+    const generation = scanGeneration
+    await invoke('plugin_host_remove_scan_blacklist', { path })
+    if (disposed || props.session !== project || scanGeneration !== generation) return
+    // A list fetched before removal completed must not put the removed entry back.
+    blacklistGeneration++
+    scanBlacklist.value = scanBlacklist.value.filter(entry => entry.path !== path)
+    scanFeedback.value = t('editor.plugins.scanBlacklistRemoved')
+  })
+}
 async function scan(force = false) {
   if (busy.value || disposed || !directories.value.length) return
+  const current: ActiveScan = { id: `plugin_scan_${Date.now().toString(36)}_${++scanSequence}_${crypto.randomUUID()}`,
+    generation: ++scanGeneration, project: props.session, controlled: capabilities.value?.scanControl === true, timer: null }
+  activeScan = current
+  busy.value = true
   scanning.value = true
+  scanStatus.value = null
+  scanActionPending.value = null
+  scanStopRequested.value = false
+  error.value = ''
+  scanFeedback.value = ''
+  // Start observation before invoking the long-running scan; control commands use independent IPC calls.
+  if (current.controlled) void pollScanStatus(current)
   try {
-    await run(async () => {
-      const project = props.session
-      const current = scanGeneration
-      let report: PluginScanReport
-      try { report = await invoke<PluginScanReport>('plugin_host_scan_report', { paths: [...directories.value], force }) }
-      catch (cause) { if (!disposed && props.session === project && current === scanGeneration) throw cause; return }
-      if (disposed || props.session !== project || current !== scanGeneration) return
-      scanReport.value = report
-      descriptors.value = report.plugins
-      if (!descriptors.value.some(plugin => descriptorKey(plugin) === selectedPluginId.value)) selectedPluginId.value = null
-    })
-  } finally { scanning.value = false }
+    const report = await invoke<PluginScanReport>('plugin_host_scan_report', { paths: [...directories.value], force,
+      ...(current.controlled ? { scanId: current.id } : {}) })
+    if (!isCurrentScan(current)) return
+    scanReport.value = report
+    descriptors.value = report.plugins
+    if (!descriptors.value.some(plugin => descriptorKey(plugin) === selectedPluginId.value)) selectedPluginId.value = null
+    if (current.controlled) {
+      if (report.blacklisted?.length) scanBlacklist.value = [...new Map([...scanBlacklist.value, ...report.blacklisted].map(entry => [entry.path, entry])).values()]
+      void refreshBlacklist(current.project, current.generation)
+    }
+  } catch (cause) {
+    if (isCurrentScan(current)) error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    if (activeScan === current) {
+      clearScanPoll(current)
+      activeScan = null
+      busy.value = false
+      scanning.value = false
+      scanActionPending.value = null
+      scanStatus.value = null
+    }
+  }
 }
 async function mutate(change: (slots: typeof chain.value) => void, recovery = false) {
   await run(async () => {
@@ -342,7 +476,7 @@ async function toggleEditor(slotId: string) {
           <li v-for="(label, index) in [t('editor.plugins.stepChoose'), t('editor.plugins.stepScan'), t('editor.plugins.stepAdd')]" :key="label" :aria-current="workflowStep === index + 1 ? 'step' : undefined" :class="{ 'plugin-manager__step--done': workflowStep > index + 1 }"><span>{{ index + 1 }}</span>{{ label }}</li>
         </ol>
         <div class="plugin-manager__body" :aria-busy="busy">
-          <section class="plugin-manager__library" :aria-label="t('editor.plugins.library')">
+          <section class="plugin-manager__library" :class="{ 'plugin-manager__library--scan-controls': capabilities.scanControl }" :aria-label="t('editor.plugins.library')">
             <div class="plugin-manager__section-heading">
               <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count">{{ descriptors.length }}</span></div>
               <n-button v-if="directories.length" size="small" secondary :loading="scanning" :disabled="busy" @click="scan()"><template #icon><n-icon :component="RefreshOutline" /></template>{{ t('editor.plugins.scan') }}</n-button>
@@ -356,12 +490,36 @@ async function toggleEditor(slotId: string) {
               <p v-if="!directories.length" class="plugin-panel__hint">{{ t('editor.plugins.chooseDirectoryHint') }}</p>
               <div v-if="directories.length" class="plugin-manager__directories">
                 <div v-for="(path, index) in directories" :key="path" class="plugin-panel__directory">
-                  <span :title="path"><strong>{{ directoryLabel(path) }}</strong><small v-if="path !== 'au:system'">{{ path }}</small></span>
+                  <span :title="path"><strong>{{ directoryLabel(path) }}</strong><small v-if="path !== 'au:system'">{{ path }}</small><small v-else class="plugin-manager__au-source-hint">{{ t('editor.plugins.scanAudioUnitsHint') }}</small></span>
                   <n-button size="tiny" quaternary :disabled="busy" :aria-label="t('editor.plugins.removeDirectory')" @click="removeDirectory(index)"><template #icon><n-icon :component="CloseOutline" /></template></n-button>
                 </div>
               </div>
               <n-button v-if="canChooseAudioUnits && !directories.includes('au:system')" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
             </div>
+            <div v-if="scanning && capabilities.scanControl" class="plugin-manager__scan-progress" :aria-label="t('editor.plugins.scanProgress')">
+              <div class="plugin-manager__scan-progress-heading"><strong role="status">{{ scanPhaseLabel }}</strong><span>{{ t('editor.plugins.scanCompletedCount', { completed: scanStatus?.completed || 0, total: scanStatus?.total || 0 }) }}</span></div>
+              <div v-if="scanStatus?.currentPath" class="plugin-manager__scan-current" :title="scanStatus.currentPath"><strong>{{ scanItemName(scanStatus.currentPath, scanStatus.currentName) }}</strong><small>{{ scanStatus.currentPath }}</small></div>
+              <span v-if="scanStatus?.currentPath" class="plugin-panel__hint">{{ t('editor.plugins.scanElapsed', { seconds: Math.floor(scanStatus.elapsedMs / 1000) }) }}</span>
+              <p class="plugin-panel__hint">{{ t('editor.plugins.scanTimeoutHint') }}</p>
+              <p class="plugin-panel__hint">{{ t(scanStatus?.currentPath === 'au:system' ? 'editor.plugins.scanAudioUnitsHint' : 'editor.plugins.scanPackageHint') }}</p>
+              <div class="plugin-manager__scan-control-actions">
+                <n-button size="small" secondary type="warning" :disabled="!canSkipScan" :loading="scanActionPending === 'skip'" @click="skipCurrentScanPlugin">{{ t('editor.plugins.skipScanPlugin') }}</n-button>
+                <n-button size="small" secondary :disabled="!canStopScan" :loading="scanActionPending === 'cancel'" @click="stopScan">{{ t('editor.plugins.stopScan') }}</n-button>
+              </div>
+            </div>
+            <p v-if="scanFeedback" class="plugin-manager__feedback" role="status">{{ scanFeedback }}</p>
+            <p v-if="scanReport?.cancelled" class="plugin-panel__hint" role="status">{{ t('editor.plugins.scanCancelledHint') }}</p>
+            <details v-if="capabilities.scanControl" class="plugin-manager__blacklist">
+              <summary>{{ t('editor.plugins.scanBlacklistTitle', { count: scanBlacklist.length }) }}</summary>
+              <p class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistHint') }}</p>
+              <p v-if="!scanBlacklist.length" class="plugin-panel__hint">{{ t('editor.plugins.scanBlacklistEmpty') }}</p>
+              <div v-else class="plugin-manager__blacklist-list">
+                <div v-for="entry in scanBlacklist" :key="entry.path" class="plugin-manager__blacklist-entry">
+                  <span :title="entry.path"><strong>{{ scanItemName(entry.path, entry.name) }}</strong><small>{{ entry.path }}</small><small>{{ t(entry.reason === 'timeout' ? 'editor.plugins.scanBlacklistTimeout' : 'editor.plugins.scanBlacklistManual') }}</small></span>
+                  <n-button size="tiny" secondary :disabled="busy" :aria-label="t('editor.plugins.removeScanBlacklistNamed', { name: scanItemName(entry.path, entry.name) })" @click="removeBlacklistedPlugin(entry.path)">{{ t('editor.plugins.removeScanBlacklist') }}</n-button>
+                </div>
+              </div>
+            </details>
             <div v-if="scanReport?.failures.length" class="plugin-panel__scan-failures" role="status">
               <div class="plugin-manager__scan-actions"><strong>{{ t('editor.plugins.scanFailures', { count: scanReport.failures.length }) }}</strong><n-button size="tiny" :disabled="busy" @click="scan(true)">{{ t('editor.plugins.retryScan') }}</n-button></div>
               <details><summary>{{ t('editor.plugins.scanFailureDetails') }}</summary><p v-for="failure in scanReport.failures" :key="failure.path" :title="failure.path"><span>{{ failure.path }}</span>{{ failure.message }}</p></details>
@@ -477,6 +635,22 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__steps > li[aria-current="step"] > span, .plugin-manager__step--done > span { background: var(--primary-soft); border-color: var(--primary-border); color: var(--primary); }
 .plugin-manager__body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
 .plugin-manager__chain, .plugin-manager__library { display: flex; flex-direction: column; align-items: stretch; gap: 12px; min-width: 0; min-height: 0; padding: 18px 20px; overflow: hidden; }
+.plugin-manager__library--scan-controls { overflow-y: auto; }
+.plugin-manager__library--scan-controls > * { flex-shrink: 0; }
+.plugin-manager__library--scan-controls .plugin-manager__catalog { min-height: 120px; }
+.plugin-manager__scan-progress { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--outline); border-radius: 6px; background: var(--surface-2); }
+.plugin-manager__scan-progress-heading { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; }
+.plugin-manager__scan-progress-heading > span { color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
+.plugin-manager__scan-current, .plugin-manager__blacklist-entry > span { display: grid; gap: 3px; min-width: 0; }
+.plugin-manager__scan-current > *, .plugin-manager__blacklist-entry > span > * { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
+.plugin-manager__scan-current > small, .plugin-manager__blacklist-entry small { color: var(--on-surface-muted); font-size: 11px; }
+.plugin-manager__scan-control-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.plugin-manager__blacklist { font-size: 12px; }
+.plugin-manager__blacklist > summary { cursor: pointer; color: var(--on-surface-muted); }
+.plugin-manager__blacklist > p, .plugin-manager__blacklist-list { margin-top: 8px; }
+.plugin-manager__blacklist-list { display: grid; gap: 9px; max-height: 110px; overflow: auto; }
+.plugin-manager__blacklist-entry { display: flex; gap: 8px; align-items: center; }
+.plugin-manager__blacklist-entry > span { flex: 1; }
 .plugin-manager__chain { background: color-mix(in srgb, var(--surface-2) 24%, transparent); border-left: 1px solid var(--outline); }
 .plugin-manager__target-label { margin-bottom: -6px; color: var(--on-surface-muted); font-size: 11px; }
 .plugin-manager__feedback { margin: 0; padding: 8px 10px; border-radius: 5px; background: var(--primary-softer); color: var(--primary-strong); font-size: 12px; line-height: 1.6; }
@@ -513,6 +687,7 @@ async function toggleEditor(slotId: string) {
 .plugin-panel__directory strong, .plugin-panel__directory small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-panel__directory strong { font-size: 12px; font-weight: 500; }
 .plugin-panel__directory small { color: var(--on-surface-muted); font-size: 11px; }
+.plugin-panel__directory .plugin-manager__au-source-hint { white-space: normal; }
 .plugin-manager__scan-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .plugin-panel__scan-failures { flex-shrink: 0; max-height: 90px; overflow: auto; padding: 8px; border-radius: 6px; background: color-mix(in srgb, var(--warning) 9%, transparent); color: var(--on-surface-muted); font-size: 12px; overflow-wrap: anywhere; }
 .plugin-panel__scan-failures summary { cursor: pointer; margin-top: 6px; }

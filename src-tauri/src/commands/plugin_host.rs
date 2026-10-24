@@ -12,6 +12,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, State};
 
+mod blacklist;
+mod scan_control;
+mod scan_pipeline;
+#[cfg(test)]
+mod scan_tests;
+use blacklist::{BlacklistEntry, BlacklistReason};
+use scan_control::{Decision as ScanDecision, ScanControl, ScanRun, Ticket as ScanTicket};
+#[cfg(test)]
+use scan_pipeline::scan_bundles;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 const RENDER_TIMEOUT: Duration = Duration::from_secs(60 * 30);
@@ -36,6 +46,9 @@ pub struct PluginHostState {
     renders: Arc<Mutex<HashMap<String, Arc<ProcessLease>>>>,
     scan_lock: Arc<Mutex<()>>,
     scan_process: Arc<ProcessLease>,
+    scan_control: Arc<ScanControl>,
+    scan_storage: Arc<Mutex<()>>,
+    scan_sequence: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
 }
@@ -46,6 +59,7 @@ impl PluginHostState {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.session_pid.cancel();
         self.scan_process.cancel();
+        self.scan_control.shutdown();
         if let Ok(renders) = self.renders.lock() {
             for pid in renders.values() {
                 pid.cancel();
@@ -117,6 +131,7 @@ pub fn plugin_host_capabilities() -> Value {
         "recording": capabilities.enabled,
         "nativeEditor": capabilities.native_editor, "experimental": true,
         "labBuild": cfg!(feature = "vst-lab"),
+        "scanControl": capabilities.enabled,
     })
 }
 
@@ -968,6 +983,8 @@ struct ScanReport {
     failures: Vec<ScanFailure>,
     scanned: usize,
     cached: usize,
+    blacklisted: Vec<BlacklistEntry>,
+    cancelled: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1152,8 +1169,10 @@ fn selected_scan_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     bundles
 }
 
+#[derive(Debug)]
 enum ScanProbeError {
     Failure(String),
+    Skipped(BlacklistReason),
     Cancelled,
 }
 
@@ -1169,156 +1188,21 @@ impl From<&str> for ScanProbeError {
     }
 }
 
-fn scan_bundles(
-    root: &Path,
-    bundles: Vec<PathBuf>,
-    failures: Vec<ScanFailure>,
-    force: bool,
-    mut probe: impl FnMut(&Path) -> Result<Vec<Value>, ScanProbeError>,
-) -> Result<ScanReport, String> {
-    if bundles.len() > 4096 {
-        return Err("The plugin scan exceeded the bundle limit".into());
-    }
-    let cache_path = root.join("plugin-cache.json");
-    let old_cache: Value = fs::File::open(&cache_path)
-        .ok()
-        .and_then(|file| serde_json::from_reader(file.take(MAX_CACHE_BYTES)).ok())
-        .unwrap_or(Value::Null);
-    // Older scanners cached shell containers as unsupported. Their fingerprints
-    // cannot establish compatibility with the current descriptor contract.
-    let old_entries = (old_cache.get("version").and_then(Value::as_u64)
-        == Some(u64::from(SCAN_CACHE_VERSION)))
-    .then(|| old_cache.get("entries").and_then(Value::as_array))
-    .flatten();
-    let mut entries = Vec::new();
-    let mut report = ScanReport {
-        failures,
-        ..ScanReport::default()
-    };
-    for bundle in bundles {
-        let virtual_target = is_virtual_scan_target(&bundle);
-        let bundle = if virtual_target {
-            bundle
-        } else {
-            bundle.canonicalize().unwrap_or(bundle)
-        };
-        let path = bundle.to_string_lossy().to_string();
-        if let Some(reason) = unsupported_scan_reason(&bundle) {
-            // Known unsupported packages are terminals, not VST libraries. Do not fingerprint
-            // their contents or invoke a native loader merely to report the format boundary.
-            report.failures.push(ScanFailure {
-                path,
-                message: reason.into(),
-            });
-            continue;
-        }
-        let fingerprint = match if virtual_target {
-            Ok(String::new())
-        } else {
-            bundle_fingerprint(&bundle)
-        } {
-            Ok(fingerprint) => fingerprint,
-            Err(message) => {
-                entries.push(json!({"path":path,"fingerprint":null,"plugins":[],"error":message}));
-                report.failures.push(ScanFailure { path, message });
-                continue;
-            }
-        };
-        if !force && !virtual_target {
-            if let Some(cached) = old_entries.and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry["path"] == path && entry["fingerprint"] == fingerprint)
-            }) {
-                if let Some(message) = cached["error"].as_str() {
-                    report.failures.push(ScanFailure {
-                        path,
-                        message: message.to_string(),
-                    });
-                    report.cached += 1;
-                    entries.push(cached.clone());
-                    continue;
-                }
-                if let Some(found) = cached["plugins"]
-                    .as_array()
-                    .filter(|found| !found.is_empty() && found.iter().all(Value::is_object))
-                {
-                    let mut found = found.clone();
-                    for descriptor in &mut found {
-                        normalize_descriptor(descriptor, &path, false)?;
-                    }
-                    report.plugins.extend(found);
-                    report.cached += 1;
-                    entries.push(cached.clone());
-                    continue;
-                }
-            }
-        }
-        report.scanned += 1;
-        let probed = match probe(&bundle) {
-            Ok(found) => Ok(found),
-            Err(ScanProbeError::Failure(message)) => Err(message),
-            Err(ScanProbeError::Cancelled) => return Err("Plugin scanning was cancelled".into()),
-        };
-        let result = probed.and_then(|mut found| {
-            if found.is_empty() && !virtual_target {
-                Err("No compatible effects were found in this plugin".into())
-            } else if found.iter().any(|descriptor| !descriptor.is_object()) {
-                Err("The plugin scanner returned an invalid result".into())
-            } else {
-                for descriptor in &mut found {
-                    normalize_descriptor(descriptor, &path, virtual_target)?;
-                }
-                Ok(found)
-            }
-        });
-        match result {
-            Ok(found) => {
-                if !virtual_target {
-                    entries.push(
-                        json!({"path":path,"fingerprint":fingerprint,"plugins":found,"error":null}),
-                    );
-                }
-                report.plugins.extend(found);
-            }
-            Err(message) => {
-                crate::session_log::early(
-                    "WARN",
-                    "audio.plugin_scan",
-                    &format!("Plugin scan failed for {}: {message}", bundle.display()),
-                );
-                if !virtual_target {
-                    entries.push(
-                        json!({"path":path,"fingerprint":fingerprint,"plugins":[],"error":message}),
-                    );
-                }
-                report.failures.push(ScanFailure { path, message });
-            }
-        }
-    }
-    let cache = json!({"version":SCAN_CACHE_VERSION,"entries":entries});
-    if serde_json::to_vec(&cache)
-        .map_err(|error| error.to_string())?
-        .len() as u64
-        > MAX_CACHE_BYTES
-    {
-        return Err("The plugin scan cache exceeded the size limit".into());
-    }
-    crate::storage::write_json_file(&cache_path, &cache).map_err(|error| error.to_string())?;
-    Ok(report)
-}
-
 async fn scan_plugins(
     app: AppHandle,
     state: PluginHostState,
     paths: Vec<String>,
     force: bool,
+    scan_id: Option<String>,
 ) -> Result<ScanReport, String> {
     require_enabled()?;
     if paths.is_empty() {
         return Ok(ScanReport::default());
     }
     let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let scan_id = scan_id.unwrap_or_else(|| format!("legacy-{}", state.scan_sequence.fetch_add(1, Ordering::Relaxed)));
+    // Register before waiting for the worker/scan lock, so disposing a queued request can cancel it.
+    let run = state.scan_control.start(scan_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = state
             .scan_lock
@@ -1329,10 +1213,12 @@ async fn scan_plugins(
         }
         let (paths, failures) = scan_paths(paths)?;
         let bundles = selected_scan_targets(paths);
-        scan_bundles(&root, bundles, failures, force, |bundle| {
+        scan_pipeline::scan(&root, bundles, failures, force,
+          scan_pipeline::Context { run: Some(&run), storage: &state.scan_storage }, |bundle, ticket| {
             if state.scan_process.id() == u32::MAX {
                 return Err(ScanProbeError::Cancelled);
             }
+            let ticket = ticket.expect("a controlled scan owns each package ticket");
             let process =
                 HostProcess::spawn(&[std::ffi::OsStr::new("--plugin-scan"), bundle.as_os_str()])?;
             if let Err(message) = state.scan_process.publish(&process) {
@@ -1342,27 +1228,119 @@ async fn scan_plugins(
                     ScanProbeError::Failure(message)
                 });
             }
-            let result = process
-                .receive(SCAN_TIMEOUT)
-                .map_err(|error| error.to_string())
+            run.attach(ticket, process.control.clone());
+            let result = receive_scan(&process, &run, ticket, SCAN_TIMEOUT)
                 .and_then(|result| {
                     result
                         .get("plugins")
                         .and_then(Value::as_array)
                         .cloned()
-                        .ok_or_else(|| "The plugin scanner returned an invalid result".to_string())
+                        .ok_or_else(|| ScanProbeError::Failure("The plugin scanner returned an invalid result".into()))
                 });
             drop(process);
             state.scan_process.release();
             if state.scan_process.id() == u32::MAX {
                 Err(ScanProbeError::Cancelled)
             } else {
-                result.map_err(ScanProbeError::Failure)
+                result
             }
         })
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn receive_scan(process: &HostProcess, run: &ScanRun, ticket: ScanTicket, timeout: Duration) -> Result<Value, ScanProbeError> {
+    loop {
+        match run.decision(Some(ticket)) {
+            ScanDecision::Skip => return Err(ScanProbeError::Skipped(BlacklistReason::Manual)),
+            ScanDecision::Cancel => return Err(ScanProbeError::Cancelled),
+            ScanDecision::Continue => {}
+        }
+        let remaining = timeout.saturating_sub(ticket.started.elapsed());
+        if remaining.is_zero() { return Err(ScanProbeError::Skipped(BlacklistReason::Timeout)); }
+        match process.responses.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(value) => return value.map_err(ScanProbeError::Failure),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScanProbeError::Failure("The plugin scanner response pipe closed".into())),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn plugin_host_scan_status(state: State<'_, PluginHostState>, scan_id: String) -> Result<Value, String> {
+    require_enabled()?;
+    serde_json::to_value(state.scan_control.status(&scan_id)).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn plugin_host_skip_scan(app: AppHandle, state: State<'_, PluginHostState>, scan_id: String, path: String) -> Result<Value, String> {
+    require_enabled()?;
+    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || skip_scan(&root, &state, &scan_id, &path))
+        .await.map_err(|error| error.to_string())?
+}
+
+fn skip_scan(root: &Path, state: &PluginHostState, scan_id: &str, path: &str) -> Result<Value, String> {
+    // Claim and persist in one storage order. A later restore must win over both actions.
+    let _storage = state.scan_storage.lock().map_err(|_| "Plugin scan storage lock failed")?;
+    let skipped = state.scan_control.skip(scan_id, path);
+    if skipped {
+        // Persist immediately, independently of later cache commit or whole-scan cancellation.
+        blacklist::add(root, path, BlacklistReason::Manual)?;
+    }
+    Ok(json!({ "skipped": skipped }))
+}
+
+#[tauri::command]
+pub async fn plugin_host_cancel_scan(state: State<'_, PluginHostState>, scan_id: String) -> Result<Value, String> {
+    require_enabled()?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || json!({ "cancelled": state.scan_control.cancel(&scan_id) }))
+        .await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn plugin_host_scan_blacklist(app: AppHandle, state: State<'_, PluginHostState>) -> Result<Value, String> {
+    require_enabled()?;
+    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _storage = state.scan_storage.lock().map_err(|_| "Plugin scan storage lock failed")?;
+        serde_json::to_value(blacklist::load(&root)?).map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string())?
+}
+
+fn remove_cached_scan_entry(root: &Path, path: &str) -> Result<(), String> {
+    let file = root.join("plugin-cache.json");
+    let mut cache: Value = fs::File::open(&file).ok()
+        .and_then(|file| serde_json::from_reader(file.take(MAX_CACHE_BYTES)).ok()).unwrap_or(Value::Null);
+    if let Some(entries) = cache.get_mut("entries").and_then(Value::as_array_mut) {
+        let previous = entries.len();
+        entries.retain(|entry| !entry["path"].as_str().is_some_and(|candidate| blacklist::path_matches(candidate, path)));
+        if entries.len() != previous {
+            crate::storage::write_json_file(&file, &cache).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn plugin_host_remove_scan_blacklist(app: AppHandle, state: State<'_, PluginHostState>, path: String) -> Result<(), String> {
+    require_enabled()?;
+    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || restore_scan_entry(&root, &state, &path))
+        .await.map_err(|error| error.to_string())?
+}
+
+fn restore_scan_entry(root: &Path, state: &PluginHostState, path: &str) -> Result<(), String> {
+    let _storage = state.scan_storage.lock().map_err(|_| "Plugin scan storage lock failed")?;
+    state.scan_control.invalidate(path);
+    // Invalidate first: a storage error must leave the exclusion active rather than reuse a failed cache.
+    remove_cached_scan_entry(root, path)?;
+    blacklist::remove(root, path)
 }
 
 #[tauri::command]
@@ -1371,7 +1349,7 @@ pub async fn plugin_host_scan(
     state: State<'_, PluginHostState>,
     paths: Vec<String>,
 ) -> Result<Vec<Value>, String> {
-    Ok(scan_plugins(app, state.inner().clone(), paths, false)
+    Ok(scan_plugins(app, state.inner().clone(), paths, false, None)
         .await?
         .plugins)
 }
@@ -1382,9 +1360,10 @@ pub async fn plugin_host_scan_report(
     state: State<'_, PluginHostState>,
     paths: Vec<String>,
     force: Option<bool>,
+    scan_id: Option<String>,
 ) -> Result<Value, String> {
     serde_json::to_value(
-        scan_plugins(app, state.inner().clone(), paths, force.unwrap_or(false)).await?,
+        scan_plugins(app, state.inner().clone(), paths, force.unwrap_or(false), scan_id).await?,
     )
     .map_err(|error| error.to_string())
 }

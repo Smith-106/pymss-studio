@@ -1219,7 +1219,31 @@
         "generator": "Signal generators",
         "tools": "Utilities",
         "other": "Uncategorized"
-      }
+      },
+      "scanProgress": "Scan progress",
+      "scanPhaseCollecting": "Collecting plugin files",
+      "scanPhaseScanning": "Scanning plugin",
+      "scanPhaseFinished": "Scan completed",
+      "scanPhaseCancelled": "Scan stopped",
+      "scanCompletedCount": "{completed} / {total} completed",
+      "scanElapsed": "Elapsed: {seconds} s",
+      "scanTimeoutHint": "Each plugin package or source has a 10-second timeout. Timed-out items are skipped and blacklisted.",
+      "scanPackageHint": "Skipping excludes every effect at this path, including VST3 classes and VST2 Shell plugins.",
+      "scanAudioUnitsHint": "This source only enumerates system Audio Units metadata. Skipping excludes the entire source for this scan.",
+      "skipScanPlugin": "Skip and blacklist",
+      "stopScan": "Stop scan",
+      "scanPluginSkipped": "Skipped and blacklisted: {name}",
+      "scanPluginAlreadyFinished": "This item has already finished. No subsequent item was skipped.",
+      "scanStopping": "Stopping the scan…",
+      "scanCancelledHint": "The scan was stopped. Plugins already identified remain available.",
+      "scanBlacklistTitle": "Scan blacklist ({count})",
+      "scanBlacklistHint": "Retry scans also exclude blacklisted plugins. Remove an entry and scan again to retry it.",
+      "scanBlacklistEmpty": "The blacklist is empty.",
+      "scanBlacklistTimeout": "Excluded after a timeout",
+      "scanBlacklistManual": "Manually excluded",
+      "removeScanBlacklistNamed": "Remove {name} from the blacklist",
+      "removeScanBlacklist": "Remove",
+      "scanBlacklistRemoved": "Removed from the blacklist. Scan again to retry this item."
     }
   },
   "settings": {

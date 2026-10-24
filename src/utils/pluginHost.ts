@@ -3,11 +3,13 @@ import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
-export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; builtinEffects?: boolean; recording?: boolean; experimental: boolean; labBuild?: boolean }
+export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; builtinEffects?: boolean; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean }
 export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean; category?: string; subCategories?: string[]; rawCategory?: number | null; componentType?: number; componentSubtype?: number; componentManufacturer?: number }
 export type PluginParameter = { id: string; name: string; min: number; max: number; default: number; unit: string; taper: string; choices: string[] }
 export type PluginParameters = Partial<PluginHostStatus> & { params: PluginParameter[]; values: Record<string, number> }
-export type PluginScanReport = { plugins: PluginDescriptor[]; failures: { path: string; message: string }[]; scanned: number; cached: number }
+export type PluginScanBlacklistEntry = { path: string; name: string; reason: 'manual' | 'timeout'; addedAt: number }
+export type PluginScanStatus = { scanId: string; phase: 'collecting' | 'scanning' | 'finished' | 'cancelled'; currentPath: string | null; currentName: string | null; elapsedMs: number; completed: number; total: number; canSkip: boolean }
+export type PluginScanReport = { plugins: PluginDescriptor[]; failures: { path: string; message: string }[]; scanned: number; cached: number; blacklisted?: PluginScanBlacklistEntry[]; cancelled?: boolean }
 export type UnavailablePlugin = { slotId: string; message: string }
 export type PluginHostStatus = { projectId?: string; sessionId?: string; stateRevision?: number; openEditors?: string[]; unavailablePlugins?: UnavailablePlugin[]; position: number; playing: boolean; duration: number; levels?: Record<string, [number, number]>; masterLevel?: [number, number]; error?: string }
 export type PluginSessionState = { project: EditorSession; sessionId: string; revision: number; dirty: boolean; error: string | null; openEditors: string[]; unavailablePlugins: UnavailablePlugin[]; unavailable: boolean }

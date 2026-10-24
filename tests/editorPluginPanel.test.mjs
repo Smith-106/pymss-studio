@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
-import { computed, effectScope, nextTick, reactive, ref, watch } from 'vue'
+import { compileTemplate, parse } from 'vue/compiler-sfc'
+import { computed, effectScope, nextTick, proxyRefs, reactive, ref, watch } from 'vue'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 const component = readFileSync(new URL('../src/components/editor/EditorPluginPanel.vue', import.meta.url), 'utf8')
@@ -15,12 +16,13 @@ const code = ts.transpileModule(source.statements.filter(item => !ts.isImportDec
 const flush = async () => { await nextTick(); await new Promise(resolve => setImmediate(resolve)) }
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const plugin = id => ({ id, format: 'vst3', pluginId: id, name: id, path: `/${id}.vst3`, bypassed: false })
-function environment(t) {
+function environment(t, { scanControl = false } = {}) {
   const capture = deferred()
   const props = reactive({ session: { id: 'project', tracks: [], pluginChain: ['a', 'b', 'c'].map(plugin) }, selectedTrackId: null })
-  const writes = [], calls = [], mounts = []
+  const writes = [], calls = [], mounts = [], disposals = [], timers = new Map()
+  let timerSequence = 0, stopped = false
   const preferences = new Map()
-  const controls = { directory: null, scanGate: null, editorGate: null, captureGate: capture, report: {
+  const controls = { scanControl, scanStatus: null, statusGate: null, skipGate: null, skipResult: true, cancelResult: true, blacklist: [], blacklistGate: null, directory: null, scanGate: null, editorGate: null, captureGate: capture, report: {
     plugins: [{ ...plugin('library'), id: 'vst3:library', classId: 'vst3:library', vendor: 'Vendor', version: '1', isInstrument: false }],
     failures: [], scanned: 1, cached: 0,
   } }
@@ -35,32 +37,53 @@ function environment(t) {
       },
       scheduleSave() { calls.push({ kind: 'save', project: props.session }) },
     }),
-    useEditorPlaybackStore: () => ({}), observePluginSession: () => () => {}, onScopeDispose() {}, onMounted: callback => mounts.push(callback),
+    useEditorPlaybackStore: () => ({}), observePluginSession: () => () => {}, onScopeDispose: callback => disposals.push(callback), onMounted: callback => mounts.push(callback),
     async invoke(command, args) {
       calls.push({ kind: 'invoke', command, args })
       if (command === 'pick_input_folder') return controls.directory
+      if (command === 'plugin_host_scan_status') {
+        const result = typeof controls.scanStatus === 'function' ? controls.scanStatus(args) : controls.scanStatus
+        if (controls.statusGate) await controls.statusGate.promise
+        return result
+      }
+      if (command === 'plugin_host_skip_scan') {
+        const skipped = controls.skipResult
+        if (controls.skipGate) await controls.skipGate.promise
+        return { skipped }
+      }
+      if (command === 'plugin_host_cancel_scan') return { cancelled: controls.cancelResult }
+      if (command === 'plugin_host_scan_blacklist') {
+        const entries = [...controls.blacklist]
+        if (controls.blacklistGate) await controls.blacklistGate.promise
+        return entries
+      }
+      if (command === 'plugin_host_remove_scan_blacklist') { controls.blacklist = controls.blacklist.filter(entry => entry.path !== args.path); return }
       assert.equal(command, 'plugin_host_scan_report')
+      const report = controls.report
       if (controls.scanGate) await controls.scanGate.promise
-      return controls.report
+      return report
     },
     async openPluginEditor(project, slotId, open) {
       calls.push({ kind: 'editor', project, slotId, open })
       if (controls.editorGate) await controls.editorGate.promise
       return { open }
     },
-    pluginHostCapabilities: async () => ({ enabled: true, platform: 'windows', formats: ['vst3'], nativeEditor: true }),
+    pluginHostCapabilities: async () => ({ enabled: true, platform: 'windows', formats: ['vst3'], nativeEditor: true, scanControl: controls.scanControl }),
     crypto: { randomUUID: () => 'added-slot' },
     localStorage: { getItem: key => preferences.get(key) ?? null, setItem: (key, value) => preferences.set(key, value) },
     window: { addEventListener() {}, removeEventListener() {} },
+    setTimeout: callback => { timers.set(++timerSequence, callback); return timerSequence },
+    clearTimeout: id => timers.delete(id),
     clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
   })
   const scope = effectScope()
   scope.run(() => vm.runInContext(code, context))
-  t.after(() => scope.stop())
+  const dispose = () => { if (!stopped) { stopped = true; disposals.forEach(callback => callback()); scope.stop() } }
+  t.after(dispose)
   const read = name => vm.runInContext(`${name}.value`, context)
   const set = (name, value) => { context.__value = value; vm.runInContext(`${name}.value = __value`, context) }
   const call = (name, ...args) => { context.__args = args; return vm.runInContext(`${name}(...__args)`, context) }
-  set('capabilities', { enabled: true, formats: ['vst3'], nativeEditor: true })
+  set('capabilities', { enabled: true, formats: ['vst3'], nativeEditor: true, scanControl })
   function trigger(action) {
     context.slot = props.session.pluginChain[1]
     context.index = 1
@@ -73,7 +96,17 @@ function environment(t) {
     }).outputText
     return vm.runInContext(eventCode, context)(true)
   }
-  return { props, writes, calls, controls, preferences, mounts, read, set, call, trigger, releaseCapture: capture.resolve }
+  return { props, writes, calls, controls, preferences, mounts, timers, dispose, read, set, call, trigger, releaseCapture: capture.resolve,
+    async tick() { const pending = [...timers.values()]; timers.clear(); pending.forEach(callback => callback()); await flush() },
+    evaluate: expression => vm.runInContext(expression, context),
+    buttonDisabled(key) {
+      const button = [...component.matchAll(/<n-button\b[\s\S]*?<\/n-button>/g)].map(match => match[0]).find(markup => markup.includes(`t('editor.plugins.${key}')`))
+      assert.ok(button, `Missing ${key} button`)
+      const expression = button.match(/:disabled="([^"]+)"/)[1]
+      context.__render = proxyRefs(vm.runInContext('({busy,scanning,canSkipScan,canStopScan,scanActionPending,scanStopRequested})', context))
+      return vm.runInContext(`with (__render) { (${expression}) }`, context)
+    },
+  }
 }
 
 test('catalog searches names, vendors and formats and clears a hidden or unsupported selection', async t => {
@@ -437,4 +470,262 @@ test('closing a native editor cannot save a replacement project after its state 
   await closing
   assert.equal(env.calls.some(call => call.kind === 'save'), false)
   assert.equal(env.read('opened').length, 0)
+})
+
+const activeScanStatus = (scanId, path = '/slow.vst3') => ({ scanId, phase: 'scanning', currentPath: path,
+  currentName: path.split('/').at(-1), elapsedMs: 3400, completed: 2, total: 7, canSkip: true })
+
+test('controlled scanning starts progress observation before discovery and busy controls remain operable', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  env.controls.scanGate = deferred()
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId)
+  const scanning = env.call('scan', true)
+  await flush()
+  const commands = env.calls.filter(call => call.kind === 'invoke')
+  assert.equal(commands[0].command, 'plugin_host_scan_status')
+  assert.equal(commands[1].command, 'plugin_host_scan_report')
+  assert.equal(commands[0].args.scanId, commands[1].args.scanId)
+  assert.equal(commands[1].args.force, true)
+  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('scanStatus').elapsedMs, 3400)
+  assert.equal(env.read('scanStatus').completed, 2)
+  assert.equal(env.buttonDisabled('skipScanPlugin'), false)
+  assert.equal(env.buttonDisabled('stopScan'), false)
+  await env.call('skipCurrentScanPlugin')
+  const skipped = env.calls.find(call => call.command === 'plugin_host_skip_scan')
+  assert.deepEqual(JSON.parse(JSON.stringify(skipped.args)), { scanId: commands[1].args.scanId, path: '/slow.vst3' })
+  await env.call('stopScan')
+  assert.equal(env.read('scanStopRequested'), true)
+  assert.equal(env.buttonDisabled('skipScanPlugin'), true)
+  assert.equal(env.buttonDisabled('stopScan'), true)
+  env.controls.report.cancelled = true
+  env.controls.scanGate.resolve()
+  await scanning
+  assert.equal(env.read('busy'), false)
+  assert.equal(env.read('scanning'), false)
+  assert.equal(env.read('scanReport').cancelled, true)
+  assert.equal(env.timers.size, 0)
+  assert.equal(env.writes.length, 0)
+  assert.deepEqual(env.props.session.pluginChain.map(slot => slot.id), ['a', 'b', 'c'])
+})
+
+test('an older backend receives only the original scan call and never the optional controls', async t => {
+  const env = environment(t)
+  await env.mounts[0]()
+  env.set('capabilities', { enabled: true, formats: ['vst3'], nativeEditor: true })
+  env.set('directories', ['/plugins'])
+  await env.call('scan')
+  assert.deepEqual(env.calls.map(call => call.command), ['plugin_host_scan_report'])
+  assert.equal('scanId' in env.calls[0].args, false)
+  assert.equal(env.timers.size, 0)
+})
+
+test('disposing a controlled scan cancels its own identifier and discards late status and results', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  env.controls.scanGate = deferred()
+  env.controls.statusGate = deferred()
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId)
+  const scanning = env.call('scan')
+  await flush()
+  const scanId = env.calls.find(call => call.command === 'plugin_host_scan_report').args.scanId
+  env.dispose()
+  assert.equal(env.read('busy'), false)
+  assert.equal(env.timers.size, 0)
+  assert.equal(env.calls.find(call => call.command === 'plugin_host_cancel_scan').args.scanId, scanId)
+  env.controls.statusGate.resolve()
+  env.controls.scanGate.resolve()
+  await scanning
+  await flush()
+  assert.equal(env.read('scanStatus'), null)
+  assert.equal(env.read('scanReport'), null)
+  assert.equal(env.read('descriptors').length, 0)
+  assert.equal(env.timers.size, 0)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_scan').length, 1)
+  assert.equal(env.writes.length, 0)
+})
+
+test('a stale skip targets the displayed plugin path and cannot silently skip the next plugin', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  env.controls.scanGate = deferred()
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId, '/first.vst3')
+  const scanning = env.call('scan')
+  await flush()
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId, '/next.vst3')
+  env.controls.skipResult = false
+  await env.call('skipCurrentScanPlugin')
+  assert.equal(env.calls.find(call => call.command === 'plugin_host_skip_scan').args.path, '/first.vst3')
+  assert.equal(env.read('scanFeedback'), 'editor.plugins.scanPluginAlreadyFinished')
+  assert.equal(env.read('scanBlacklist').length, 0)
+  await env.tick()
+  assert.equal(env.read('scanStatus').currentPath, '/next.vst3')
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_skip_scan').length, 1)
+  env.controls.scanGate.resolve()
+  await scanning
+  assert.equal(env.writes.length, 0)
+})
+
+test('a closed manager keeps its controlled scan and library selection state until the report completes', async t => {
+  const env = environment(t, { scanControl: true })
+  env.props.session.tracks.push({ id: 'voice', name: 'Voice', pluginChain: [plugin('voice-effect')] })
+  env.set('target', 'voice')
+  env.set('directories', ['/plugins'])
+  env.set('catalogGroupBy', 'category')
+  env.set('librarySearch', 'Vendor')
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId)
+  env.controls.scanGate = deferred()
+  env.call('openManager')
+  const scanning = env.call('scan')
+  await flush()
+  env.call('closeManager')
+  await env.tick()
+  assert.equal(env.read('managerOpen'), false)
+  assert.equal(env.read('busy'), true)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_scan').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_status').length, 2)
+  env.controls.scanGate.resolve()
+  await scanning
+  assert.equal(env.timers.size, 0)
+  env.call('openManager')
+  assert.equal(env.read('target'), 'voice')
+  assert.equal(env.read('catalogGroupBy'), 'category')
+  assert.equal(env.read('librarySearch'), 'Vendor')
+  assert.equal(env.read('descriptors').length, 1)
+  assert.equal(env.writes.length, 0)
+})
+
+test('late status, skip and scan replies cannot clear or overwrite a newer project scan', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  const oldScan = deferred(), oldStatus = deferred(), oldSkip = deferred()
+  env.controls.scanGate = oldScan
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId, '/old.vst3')
+  const oldRequest = env.call('scan')
+  await flush()
+  const oldId = env.read('scanStatus').scanId
+  env.controls.statusGate = oldStatus
+  await env.tick()
+  env.controls.skipGate = oldSkip
+  const skipping = env.call('skipCurrentScanPlugin')
+  await flush()
+  env.props.session = { ...env.props.session, id: 'next', pluginChain: [plugin('untouched')] }
+  await flush()
+  assert.equal(env.calls.find(call => call.command === 'plugin_host_cancel_scan').args.scanId, oldId)
+  env.controls.statusGate = null
+  env.controls.skipGate = null
+  env.controls.scanGate = deferred()
+  env.controls.report = { ...env.controls.report, plugins: [{ ...env.controls.report.plugins[0], name: 'New catalog' }] }
+  env.controls.scanStatus = ({ scanId }) => activeScanStatus(scanId, '/new.vst3')
+  const newRequest = env.call('scan')
+  await flush()
+  const newId = env.read('scanStatus').scanId
+  assert.notEqual(newId, oldId)
+  oldStatus.resolve()
+  oldSkip.resolve()
+  oldScan.resolve()
+  await oldRequest
+  await skipping
+  await flush()
+  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('scanning'), true)
+  assert.equal(env.read('scanStatus').scanId, newId)
+  assert.equal(env.read('scanStatus').currentPath, '/new.vst3')
+  assert.equal(env.read('scanFeedback'), '')
+  assert.equal(env.timers.size, 1)
+  env.controls.scanGate.resolve()
+  await newRequest
+  assert.equal(env.read('descriptors')[0].name, 'New catalog')
+  assert.equal(env.timers.size, 0)
+  assert.deepEqual(env.props.session.pluginChain.map(slot => slot.id), ['untouched'])
+  assert.equal(env.writes.length, 0)
+})
+
+test('blacklisted entries survive forced scans and removing one requires an explicit later rescan', async t => {
+  const env = environment(t, { scanControl: true })
+  const entry = { path: '/blocked.vst3', name: 'Blocked', reason: 'manual', addedAt: 123 }
+  env.controls.blacklist = [entry]
+  await env.call('refreshBlacklist')
+  assert.equal(env.read('scanBlacklist')[0].path, entry.path)
+  env.set('directories', ['/plugins'])
+  env.controls.report = { ...env.controls.report, blacklisted: [entry], cancelled: false }
+  await env.call('scan', true)
+  await flush()
+  assert.equal(env.read('scanBlacklist').length, 1)
+  const report = env.calls.find(call => call.command === 'plugin_host_scan_report')
+  assert.equal(report.args.force, true)
+  assert.deepEqual(Object.keys(report.args).sort(), ['force', 'paths', 'scanId'])
+  await env.call('removeBlacklistedPlugin', entry.path)
+  assert.equal(env.read('scanBlacklist').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_report').length, 1)
+  assert.equal(env.calls.find(call => call.command === 'plugin_host_remove_scan_blacklist').args.path, entry.path)
+  env.controls.report = { ...env.controls.report, blacklisted: [] }
+  await env.call('scan')
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_report').length, 2)
+  assert.deepEqual(env.props.session.pluginChain.map(slot => slot.id), ['a', 'b', 'c'])
+  assert.equal(env.writes.length, 0)
+})
+
+
+test('a delayed blacklist refresh cannot resurrect an entry after the user removes it', async t => {
+  const env = environment(t, { scanControl: true })
+  const entry = { path: '/blocked.vst3', name: 'Blocked', reason: 'timeout', addedAt: 123 }
+  env.controls.blacklist = [entry]
+  await env.call('refreshBlacklist')
+  env.controls.blacklistGate = deferred()
+  const staleRefresh = env.call('refreshBlacklist')
+  await flush()
+  await env.call('removeBlacklistedPlugin', entry.path)
+  env.controls.blacklistGate.resolve()
+  await staleRefresh
+  assert.equal(env.read('scanBlacklist').length, 0)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_report').length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('system Audio Units skips the explicit metadata source rather than claiming a particular component', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('capabilities', { enabled: true, platform: 'macos', formats: ['au'], nativeEditor: true, scanControl: true })
+  env.set('directories', ['au:system'])
+  env.controls.scanGate = deferred()
+  env.controls.scanStatus = ({ scanId }) => ({ ...activeScanStatus(scanId, 'au:system'), currentName: 'Audio Units' })
+  const scanning = env.call('scan')
+  await flush()
+  assert.equal(env.call('scanItemName', 'au:system', 'Audio Units'), 'editor.plugins.systemAudioUnits')
+  assert.equal(env.call('scanItemName', '/shell.dll', 'Shell Bundle'), 'Shell Bundle')
+  await env.call('skipCurrentScanPlugin')
+  assert.equal(env.calls.find(call => call.command === 'plugin_host_skip_scan').args.path, 'au:system')
+  assert.equal(env.writes.length, 0)
+  env.controls.scanGate.resolve()
+  await scanning
+})
+
+test('scan controls and blacklist preserve a valid accessible component template', () => {
+  const parsed = parse(component, { filename: 'EditorPluginPanel.vue' })
+  assert.deepEqual(parsed.errors, [])
+  const result = compileTemplate({ filename: 'EditorPluginPanel.vue', id: 'scan-controls-test',
+    source: parsed.descriptor.template.content, compilerOptions: { expressionPlugins: ['typescript'] } })
+  assert.deepEqual(result.errors, [])
+})
+
+test('null and terminal scan status cleanly gate controls without completing the pending report early', async t => {
+  const env = environment(t, { scanControl: true })
+  env.set('directories', ['/plugins'])
+  env.controls.scanGate = deferred()
+  const scanning = env.call('scan')
+  await flush()
+  assert.equal(env.buttonDisabled('skipScanPlugin'), true)
+  assert.equal(env.buttonDisabled('stopScan'), false)
+  await env.call('skipCurrentScanPlugin')
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_skip_scan').length, 0)
+  env.controls.scanStatus = ({ scanId }) => ({ ...activeScanStatus(scanId), phase: 'finished', currentPath: null, canSkip: false })
+  await env.tick()
+  assert.equal(env.read('busy'), true)
+  assert.equal(env.timers.size, 0)
+  assert.equal(env.buttonDisabled('stopScan'), true)
+  env.controls.scanGate.resolve()
+  await scanning
+  assert.equal(env.read('busy'), false)
+  assert.equal(env.timers.size, 0)
 })

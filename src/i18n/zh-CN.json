@@ -1219,7 +1219,31 @@
         "generator": "信号发生器",
         "tools": "实用工具",
         "other": "未分类"
-      }
+      },
+      "scanProgress": "扫描进度",
+      "scanPhaseCollecting": "正在收集插件文件",
+      "scanPhaseScanning": "正在扫描插件",
+      "scanPhaseFinished": "扫描完成",
+      "scanPhaseCancelled": "扫描已停止",
+      "scanCompletedCount": "已完成 {completed} / {total}",
+      "scanElapsed": "已耗时 {seconds} 秒",
+      "scanTimeoutHint": "单个插件包或来源的扫描超时为 10 秒。超时后将自动跳过并加入黑名单。",
+      "scanPackageHint": "跳过将屏蔽当前路径下的全部效果器，包括 VST3 多类和 VST2 Shell 子插件。",
+      "scanAudioUnitsHint": "此来源仅枚举系统 Audio Units 元数据；跳过将排除此来源的整轮枚举。",
+      "skipScanPlugin": "跳过并加入黑名单",
+      "stopScan": "停止扫描",
+      "scanPluginSkipped": "已跳过并加入黑名单：{name}",
+      "scanPluginAlreadyFinished": "此项扫描已结束，未跳过后续项。",
+      "scanStopping": "正在停止扫描…",
+      "scanCancelledHint": "扫描已停止，已识别的插件仍可使用。",
+      "scanBlacklistTitle": "扫描黑名单（{count}）",
+      "scanBlacklistHint": "重试扫描仍会跳过黑名单项。移出后需手动重新扫描。",
+      "scanBlacklistEmpty": "黑名单为空。",
+      "scanBlacklistTimeout": "扫描超时后自动屏蔽",
+      "scanBlacklistManual": "手动屏蔽",
+      "removeScanBlacklistNamed": "将“{name}”移出黑名单",
+      "removeScanBlacklist": "移出",
+      "scanBlacklistRemoved": "已移出黑名单，请重新扫描以重试此项。"
     }
   },
   "settings": {

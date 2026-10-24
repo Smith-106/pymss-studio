@@ -51,6 +51,14 @@ defaults. On macOS, system Audio Units are a separate explicit source choice.
 The initial position leaves transport visible, and resizing recenters the panel.
 Closing it retains the selected target and catalog; native windows stay open.
 The library groups results by vendor, declared effect type or plugin format.
+Scanning runs on the blocking worker with one isolated helper per package. The
+manager shows the active package, elapsed time and completion count, with Skip
+and blacklist and Stop controls available while the scan is busy. A package that
+exceeds ten seconds is terminated, excluded and followed by the next package.
+Exclusions persist in plugin-blacklist.json and survive ordinary/forced rescans.
+Remove an entry in the manager to invalidate its failure cache and retry during
+the next scan. VST2 shell children/VST3 classes share their package exclusion;
+the explicit system AU source is a whole metadata enumeration, not a per-unit test.
 VST3 uses SDK metadata; VST2 categories stay coarse; unknown categories are not
 guessed from names. AU currently uses vendor/format and actual component identity.
 Track and master chains support adding, ordering, bypassing, removing and opening
@@ -883,3 +891,21 @@ Windows ordinary/Lab/minimal debug builds all passed with unchanged source hashe
 The ordinary exe passed the real staged-package verifier; Lab identity and disabled
 minimal capability responses were checked without creating desktop data. Each native
 application exe also passed five processing-restriction/state-preservation scenarios.
+
+Twentieth iteration: interruptible package scans (2026-10-24 UTC)
+----------------------------------------------------------------
+Independent scan IDs and package attempts own progress, skip and cancellation.
+Fifty-millisecond polling observes controls under the existing ten-second deadline;
+skip wins over a simultaneous successful reply. Cancellation can be followed by a
+new scan and does not poison the app-wide shutdown lease or affect playback/render.
+Manual skip has one persistence owner; restoring an exclusion cannot be undone by
+a late worker add. Cache commit also respects restore invalidations. UI polling and
+controls reject obsolete project/source/scan replies and clean up timers.
+
+Validation: Windows native bridge/control/storage 68 passed; frontend 1180 passed,
+three skipped, focused UI/locales 41 passed. Three actual Vue browser scenarios with
+mock IPC passed at two sizes, without page errors. Ordinary/Lab Windows debug builds
+and packaged capabilities/helper entry checks passed. No installed plugins, remote
+license servers, user windows, macOS/Linux desktop execution or signing were used.
+Unix descendant-held-pipe regression is included in the native validation workflow.
+Reports: E:/pymss-vst-lab-artifacts/native-v20-* and scan-control-ui/.

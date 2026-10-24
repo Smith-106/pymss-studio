@@ -57,8 +57,8 @@ jobs:
       - name: Check native host with ordinary application identity
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --features native-plugins
       - name: Verify process isolation and saved-state bridge
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features vst-lab commands::plugin_host::tests
+        run: 'cargo test --locked --manifest-path src-tauri/Cargo.toml --features vst-lab commands::plugin_host::'
       - name: Verify ordinary-identity plugin bridge
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features native-plugins commands::plugin_host::tests
+        run: 'cargo test --locked --manifest-path src-tauri/Cargo.toml --features native-plugins commands::plugin_host::'
       - name: Verify guarded application quit requests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --features native-plugins app_quit::tests

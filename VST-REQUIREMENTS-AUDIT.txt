@@ -1,6 +1,6 @@
 VST 原始需求对照检查
 检查日期：2026-10-24
-当前实现基线：5a50b95；本轮增量实现和验证见第 14 节（保留历史记录）
+当前实现基线：3927233；本轮增量实现和验证见第 15 节（保留历史记录）
 实验分支：codex/vst3-host-lab
 工作目录：D:/项目/pymss-studio-vst-lab
 
@@ -43,6 +43,7 @@ AU 属于 Apple 平台；“三平台”应按各格式的原生适用范围验�
      Dock Quit/注销等系统原生终止路径尚未覆盖，不能把菜单测试当作该路径通过。
 
 本轮证据（本机）：
+  native-v20-*、scan-control-ui/：扫描跳过、10 秒期限、持久黑名单及界面验证，见第 15 节。
   native-v19-*：本轮 AU 修复、退出流程、默认/发行接线及验证，详见第 14 节。
   native-v18-*：AAX 模块/ABI 探测、VST3 处理限制、当前宿主和桥接验证，详见第 13 节。
   native-v13-{linux,aarch64-apple-darwin,x86_64-apple-darwin}.log：交叉 check --tests。
@@ -556,3 +557,43 @@ AAX 保留此前的诊断实现，本轮不扩展，不作为当前交付门槛�
 Apple 声道定义依据：
 https://developer.apple.com/documentation/audiotoolbox/auchannelinfo
 https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_supportednumchannels
+
+15. 第二十轮：可中断扫描与持久扫描黑名单（基线 3927233）
+
+扫描继续复用已有 spawn_blocking 后台线程和逐包独立 helper，不在 UI 线程加载插件。
+本轮新增 scanId 所有权、当前包/耗时/完成数量、独立跳过和停止命令；接收以 50ms
+短轮询检查控制标记，并沿用每包 10 秒绝对期限。手动跳过或超时均继续后面的包。
+停止整轮会返回已完成的部分结果、保留未访问缓存；不会将用户停止的当前包自动拉黑。
+
+plugin-blacklist.json 持久保存路径、名称、manual/timeout 原因和时间。普通/强制扫描
+均在 fingerprint/cache/native probe 前检查黑名单，文件变化或缓存成功不自动绕过它。
+界面可逐项移出；移出会同时清除该路径的失败缓存，下次扫描重新识别，不改工程插件链。
+黑名单损坏或未知版本明确报错，限制 2 MiB/4096 项；Windows 路径比较兼容扩展路径前缀。
+
+并发/进程保证：
+  - skip 按 scanId 和当前完整路径认领；完成和跳过在同一状态锁下决策，跳过优先于
+    同期成功回包，迟到请求不能作用于下一包/下一轮。手动取消不复用永久 shutdown 标记。
+  - 手动 skip 只有命令一处负责持久化；认领和写入按 storage 锁排序，worker 仅报告。
+    修复了用户刚移出黑名单、扫描收尾又重复 add 的竞态。移出也使在途旧缓存失效。
+  - 只停止 scanner 的 owned ProcessControl；原有播放/渲染进程不受影响。
+    Unix 仍先终止所属进程组再回收 leader，覆盖后代持有 stdout 的退出边界。
+  - 轮询、控制和列表刷新带 scanId/generation/project/disposed 守卫；组件释放、换来源
+    或换工程时取消自身扫描。关闭浮层保留后台扫描；停止/结束后清除轮询 timer。
+
+粒度明确：VST3 多类、VST2 Shell 按共享二进制包路径跳过；au:system 是整个系统 AU
+目录的元数据枚举，跳过会排除此显式来源，不伪称定位/验证了某一个 AU 的 DSP 加载。
+AAX 保持暂缓，未扩展。三平台 CI 的桥接过滤器现覆盖新增子模块和 Unix 持管道回归。
+
+验证：
+  - Windows 宿主/控制/黑名单回归 68 项通过，包括真实挂起子进程超时回收、跳过优先、
+    另一个宿主不被终止、强制扫描不能绕过、恢复后新探测和两种旧缓存/恢复竞态。
+  - 前端全量 1180 通过、3 跳过；扫描界面/文案聚焦 41 项通过。
+  - 真实 Vue + mock IPC 的 Playwright 场景 3/3，覆盖 1280x820 与 980x680、键盘操作、
+    skip→下一项、关闭重开继续、停止、移出名单不自动扫描或改变链，页面错误为空。
+  - 普通身份/Lab Windows Debug 均完成类型检查、前端生产构建和原生链接；普通版实际
+    stage verifier 通过，Lab 的 scanControl=true、身份和 helper shutdown 入口通过。
+  - 新模块 rustfmt、YAML 与差异检查通过；实现源码保持与构建输入一致。构建期间仅修正
+    CI 过滤器末尾冒号的 YAML 引用，差异单独记录 native-v20-workflow-only-fix.json。
+
+本轮未扫描已安装第三方插件，未访问授权服务器，未重启用户当前窗口，也未运行
+macOS/Linux 桌面或真实签名包；Unix 专属新测试等待对应平台 CI/统一验收。
