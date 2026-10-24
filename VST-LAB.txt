@@ -3,6 +3,9 @@ Pymss Studio VST Lab
 
 Experimental branch: codex/vst3-host-lab
 Original requirement audit and remaining acceptance work: VST-REQUIREMENTS-AUDIT.txt.
+Original three-platform/four-format production target is not complete: AAX has no
+loader, macOS/Linux runtime acceptance is pending, and release builds do not enable
+the optional vst-lab host. The current executable is a Windows debug lab build.
 Initial validated host target: Windows x64 VST3 audio effects.
 VST3 implementation now also includes macOS and Linux; native validation is pending there.
 Additional code adapters: Windows/macOS/Linux VST2 effects, including shell children,
@@ -31,8 +34,14 @@ files into the lab unless they are disposable copies.
 
 Usage
 -----
-Open an audio project, select a track in the editor, then use the plugin panel
-in the inspector. Add a search directory or scan the standard VST3 directories.
+Open an audio project and select a track in the editor. The inspector has one
+Audio plugins button opening the draggable, modeless manager. Choose a plugin
+folder on the left to identify its effects, select an effect and add it to the
+named track/master destination on the right. Sources initially contain no folder;
+only explicitly selected sources are remembered. Empty lists never scan system
+defaults. On macOS, system Audio Units are a separate explicit source choice.
+The initial position leaves transport visible, and resizing recenters the panel.
+Closing it retains the selected target and catalog; native windows stay open.
 Track and master chains support adding, ordering, bypassing, removing and opening
 the plugin's native window. Native edits are observed and automatically captured
 into immutable content-addressed files; manual save and window close await the
@@ -683,3 +692,92 @@ No real third-party plugin, editor window, microphone or output stream was opene
 macOS/Linux programs were not executed. These timing fixes resolve the code issue
 recorded in iteration twelve; AAX hosting, native compatibility and signed release
 acceptance remain outstanding.
+
+Fourteenth iteration: floating plugin manager (2026-10-24 UTC)
+------------------------------------------------------------
+Plugin library forms and generic controls moved out of the narrow inspector.
+The sidebar retains chain context, bypass and native-editor shortcuts. Manage
+plugins opens a wide, draggable, modeless panel with chain and library columns;
+long paths wrap, and error details/recovery stay in that panel. The existing
+theme and built-in component set are retained. The outdated instruction to
+disable built-in effects was removed from the plugin introduction.
+
+The manager uses the existing Vue owner and plugin/store APIs. It does not create
+another Tauri window or another graph/controller. Closing it preserves catalog,
+directories, selection and native editor lifetime. Project replacement closes
+the manager and rejects late scan/editor replies. Missing targets fall back to
+master, and an action awaiting state capture cannot recreate a removed track.
+
+Dropdowns and confirmation popups live under the floating card's keyboard
+boundary. Escape dismisses the active child before the manager. Confirmation
+buttons cannot trigger background playback/delete shortcuts. Resize clears only
+drag offsets, preserving controls and drafts. Numeric parameter inputs receive
+their accessible label on the input itself.
+
+Validation: frontend 1140 passed, three skipped; the focused panel suite passes
+15 tests. Its previous SFC passes the original seven and fails all eight new
+state/lifecycle regressions in an isolated comparison. Thirteen controlled-
+transport browser scenarios cover compact layout, dragging, resize, background
+loop control, close/reopen, generic parameter writes, chain actions, persistence,
+scan errors and recovery. Extra light/dark captures check 1280x820 and 980x680.
+The initial empty sidebar measures about 171 CSS pixels in that browser check.
+No real plugin, device or user project is manipulated by these UI checks.
+
+Windows lab build uses the normal pnpm vst:build entry. Native DSP/SDK code was
+not changed or retested in this UI iteration. Logs, screenshots and build hashes:
+E:/pymss-vst-lab-artifacts/plugin-manager-v14-* and native-v14-*.
+Fifteenth iteration: plugin manager layout and controls (2026-10-24 UTC)
+-----------------------------------------------------------------------
+Search locations now collapse to a single row, with manual paths and the existing
+native folder picker available on expansion. The library is a searchable list
+with visible selection and one add action. Generic parameters and chain controls
+stay in the left column; reorder, relocation and removal use labelled icon buttons.
+Empty, no-match and scan-failure states provide focused guidance. Scan failures
+retain full diagnostics under an expandable detail control.
+
+Existing descriptor labels still distinguish AU versions, shell classes and
+same-name installations. These details remain visible and accessible in the list;
+relocation preserves its strict format/identity filter. A filter cannot leave a
+hidden or unsupported candidate selected. Scan progress is separate from other
+busy operations. Keyboard boundaries, project lifetime guards and native window
+ownership remain with the existing panel/store paths.
+
+Validation: frontend 1144 passed, three skipped; focused panel tests include
+search, folder cancellation/deduplication, variant metadata and relocation.
+Fifteen controlled-transport browser scenarios passed without page errors. Five
+additional light/dark layouts cover 1440x900, 1280x820 and 980x680. Browser tests
+use synthetic projects and mock Tauri responses; they do not access user data or
+exercise real plugins/devices. Native DSP/SDK code remains unchanged.
+Artifacts: E:/pymss-vst-lab-artifacts/plugin-manager-v15-* and native-v15-*.
+
+Sixteenth iteration: explicit plugin sources and guided setup (2026-10-24 UTC)
+----------------------------------------------------------------------------
+The inspector now exposes one Audio plugins function button. The floating manager
+follows a left-to-right workflow: choose a source, identify effects, then add to
+the named track/master destination. Selecting a folder identifies its effects;
+cancelling does nothing. Search/add controls appear after identification, and a
+successful chain edit names its destination. Existing projects and effect state
+are preserved when library sources change.
+
+New source preferences restore only choices made through this workflow. Legacy
+experimental search paths are neither imported nor deleted. Both desktop scan
+commands now treat an empty source list as empty, without system/environment
+fallback or probing. macOS Audio Unit discovery is an explicit system-source
+action, using the existing au:system protocol; normal folder scans no longer
+append it. Native CLI defaults and saved AU project loading remain unchanged.
+Source revisions invalidate late scan replies and errors. Relative/invalid paths
+retain validation, and AU registry sources remain limited to macOS lab builds.
+
+The manager assigns its own content/footer classes to the existing Naive UI
+component. This fixes the previous selector mismatch and nested outer scrolling.
+Only long source lists, plugin results and effect chains need local scrolling;
+the workflow bar and add action remain visible at the desktop minimum size.
+
+Validation: frontend full suite 1148 passed, three skipped; 28 focused panel and
+locale checks passed after final UI changes. Windows plugin-host tests: 45 passed.
+Seventeen controlled-transport browser scenarios and five light/dark layout cases
+passed. Empty roots, old cached candidates, explicit AU gating, picker cancellation,
+source invalidation, saved chain preservation and footer visibility are covered.
+Browser/native unit checks use synthetic data, not user projects or real plugins.
+macOS/Linux runtime and real third-party plugin/device acceptance remain deferred.
+Artifacts: E:/pymss-vst-lab-artifacts/plugin-manager-v16-* and native-v16-*.

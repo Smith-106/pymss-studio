@@ -878,17 +878,6 @@ pub async fn plugin_host_request(
     .map_err(|error| error.to_string())?
 }
 
-fn default_scan_paths() -> Vec<PathBuf> {
-    #[cfg(feature = "vst-lab")]
-    {
-        pymss_audio_host::default_search_paths()
-    }
-    #[cfg(not(feature = "vst-lab"))]
-    {
-        Vec::new()
-    }
-}
-
 fn bundle_fingerprint(path: &Path) -> Result<String, String> {
     fn visit(path: &Path, hash: &mut Sha256, count: &mut usize) -> Result<(), String> {
         *count += 1;
@@ -1050,24 +1039,25 @@ fn normalize_descriptor(
     Ok(())
 }
 
-fn scan_paths(
-    paths: Vec<String>,
-    defaults: Vec<PathBuf>,
-) -> Result<(Vec<PathBuf>, Vec<ScanFailure>), String> {
-    let custom = !paths.is_empty();
-    let paths = if custom {
-        let paths: Vec<_> = paths.into_iter().map(PathBuf::from).collect();
-        if paths.iter().any(|path| !path.is_absolute()) {
-            return Err("Plugin scan directories must be absolute".into());
-        }
-        paths
-    } else {
-        defaults
-    };
+fn scan_paths(paths: Vec<String>) -> Result<(Vec<PathBuf>, Vec<ScanFailure>), String> {
+    let paths: Vec<_> = paths.into_iter().map(PathBuf::from).collect();
+    if paths
+        .iter()
+        .any(|path| !is_virtual_scan_target(path) && !path.is_absolute())
+    {
+        return Err("Plugin scan directories must be absolute".into());
+    }
     let mut valid = Vec::new();
     let mut failures = Vec::new();
     for path in paths {
         let result = (|| {
+            if is_virtual_scan_target(&path) {
+                return if cfg!(all(feature = "vst-lab", target_os = "macos")) {
+                    Ok(())
+                } else {
+                    Err("Audio Unit discovery is only available on macOS".into())
+                };
+            }
             let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
             let bundle = is_plugin_path(&path);
             if !bundle && !metadata.is_dir() {
@@ -1081,14 +1071,38 @@ fn scan_paths(
         })();
         match result {
             Ok(()) => valid.push(path),
-            Err(message) if custom => failures.push(ScanFailure {
+            Err(message) => failures.push(ScanFailure {
                 path: path.to_string_lossy().into_owned(),
                 message,
             }),
-            Err(_) => (),
         }
     }
     Ok((valid, failures))
+}
+
+fn selected_scan_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let audio_units = cfg!(all(feature = "vst-lab", target_os = "macos"))
+        && paths.iter().any(|path| is_virtual_scan_target(path));
+    let roots: Vec<_> = paths
+        .into_iter()
+        .filter(|path| !is_virtual_scan_target(path))
+        .collect();
+    // Never let an empty source list reach the native finder's default fallback.
+    #[cfg(feature = "vst-lab")]
+    let mut bundles = if roots.is_empty() {
+        Vec::new()
+    } else {
+        pymss_audio_host::find_bundles(&roots)
+    };
+    #[cfg(not(feature = "vst-lab"))]
+    let mut bundles: Vec<PathBuf> = {
+        let _ = roots;
+        Vec::new()
+    };
+    if audio_units {
+        bundles.push(PathBuf::from("au:system"));
+    }
+    bundles
 }
 
 enum ScanProbeError {
@@ -1254,6 +1268,9 @@ async fn scan_plugins(
     force: bool,
 ) -> Result<ScanReport, String> {
     require_enabled()?;
+    if paths.is_empty() {
+        return Ok(ScanReport::default());
+    }
     let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = state
@@ -1263,25 +1280,8 @@ async fn scan_plugins(
         if state.scan_process.id() == u32::MAX {
             return Err("Plugin scanning was cancelled".into());
         }
-        let (paths, failures) = scan_paths(paths, default_scan_paths())?;
-        // An empty explicit list after validation must not trigger the native
-        // finder's fallback to system defaults.
-        #[cfg(feature = "vst-lab")]
-        let mut bundles = if paths.is_empty() {
-            Vec::new()
-        } else {
-            pymss_audio_host::find_bundles(&paths)
-        };
-        #[cfg(not(feature = "vst-lab"))]
-        let mut bundles: Vec<PathBuf> = {
-            let _ = paths;
-            Vec::new()
-        };
-        // Audio Units are registered components rather than files. Always probe
-        // the current catalog, including scans with custom VST directories.
-        if cfg!(all(feature = "vst-lab", target_os = "macos")) {
-            bundles.push(PathBuf::from("au:system"));
-        }
+        let (paths, failures) = scan_paths(paths)?;
+        let bundles = selected_scan_targets(paths);
         scan_bundles(&root, bundles, failures, force, |bundle| {
             if state.scan_process.id() == u32::MAX {
                 return Err(ScanProbeError::Cancelled);
@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_paths_reports_custom_invalid_paths_without_reporting_absent_defaults() {
+    fn scan_paths_only_validates_explicit_sources() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing");
         let file = root.path().join("readme.txt");
@@ -1938,15 +1938,71 @@ mod tests {
             [&missing, &file, &valid]
                 .map(|path| path.to_string_lossy().into_owned())
                 .to_vec(),
-            Vec::new(),
         )
         .unwrap();
         assert_eq!(paths, vec![valid]);
         assert_eq!(failures.len(), 2);
-        let (paths, failures) = scan_paths(Vec::new(), vec![missing]).unwrap();
+        let (paths, failures) = scan_paths(Vec::new()).unwrap();
         assert!(paths.is_empty());
         assert!(failures.is_empty());
-        assert!(scan_paths(vec!["relative/plugins".into()], Vec::new()).is_err());
+        assert!(scan_paths(vec!["relative/plugins".into()]).is_err());
+    }
+
+    #[test]
+    fn empty_sources_never_probe_or_reuse_an_old_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("plugin-cache.json"),
+            serde_json::to_vec(&json!({"version":SCAN_CACHE_VERSION,"entries":[{
+                "path":"old-fixture.vst3","plugins":[{"id":"old-fixture"}]
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (paths, failures) = scan_paths(Vec::new()).unwrap();
+        let bundles = selected_scan_targets(paths);
+        assert!(bundles.is_empty());
+        let report = scan_bundles(root.path(), bundles, failures, false, |_| {
+            panic!("empty sources must never load a plugin")
+        })
+        .unwrap();
+        assert!(report.plugins.is_empty());
+        assert!(report.failures.is_empty());
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.cached, 0);
+    }
+
+    #[cfg(feature = "vst-lab")]
+    #[test]
+    fn selected_directory_does_not_include_other_sources_or_audio_units() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("selected");
+        let other = root.path().join("other");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&other).unwrap();
+        let plugin = selected.join("Gain.vst3");
+        fs::create_dir(&plugin).unwrap();
+        fs::create_dir(other.join("Unselected.vst3")).unwrap();
+        let (paths, failures) = scan_paths(vec![selected.to_string_lossy().into_owned()]).unwrap();
+        assert!(failures.is_empty());
+        assert_eq!(selected_scan_targets(paths), vec![plugin]);
+    }
+
+    #[test]
+    fn audio_unit_catalog_requires_an_explicit_supported_source() {
+        let (paths, failures) = scan_paths(vec!["au:system".into(), "au:system".into()]).unwrap();
+        if cfg!(all(feature = "vst-lab", target_os = "macos")) {
+            assert!(failures.is_empty());
+            assert_eq!(
+                selected_scan_targets(paths),
+                vec![PathBuf::from("au:system")]
+            );
+        } else {
+            assert!(paths.is_empty());
+            assert_eq!(failures.len(), 2);
+            assert!(failures[0].message.contains("only available on macOS"));
+        }
+        assert!(scan_paths(vec!["au:unknown".into()]).is_err());
     }
 
     #[test]
@@ -1961,8 +2017,7 @@ mod tests {
         };
         let plugin = root.path().join(format!("effect.{extension}"));
         fs::write(&plugin, "plugin-binary").unwrap();
-        let (paths, failures) =
-            scan_paths(vec![plugin.to_string_lossy().into_owned()], Vec::new()).unwrap();
+        let (paths, failures) = scan_paths(vec![plugin.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(paths, vec![plugin]);
         assert!(failures.is_empty());
     }
@@ -1972,8 +2027,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bundle = directory.path().join("Effect.aaxplugin");
         fs::create_dir(&bundle).unwrap();
-        let (paths, failures) =
-            scan_paths(vec![bundle.to_string_lossy().into_owned()], Vec::new()).unwrap();
+        let (paths, failures) = scan_paths(vec![bundle.to_string_lossy().into_owned()]).unwrap();
         assert!(failures.is_empty());
         let report = scan_bundles(directory.path(), paths, Vec::new(), true, |_| {
             panic!("an unsupported format must never reach the VST loader")

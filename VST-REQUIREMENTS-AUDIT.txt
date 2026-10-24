@@ -1,12 +1,62 @@
 VST 原始需求对照检查
 检查日期：2026-10-24
-检查起点：35955b6（保留前几轮的验证记录）
+当前核对基线：8a5ed00（保留前几轮的验证记录）
 实验分支：codex/vst3-host-lab
 工作目录：D:/项目/pymss-studio-vst-lab
 
 结论：核心效果器链路已接通，但“四格式、三平台正式支持”尚未全部验收。
 AAX 真实加载未实现；macOS/Linux 实机、第三方 VST2/AU 和签名发布包验证待完成。
-本次执行代码检查、自动化测试及本地原生测试夹具，不启动桌面界面或第三方插件。
+本次核对代码、既有测试/构建报告与官方资料，未新增真实插件或跨平台运行验收。
+
+0. 当前交付状态：未达到原始正式支持目标
+
+平台       VST2                    VST3                    AU                     AAX
+Windows    已接入，真实插件待验收   已接入，有早期实测记录   无原生运行支持          未实现
+macOS      已接入，实机待验收       已接入，实机待验收       AUv2/AUv3 已接，待验收  未实现
+Linux      已接入，实机待验收       已接入，实机待验收       无原生运行支持          未实现
+
+以上“已接入”仅指实验构建内具备效果器加载/处理、参数、状态和窗口代码路径。
+macOS/Linux 的旧交叉报告执行的是 cargo check --tests；没有完成本机链接和运行，
+不能称为真机通过。Windows 的 TDR Nova/其他真实 VST3 记录属于较早提交，不能替代
+当前全部格式的正式回归。当前 8a5ed00 只确认 Windows x64 Debug 实验版已构建、启动。
+
+正式发布仍未启用：
+  - src-tauri/Cargo.toml 的 default=[]；宿主是可选的 vst-lab feature。
+  - plugin_host.rs:66 的能力门禁要求该 feature，返回值仍标记 experimental=true。
+  - 三平台正式 release 工作流的 tauri build 命令均未启用 vst-lab。
+  - pnpm vst:build 使用独立 Lab 标识、Debug 和 --no-bundle；不等于签名发行包。
+  - .github/workflows/vst-lab-native.yml 有三系统 check/test 矩阵，但配置本身不证明
+    当前提交的真机兼容性或正式安装包已验收。
+
+AAX 是实现缺口，不是仅待补测：HostedPlugin 只有 VST2/VST3/AU，没有 AAX adapter。
+当前 .aaxplugin 路径只报告 unsupported。Avid 公开 AAX SDK 页面说明的是插件开发，
+尚未核实适用于本应用独立宿主的加载契约；不得据此宣称可直接接入或已经支持。
+AU 属于 Apple 平台；“三平台”应按各格式的原生适用范围验收，不代表同一插件二进制
+能跨操作系统加载，也不默认承诺跨系统或跨架构桥接。
+
+关闭剩余目标所需的工作：
+  1) 核实 AAX 独立宿主可实施接口及接入条件，具备明确依据后完成真实加载链路。
+  2) 分平台以真实 VST2/VST3、macOS AUv2/AUv3 验证扫描、DSP、窗口、预设/参数、
+     工程保存恢复、混合链导出和故障恢复；AAX 实现后同样验收。
+  3) 接入正式构建/发行路径，并验证 Windows 便携布局、macOS 签名/公证与插件装载、
+     Linux 依赖和 X11/XWayland 窗口边界；未完成前保留实验标识。
+  4) 验证完整应用退出和资源清理。此前窗口关闭失败曾需结束旧进程，尚无当前版本
+     正式包退出回归通过的证据；启动成功或测试总数不能替代该项。
+
+本轮证据（本机）：
+  native-v13-{linux,aarch64-apple-darwin,x86_64-apple-darwin}.log：交叉 check --tests。
+  tauri-smoke/20261023T160336.729089Z-12868/report.json：早期 Windows TDR Nova VST3，12/12。
+  native-v16-build-artifact.json：8a5ed00 Windows x64 Debug vst-lab 构建指纹。
+  plugin-manager-v16-{tests,rust-tests,ui}.log：1148 前端、45 桥接及 17 个受控界面场景；
+  它们不构成真实第三方插件/macOS/Linux 的正式兼容性验收。
+  以上文件均位于 E:/pymss-vst-lab-artifacts。
+
+官方资料复核：
+  https://developer.avid.com/aax/
+  https://developer.avid.com/audio/
+  https://developer.apple.com/documentation/audiotoolbox/incorporating-audio-effects-and-instruments
+
+以下为既有迭代记录，状态冲突时以上述当前核对结果为准。
 
 1. 原始要求与当前证据
 
