@@ -117,61 +117,14 @@ jobs:
             echo "RELEASE_PRERELEASE=${{ github.event_name == 'workflow_dispatch' && inputs.prerelease == true }}" >> "$GITHUB_ENV"
           fi
           requested_auto_update="${{ github.event_name == 'workflow_dispatch' && inputs.allow_auto_update == true }}"
+          echo "RELEASE_AUTO_UPDATE_SUPPORTED=$requested_auto_update" >> "$GITHUB_ENV"
           echo "RELEASE_MACOS_AUTO_UPDATE_SUPPORTED=$requested_auto_update" >> "$GITHUB_ENV"
           echo "RELEASE_LINUX_AUTO_UPDATE_SUPPORTED=$requested_auto_update" >> "$GITHUB_ENV"
-          previous_tag="$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | grep -v "^${release_tag}$" | head -n 1 || true)"
-          runtime_compatible=false
-          compatibility_reason="No previous release with a complete Windows runtime and package contract was found."
-          if [[ -n "$previous_tag" ]] && \
-              git cat-file -e "$previous_tag:python/runtime-manifest.json" && \
-              git cat-file -e "$previous_tag:src-tauri/tauri.conf.json" && \
-              git cat-file -e "$previous_tag:installer/pymss-studio.iss"; then
-            previous_manifest="$(mktemp)"
-            previous_tauri_config="$(mktemp)"
-            previous_installer="$(mktemp)"
-            trap 'rm -f "$previous_manifest" "$previous_tauri_config" "$previous_installer"' EXIT
-            git show "$previous_tag:python/runtime-manifest.json" > "$previous_manifest"
-            git show "$previous_tag:src-tauri/tauri.conf.json" > "$previous_tauri_config"
-            git show "$previous_tag:installer/pymss-studio.iss" > "$previous_installer"
-            base_layout_args=()
-            # Python ABI, accelerator packages and layout revisions are compared in the
-            # manifest. Dependency installation/probe changes in prepare scripts do not
-            # replace an installed base; Windows pruning can remove runtime files.
-            if ! git diff --quiet "$previous_tag" "$GITHUB_SHA" -- \
-                scripts/prune-python-runtime.ps1; then
-              base_layout_args+=(--base-layout-changed)
-            fi
-            compatibility_status=0
-            compatibility_reason="$(python3 scripts/check-runtime-update-compatibility.py \
-              "${base_layout_args[@]}" \
-              --previous-tauri-config "$previous_tauri_config" \
-              --current-tauri-config src-tauri/tauri.conf.json \
-              --previous-installer "$previous_installer" \
-              --current-installer installer/pymss-studio.iss \
-              "$previous_manifest" python/runtime-manifest.json)" || compatibility_status=$?
-            if [[ "$compatibility_status" -gt 1 ]]; then
-              echo "Unable to determine runtime update compatibility" >&2
-              exit "$compatibility_status"
-            fi
-            if [[ "$compatibility_status" -eq 0 ]]; then
-              runtime_compatible=true
-            fi
-          fi
-          echo "Previous release: ${previous_tag:-none}"
           echo "Automatic update requested: $requested_auto_update"
-          echo "Windows runtime compatibility: $runtime_compatible ($compatibility_reason)"
           update_message=""
-          if [[ "$requested_auto_update" == "true" && "$runtime_compatible" == "true" ]]; then
-            echo "RELEASE_AUTO_UPDATE_SUPPORTED=true" >> "$GITHUB_ENV"
-          else
-            echo "RELEASE_AUTO_UPDATE_SUPPORTED=false" >> "$GITHUB_ENV"
-            if [[ "$requested_auto_update" != "true" ]]; then
-              update_message="This release requires manual installation from GitHub because automatic updates were not enabled for this release."
-            else
-              update_message="This release requires manual installation from GitHub. ${compatibility_reason}"
-            fi
+          if [[ "$requested_auto_update" != "true" ]]; then
+            update_message="This release requires manual installation from GitHub because automatic updates were not enabled for this release."
           fi
-          echo "RELEASE_RUNTIME_COMPATIBLE=$runtime_compatible" >> "$GITHUB_ENV"
           echo "RELEASE_UPDATE_MESSAGE=$update_message" >> "$GITHUB_ENV"
       - name: Download Windows portable artifacts
         if: needs.windows.result == 'success'
