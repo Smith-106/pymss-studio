@@ -4,6 +4,8 @@
 //! the same frame while it returns `false`, then retry that block. Filesystem and
 //! process I/O happen only when creating a timeline or on decoder worker threads.
 
+pub use crate::limiter::MasterLimiterSpec;
+
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -118,6 +120,8 @@ pub struct SessionSpec {
     pub master_volume: f64,
     #[serde(default)]
     pub master_pan: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_limiter: Option<MasterLimiterSpec>,
     pub sources: Vec<SourceSpec>,
     pub tracks: Vec<TrackSpec>,
     #[serde(default)]
@@ -151,6 +155,9 @@ impl SessionSpec {
         valid_id(&self.id, "Session")?;
         in_range(self.master_volume, 0.0, 2.0, "Master volume")?;
         in_range(self.master_pan, -1.0, 1.0, "Master pan")?;
+        if let Some(limiter) = &self.master_limiter {
+            limiter.validate()?;
+        }
         if self.tracks.len() > MAX_TRACKS || self.sources.len() > MAX_SOURCES {
             return Err(format!(
                 "A session supports at most {MAX_TRACKS} tracks and {MAX_SOURCES} sources"

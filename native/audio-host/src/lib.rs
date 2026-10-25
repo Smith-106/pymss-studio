@@ -1,6 +1,7 @@
 mod discovery;
 mod engine;
 mod graph;
+mod limiter;
 mod output;
 mod plugins;
 mod protocol;

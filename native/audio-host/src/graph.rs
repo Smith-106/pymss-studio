@@ -203,6 +203,7 @@ pub(crate) struct Graph {
     chains: Vec<Vec<Slot>>,
     suppressed: Vec<bool>,
     master: Vec<Slot>,
+    limiter: crate::limiter::MasterLimiter,
     delays: Vec<Delay>,
     pub mix: Vec<Vec<f32>>,
     pub levels: Vec<[f32; 2]>,
@@ -349,7 +350,13 @@ impl Graph {
             .map(|c| total_latency(c.iter().map(|s| s.latency)))
             .collect();
         let max_latency = track_latencies.iter().copied().max().unwrap_or(0);
-        let latency = max_latency.saturating_add(total_latency(master.iter().map(|s| s.latency)));
+        let limiter = crate::limiter::MasterLimiter::new(
+            spec.master_limiter.clone().unwrap_or_default(),
+            sample_rate,
+        );
+        let latency = max_latency
+            .saturating_add(total_latency(master.iter().map(|s| s.latency)))
+            .saturating_add(limiter.latency());
         if latency > MAX_LATENCY {
             return Err("Combined plugin latency exceeds the supported limit".into());
         }
@@ -383,6 +390,7 @@ impl Graph {
                 chains,
                 suppressed,
                 master,
+                limiter,
                 delays,
                 mix: vec![vec![0.0; BLOCK]; 2],
                 levels,
@@ -397,6 +405,7 @@ impl Graph {
 
     pub fn reset(&mut self) {
         self.timeline.clear_pending();
+        self.limiter.reset();
         for slot in self
             .chains
             .iter_mut()
@@ -490,7 +499,9 @@ impl Graph {
             .map(|values| total_latency(values.iter().copied()))
             .collect();
         let maximum = totals.iter().copied().max().unwrap_or(0);
-        let combined = maximum.saturating_add(total_latency(master_latencies.iter().copied()));
+        let combined = maximum
+            .saturating_add(total_latency(master_latencies.iter().copied()))
+            .saturating_add(self.limiter.latency());
         if combined > MAX_LATENCY {
             return Err("Combined plugin latency exceeds the supported limit".into());
         }
@@ -532,7 +543,19 @@ impl Graph {
         {
             return Err("Audio graph topology changed".into());
         }
+        let next_limiter = spec.master_limiter.clone().unwrap_or_default();
+        let maximum = self.chains.iter()
+            .map(|chain| total_latency(chain.iter().map(|slot| slot.latency)))
+            .max().unwrap_or(0);
+        let latency = maximum
+            .saturating_add(total_latency(self.master.iter().map(|slot| slot.latency)))
+            .saturating_add(next_limiter.latency(self.sample_rate));
+        if latency > MAX_LATENCY {
+            return Err("Combined plugin latency exceeds the supported limit".into());
+        }
         self.timeline.apply_mix_update(prepared)?;
+        self.limiter.configure(next_limiter);
+        self.latency = latency;
         for (slots, track) in self.chains.iter_mut().zip(&spec.tracks) {
             for slot in slots {
                 if let Some(next) = track.plugin_chain.iter().find(|s| s.id == slot.id) {
@@ -663,6 +686,7 @@ impl Graph {
                 "Audio graph produced invalid samples".into(),
             ));
         }
+        self.limiter.process(&mut self.mix, frames);
         Ok(true)
     }
 }
@@ -670,6 +694,26 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limiter_latency_survives_update_renegotiation_and_reset_without_adding_a_tail() {
+        let mut spec: SessionSpec = serde_json::from_value(serde_json::json!({
+            "id":"limiter", "name":"Audio", "sources":[], "tracks":[],
+            "masterLimiter":{"enabled":true,"attackMs":100.0}
+        })).unwrap();
+        let (mut graph, _) = Graph::load(spec.clone(), "ffmpeg".into(), 48000).unwrap();
+        assert_eq!(graph.latency, 4800);
+        assert_eq!(graph.tail, 0);
+        graph.renegotiate_latency().unwrap(); assert_eq!(graph.latency, 4800);
+        spec.master_limiter.as_mut().unwrap().attack_ms = 3.0;
+        let prepared = crate::timeline::prepare_mix_update(spec.clone(), 48000).unwrap();
+        graph.update_mix(spec.clone(), prepared).unwrap(); assert_eq!(graph.latency, 144);
+        graph.reset(); assert_eq!(graph.latency, 144);
+        spec.master_limiter.as_mut().unwrap().enabled = false;
+        let prepared = crate::timeline::prepare_mix_update(spec.clone(), 48000).unwrap();
+        graph.update_mix(spec, prepared).unwrap(); assert_eq!(graph.latency, 0);
+        graph.renegotiate_latency().unwrap(); assert_eq!(graph.latency, 0);
+    }
 
     #[test]
     fn monitor_suppression_survives_mix_updates_and_ignores_legacy_effects() {

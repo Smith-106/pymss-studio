@@ -219,7 +219,7 @@ impl Session {
         Self::load_at_rate(spec, ffmpeg, rate, offline)
     }
 
-    fn load_at_rate(
+    pub(crate) fn load_at_rate(
         spec: SessionSpec,
         ffmpeg: PathBuf,
         rate: u32,
@@ -538,6 +538,14 @@ impl Session {
 
     pub fn update_mix(&mut self, spec: SessionSpec) -> Result<Value, String> {
         let prepared = prepare_mix_update(spec.clone(), self.sample_rate)?;
+        let previous_latency = self.spec.master_limiter.clone().unwrap_or_default().latency(self.sample_rate);
+        let next_latency = spec.master_limiter.clone().unwrap_or_default().latency(self.sample_rate);
+        let latency_changed = previous_latency != next_latency;
+        let pause = if latency_changed {
+            Some(SnapshotPause::acquire(&self.tx, Duration::from_secs(5))?)
+        } else {
+            None
+        };
         let (reply, applied) = bounded(1);
         self.send(Control::Mix(spec.clone(), prepared, reply))?;
         // Admit one prepared update at a time. Large effect histories must not
@@ -559,7 +567,17 @@ impl Session {
         {
             self.latency_recovery_used = false;
         }
+        if latency_changed {
+            let frame = self.clock.position().min((spec.duration() * f64::from(self.sample_rate)).round() as u64);
+            self.transport_playing = self.playback_intent();
+            let generation = self.clock.transition(frame, self.transport_playing);
+            if let Err(error) = self.send(Control::Seek(frame, generation)) {
+                self.fail(error.clone());
+                return Err(error);
+            }
+        }
         self.spec = spec;
+        drop(pause);
         Ok(self.status())
     }
 
@@ -1094,7 +1112,7 @@ fn process(
                 last,
             });
         }
-        if output.slots() <= 4096 - 1024 || (!looping && position >= end) {
+        if warmup == 0 && (output.slots() <= 4096 - 1024 || (!looping && position >= end)) {
             clock.prefilled(generation);
         }
         for (meter, level) in meters.iter().zip(&graph.levels) {
@@ -1755,6 +1773,24 @@ mod tests {
         session.clock.recovering.store(false, Ordering::Release);
         session.fail("Plugin processing failed".into());
         assert!(!session.can_update_in_place(&spec));
+    }
+
+    #[test]
+    fn limiter_mix_updates_reuse_the_session_and_preserve_paused_transport_position() {
+        let mut spec: SessionSpec = serde_json::from_value(json!({"id":"limiter", "name":"Audio",
+            "sources":[{"id":"offline", "path":"", "duration":1}],
+            "tracks":[{"id":"muted", "sourceId":"offline", "muted":true}]})).unwrap();
+        let mut session = Session::load(spec.clone(), "ffmpeg".into()).unwrap();
+        session.seek(0.5).unwrap();
+        let id = session.session_id.clone();
+        for (enabled, attack_ms) in [(true, 3.0), (true, 100.0), (false, 100.0)] {
+            spec.master_limiter = Some(crate::limiter::MasterLimiterSpec { enabled, attack_ms, ..Default::default() });
+            let status = session.update_mix(spec.clone()).unwrap();
+            assert_eq!(status["position"], 0.5);
+            assert_eq!(status["playing"], false);
+            assert_eq!(session.session_id, id);
+            assert!(session.error.is_none());
+        }
     }
 
     #[test]

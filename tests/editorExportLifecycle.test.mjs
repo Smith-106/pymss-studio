@@ -250,3 +250,35 @@ test('history and persistence retain independent master and track chains with un
   assert.deepEqual(saved.pluginChain[0], unknown)
   assert.equal(saved.tracks[0].pluginChain[0].state, 'sha256:opaque')
 })
+
+test('enabled master limiter alone renders natively at the encoding rate and clears processing before encoding', async () => {
+  const env = environment()
+  env.store.setMasterLimiter({ enabled: true, gainDb: 12, ceilingDb: -6 })
+  const exporting = env.store.exportMix({ format: 'wav', audioParams: { sampleRate: 32000 } })
+  await flush()
+  const native = env.calls.find(call => call.command === 'plugin_host_render')
+  assert.equal(native.args.project.masterLimiter.enabled, true)
+  assert.equal(native.args.sampleRate, 32000)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.equal(start.args.payload.project.masterLimiter, undefined)
+  assert.equal(start.args.payload.project.masterVolume, 1)
+  assert.equal(start.args.payload.project.masterPan, 0)
+  assert.equal(start.args.payload.project.tracks.length, 1)
+  assert.equal(start.args.payload.project.assets[0].path, 'D:/native-render.wav')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/limited.wav', duration: 1.5, sampleRate: 32000, channels: 2, format: 'wav' } })
+  await exporting
+})
+
+test('disabled master limiter keeps normal exports on the existing dry path', async () => {
+  const env = environment()
+  env.store.setMasterLimiter({ enabled: false, gainDb: 30, ceilingDb: -30 })
+  const exporting = env.store.exportMix({ format: 'wav' })
+  await flush()
+  assert.equal(env.calls.some(call => call.command === 'plugin_host_render'), false)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.equal(start.args.payload.project.assets[0].path, 'D:/audio.wav')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/dry.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+})

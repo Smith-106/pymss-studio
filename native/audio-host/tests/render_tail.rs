@@ -822,3 +822,55 @@ fn legacy_effect_fields_are_ignored_and_export_updates_preserve_the_session() {
     );
     host.finish();
 }
+
+#[test]
+fn master_limiter_exports_at_the_encoding_rate_without_losing_or_adding_frames() {
+    let ffmpeg = std::env::var_os("PYMSS_TEST_FFMPEG").map(PathBuf::from).or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
+            .map(|path| path.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }))
+            .find(|path| path.is_file()))
+    });
+    let Some(ffmpeg) = ffmpeg else { eprintln!("FFmpeg unavailable; skipping limiter export coverage"); return; };
+    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = directory.path().join("limiter-input.wav");
+    let mut writer = hound::WavWriter::create(&source, hound::WavSpec {
+        channels: 2, sample_rate: 48000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float,
+    }).unwrap();
+    for i in 0..4800 {
+        let sample = if i == 0 || i >= 4750 { 1.0_f32 } else { 0.1 };
+        writer.write_sample(sample).unwrap(); writer.write_sample(-sample * 0.25).unwrap();
+    }
+    writer.finalize().unwrap();
+    let mut host = Host::with_behavior("");
+    let mut project = json!({"id":"limiter-export","name":"Audio","masterVolume":2.0,
+        "sources":[{"id":"source","path":source,"duration":0.1,"channels":2,"sampleRate":48000}],
+        "tracks":[{"id":"voice","sourceId":"source"},{"id":"backing","sourceId":"source"}],
+        "masterLimiter":{"enabled":true,"gainDb":6.0,"ceilingDb":-6.0,"attackMs":3.0,"releaseMs":250.0}});
+    let ffmpeg = ffmpeg.canonicalize().unwrap();
+    for rate in [32000, 44100, 48000] {
+        host.request(json!({"op":"load","project":project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":rate}));
+        for attack in [0.1, 100.0] {
+            let before = host.request(json!({"op":"status"}));
+            project["masterLimiter"]["attackMs"] = attack.into();
+            let after = host.request(json!({"op":"update","project":project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":rate}));
+            assert_eq!(after["sessionId"], before["sessionId"], "timing updates must keep the plugin session");
+            let path = directory.path().join(format!("limited-{rate}-{attack}.wav"));
+            let result = host.render(&path);
+            assert_eq!(result["sampleRate"], rate);
+            let reader = hound::WavReader::open(path).unwrap();
+            assert_eq!(reader.duration(), rate / 10, "lookahead must not change duration");
+            let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+            assert!(samples.iter().all(|sample| sample.abs() <= 10.0_f32.powf(-6.0 / 20.0) + 1e-7));
+            assert!(samples[0].abs() > 0.0, "first frame must survive latency compensation");
+            assert!(samples[samples.len() - 2].abs() > 0.0, "last frame must be flushed");
+            for frame in samples.chunks_exact(2) { assert!((frame[0] * 0.25 + frame[1]).abs() < 1e-6); }
+        }
+    }
+    project["masterLimiter"]["enabled"] = false.into();
+    host.request(json!({"op":"update","project":project,"ffmpeg":ffmpeg,"offline":true}));
+    let path = directory.path().join("bypass.wav"); host.render(&path);
+    let samples: Vec<f32> = hound::WavReader::open(path).unwrap().into_samples::<f32>().map(Result::unwrap).collect();
+    assert!(samples.iter().any(|sample| sample.abs() > 1.0), "bypass must preserve the unrestricted mix");
+    host.finish();
+}

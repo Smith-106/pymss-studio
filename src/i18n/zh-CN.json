@@ -977,6 +977,16 @@
     "exportFailed": "导出失败",
     "zoomIn": "放大",
     "zoomOut": "缩小",
+    "limiter": {
+      "unavailable": "当前音频环境不支持限幅器，请更新系统 WebView 后重试。",
+      "failed": "限幅器处理失败，请重新播放。",
+      "title": "限幅器",
+      "enable": "启用限幅器",
+      "gain": "增益",
+      "ceiling": "限幅",
+      "attack": "启动时间",
+      "release": "释放时间"
+    },
     "masterVolume": "主音量",
     "balance": "左右平衡",
     "balanceShort": "平衡",

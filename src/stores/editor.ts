@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { masterLimiterRenderRate, normalizeMasterLimiter } from '@/utils/masterLimiter'
 import { createLogger } from '@/utils/logger'
 import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
 import { assertPluginProjectSupported, currentPluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession } from '@/utils/pluginHost'
@@ -15,6 +16,7 @@ import { registerWindowCloseGuard, WindowClosePersistenceError } from '@/utils/w
 import { isTauriRuntime } from '@/utils/appStore'
 import type { SeparationTask, StemOutput } from '@/stores/task'
 import type {
+  EditorMasterLimiter,
   EditorPluginSlot,
   EditorExportFormat,
   EditorExportOptions,
@@ -44,6 +46,7 @@ type HistorySnapshot = {
   tracks: EditorTrack[]
   masterVolume: number
   masterPan: number
+  masterLimiter?: EditorMasterLimiter
   pluginChain?: EditorPluginSlot[]
   selectedTrackId: string | null
   selectedClipId: string | null
@@ -481,6 +484,7 @@ function normalizeSession(session: PersistedSession): EditorSession {
     sourceResultDir: session.sourceResultDir ? String(session.sourceResultDir) : undefined,
     masterVolume: clamp(Number(session.masterVolume ?? 1), 0, 2),
     masterPan: clamp(Number(session.masterPan ?? 0), -1, 1),
+    masterLimiter: session.masterLimiter ? normalizeMasterLimiter(session.masterLimiter) : undefined,
     pluginChain: normalizePluginChain(session.pluginChain),
     sources,
     tracks,
@@ -694,6 +698,7 @@ export const useEditorStore = defineStore('editor', () => {
       tracks: cloneTracks(session.value.tracks),
       masterVolume: session.value.masterVolume,
       masterPan: session.value.masterPan,
+      masterLimiter: session.value.masterLimiter ? { ...session.value.masterLimiter } : undefined,
       pluginChain: clonePluginChain(session.value.pluginChain),
       selectedTrackId: selectedTrackId.value,
       selectedClipId: selectedClipId.value,
@@ -705,6 +710,7 @@ export const useEditorStore = defineStore('editor', () => {
     session.value.tracks = cloneTracks(next.tracks)
     session.value.masterVolume = next.masterVolume
     session.value.masterPan = next.masterPan
+    session.value.masterLimiter = next.masterLimiter ? { ...next.masterLimiter } : undefined
     session.value.pluginChain = clonePluginChain(next.pluginChain)
     selectedTrackId.value = next.selectedTrackId
     selectedClipId.value = next.selectedClipId
@@ -1805,6 +1811,16 @@ export const useEditorStore = defineStore('editor', () => {
     if (interactionDepth.value === 0) scheduleSave()
   }
 
+  function setMasterLimiter(patch: Partial<EditorMasterLimiter>) {
+    if (!session.value) return
+    const previous = normalizeMasterLimiter(session.value.masterLimiter)
+    const next = normalizeMasterLimiter({ ...previous, ...patch })
+    if (JSON.stringify(previous) === JSON.stringify(next)) return
+    pushHistory()
+    session.value.masterLimiter = next
+    if (interactionDepth.value === 0) scheduleSave()
+  }
+
   function setMasterPan(value: number) {
     if (!session.value) return
     session.value.masterPan = clamp(Number(value), -1, 1)
@@ -1942,7 +1958,7 @@ export const useEditorStore = defineStore('editor', () => {
     let snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
     const renderController = new AbortController()
     exportRenderController = renderController
-    const pluginRenderRequired = hasEditorPlugins(snapshot)
+    const pluginRenderRequired = hasEditorPlugins(snapshot) || normalizeMasterLimiter(snapshot.masterLimiter).enabled
     let pluginTailLimited = false
     exporting.value = true
     exportCancelling.value = false
@@ -1966,7 +1982,11 @@ export const useEditorStore = defineStore('editor', () => {
             nativeRenderTaskId = taskId
             exportProgress.value = { phase: 'rendering', completed: 0, total: 100, current: '' }
             try {
-              const rendered = await invoke<{ path: string; duration: number; sampleRate: number; channels: number; tailLimited?: boolean }>('plugin_host_render', { project: snapshot, taskId })
+              const rendered = await invoke<{ path: string; duration: number; sampleRate: number; channels: number; tailLimited?: boolean }>('plugin_host_render', {
+                project: snapshot, taskId,
+                sampleRate: normalizeMasterLimiter(snapshot.masterLimiter).enabled
+                  ? masterLimiterRenderRate(snapshot, normalized.audioParams?.sampleRate) : undefined,
+              })
               pluginTailLimited = rendered.tailLimited === true
               return { session: neutralPluginRenderProject(snapshot, rendered), sourceSampleRate: rendered.sampleRate }
             } finally {
@@ -2168,6 +2188,7 @@ export const useEditorStore = defineStore('editor', () => {
     setClipTiming,
     setMasterVolume,
     setMasterPan,
+    setMasterLimiter,
     removeTrack,
     removeClip,
     removeSource,

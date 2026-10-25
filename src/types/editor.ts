@@ -62,6 +62,14 @@ export type EditorTrack = {
   clips?: EditorClip[]
 }
 
+export type EditorMasterLimiter = {
+  enabled: boolean
+  gainDb: number
+  ceilingDb: number
+  attackMs: number
+  releaseMs: number
+}
+
 export type EditorSession = {
   id: string
   name: string
@@ -69,6 +77,7 @@ export type EditorSession = {
   sourceResultDir?: string
   masterVolume: number
   masterPan: number
+  masterLimiter?: EditorMasterLimiter
   pluginChain?: EditorPluginSlot[]
   sources: EditorSource[]
   tracks: EditorTrack[]

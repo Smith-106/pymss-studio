@@ -4,8 +4,9 @@ import type { InputInst } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { PencilOutline } from '@vicons/ionicons5'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
-import type { EditorClip, EditorSession, EditorSource } from '@/types/editor'
+import type { EditorClip, EditorMasterLimiter as MasterLimiterSettings, EditorSession, EditorSource } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
+import EditorMasterLimiter from '@/components/editor/EditorMasterLimiter.vue'
 import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
 import EditorPluginPanel from '@/components/editor/EditorPluginPanel.vue'
 
@@ -23,6 +24,9 @@ const emit = defineEmits<{
   selectTrack: [trackId: string | null]
   setMasterVolume: [value: number]
   setMasterPan: [value: number]
+  setMasterLimiter: [patch: Partial<MasterLimiterSettings>]
+  beginMasterLimiter: []
+  commitMasterLimiter: []
   beginMasterVolume: []
   commitMasterVolume: []
   beginMasterPan: []
@@ -114,8 +118,28 @@ function normalizeLevel(value: number | undefined) {
 function levelDb(value: number) {
   return value > 0 ? 20 * Math.log10(value) : -Infinity
 }
+const meterTicks = [
+  { db: 0, position: 1 },
+  { db: -3, position: 0.88 },
+  { db: -6, position: 0.76 },
+  { db: -9, position: 0.64 },
+  { db: -12, position: 0.52 },
+  { db: -15, position: 0.4 },
+  { db: -24, position: 0.24 },
+  { db: -30, position: 0.12 },
+  { db: -60, position: 0 },
+]
 function meterValue(value: number) { return Math.max(-60, levelDb(value)) }
-function meterScale(value: number) { return (meterValue(value) + 60) / 60 }
+function meterDbScale(db: number) {
+  if (db >= 0) return 1
+  for (let index = 1; index < meterTicks.length; index++) {
+    const lower = meterTicks[index]
+    const upper = meterTicks[index - 1]
+    if (db >= lower.db) return lower.position + (db - lower.db) / (upper.db - lower.db) * (upper.position - lower.position)
+  }
+  return 0
+}
+function meterScale(value: number) { return meterDbScale(meterValue(value)) }
 function formatLevel(value: number) { return value > 0 ? levelDb(value).toFixed(1) : '−∞' }
 
 watch(
@@ -287,9 +311,11 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
             </div>
             <div class="inspector-strip__meter">
               <div v-for="(value, index) in channelLevels" :key="index" class="inspector-strip__meter-bar" role="meter" :aria-label="`${t('editor.channelLevel')} · ${t(index === 0 ? 'editor.panLeft' : 'editor.panRight')}`" :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="meterValue(value)" :aria-valuetext="`${formatLevel(value)} dBFS`">
-                <span :class="{ 'inspector-strip__meter-fill--full': value >= 1 }" :style="{ transform: `scaleY(${meterScale(value)})` }" />
+                <span :class="{ 'inspector-strip__meter-fill--full': value >= 1 }" :style="{ clipPath: `inset(${(1 - meterScale(value)) * 100}% 0 0)` }" />
               </div>
-              <div class="inspector-strip__meter-scale" aria-hidden="true"><span>0</span><span>−30</span><span>−60</span></div>
+              <div class="inspector-strip__meter-scale" aria-hidden="true">
+                <span v-for="tick in meterTicks" :key="tick.db" :class="{ 'inspector-strip__meter-tick--major': tick.db >= -12 }" :style="{ top: `${(1 - tick.position) * 100}%` }">{{ tick.db === 0 ? '0' : `−${Math.abs(tick.db)}` }}</span>
+              </div>
             </div>
           </div>
 
@@ -435,6 +461,13 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
           </div>
         </div>
       </section>
+      <EditorMasterLimiter
+        v-if="!selectedTrack"
+        :value="session.masterLimiter"
+        @update="emit('setMasterLimiter', $event)"
+        @begin="emit('beginMasterLimiter')"
+        @commit="emit('commitMasterLimiter')"
+      />
     </div>
   </aside>
 </template>
@@ -578,9 +611,12 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
 .inspector-strip__fader :deep(.editor-parameter-slider__reset) { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); min-height: 18px; max-width: 100%; padding: 0 3px; font-size: 9px; white-space: normal; }
 .inspector-strip__meter { display: grid; grid-template-columns: 5px 5px 16px; gap: 2px; }
 .inspector-strip__meter-bar { position: relative; overflow: hidden; background: var(--surface-2); border: 1px solid var(--outline); border-radius: 2px; }
-.inspector-strip__meter-bar > span { position: absolute; inset: 0; background: var(--success, var(--primary)); transform-origin: bottom; }
+.inspector-strip__meter-bar > span { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255, 106, 106, 0.95), rgba(255, 170, 102, 0.92) 24%, rgba(92, 214, 132, 0.9) 60%); }
 .inspector-strip__meter-bar > .inspector-strip__meter-fill--full { background: var(--error, var(--warning)); }
-.inspector-strip__meter-scale { display: flex; flex-direction: column; justify-content: space-between; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
+.inspector-strip__meter-scale { position: relative; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
+.inspector-strip__meter-scale > span { position: absolute; left: 0; white-space: nowrap; transform: translateY(-50%); }
+.inspector-strip__meter-scale > span::before { content: ''; position: absolute; top: 50%; left: -3px; width: 2px; height: 1px; background: var(--outline-strong); }
+.inspector-strip__meter-scale > .inspector-strip__meter-tick--major { color: var(--on-surface); font-size: 9px; font-weight: 600; }
 .inspector-strip__readout { display: grid; justify-items: center; gap: 1px; padding: 4px 0 1px; border-top: 1px solid color-mix(in srgb, var(--outline) 60%, transparent); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .inspector-strip__readout > strong { font-size: 11px; font-weight: 600; }
 .inspector-strip__readout > small { color: var(--on-surface-muted); font-size: 8px; }

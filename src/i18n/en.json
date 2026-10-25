@@ -977,6 +977,16 @@
     "exportFailed": "Export failed",
     "zoomIn": "Zoom in",
     "zoomOut": "Zoom out",
+    "limiter": {
+      "unavailable": "The audio environment does not support the limiter. Update the system WebView and retry.",
+      "failed": "Limiter processing failed. Restart playback.",
+      "title": "Limiter",
+      "enable": "Enable limiter",
+      "gain": "Gain",
+      "ceiling": "Ceiling",
+      "attack": "Attack",
+      "release": "Release"
+    },
     "masterVolume": "Master",
     "balance": "Balance",
     "balanceShort": "Pan",

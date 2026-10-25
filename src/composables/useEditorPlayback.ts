@@ -2,6 +2,8 @@ import { onBeforeUnmount, type Ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
+import { normalizeMasterLimiter } from '@/utils/masterLimiter'
+import masterLimiterWorkletUrl from '@/audio/masterLimiterProcessor.js?url'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '@/utils/editorClips'
 import { createEditorAudioElement, createPreviewChunkReader, EditorTimelinePlayback, type TimelineAudioClip } from '@/utils/editorAudio'
 import type { EditorClip, EditorSource, EditorTrack } from '@/types/editor'
@@ -95,6 +97,10 @@ export function useEditorPlayback(options: PlaybackOptions) {
   let followScrollTargetLeft = 0
   let audioContext: AudioContext | null = null
   let disposed = false
+  let masterLimiterNode: AudioWorkletNode | null = null
+  let masterLimiterSetup: Promise<void> | null = null
+  let masterLimiterModuleLoaded = false
+  let masterLimiterDrainTimer: ReturnType<typeof setTimeout> | null = null
   let timelinePlayback: EditorTimelinePlayback | null = null
   let masterInputGain: GainNode | null = null
   let masterBalanceSplitter: ChannelSplitterNode | null = null
@@ -163,6 +169,77 @@ export function useEditorPlayback(options: PlaybackOptions) {
     }
     applyMasterAudioSettings()
     return audioContext
+  }
+
+  async function syncMasterLimiter() {
+    const config = normalizeMasterLimiter(editor.session?.masterLimiter)
+    if (disposed || nativePlayback.required.value || !audioContext) return
+    if (config.enabled && activeClips().some(({ clip }) => audioEntries.get(clip.id)?.graphEnabled === false)) {
+      throw new Error(ERROR_AUDIO_CONTEXT)
+    }
+    if (masterLimiterNode) {
+      masterLimiterNode.port.postMessage({ type: 'configure', config })
+      return
+    }
+    if (!config.enabled) return
+    if (masterLimiterSetup) return masterLimiterSetup
+    const ctx = audioContext
+    masterLimiterSetup = (async () => {
+      if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error(String(i18n.global.t('editor.limiter.unavailable')))
+      if (!masterLimiterModuleLoaded) {
+        await ctx.audioWorklet.addModule(masterLimiterWorkletUrl)
+        masterLimiterModuleLoaded = true
+      }
+      if (disposed || audioContext !== ctx || nativePlayback.required.value) return
+      const latest = normalizeMasterLimiter(editor.session?.masterLimiter)
+      if (!latest.enabled) return
+      const node = new AudioWorkletNode(ctx, 'pymss-master-limiter', {
+        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+        channelCount: 2, channelCountMode: 'explicit', processorOptions: latest,
+      })
+      node.onprocessorerror = () => {
+        if (disposed || masterLimiterNode !== node) return
+        node.onprocessorerror = null
+        node.disconnect()
+        node.port.close()
+        masterLimiterNode = null
+        if (audioContext !== ctx) return
+        masterBalanceMerger!.disconnect()
+        masterBalanceMerger!.connect(masterMeterSplitter!)
+        masterBalanceMerger!.connect(ctx.destination)
+        // A retained bypass node must not fail dry playback or the native graph.
+        if (!nativePlayback.required.value && normalizeMasterLimiter(editor.session?.masterLimiter).enabled) {
+          failPlayback(activeRequestId, new Error(String(i18n.global.t('editor.limiter.failed'))))
+        }
+      }
+      node.connect(masterMeterSplitter!)
+      node.connect(ctx.destination)
+      masterBalanceMerger!.disconnect()
+      masterBalanceMerger!.connect(node)
+      masterLimiterNode = node
+    })().catch(cause => {
+      // Setup is shared by startup and live edits. Ignore a late failure when
+      // the current playback no longer needs this limiter or audio context.
+      if (disposed || audioContext !== ctx || nativePlayback.required.value
+        || !normalizeMasterLimiter(editor.session?.masterLimiter).enabled) return
+      throw cause
+    }).finally(() => { masterLimiterSetup = null })
+    return masterLimiterSetup
+  }
+
+  function finishAtEnd() {
+    if (intent.value !== 'play' || masterLimiterDrainTimer !== null) return
+    const finish = () => {
+      masterLimiterDrainTimer = null
+      if (disposed || intent.value !== 'play') return
+      if (loop.value) void requestPlay(0)
+      else requestPause(true)
+    }
+    const config = normalizeMasterLimiter(editor.session?.masterLimiter)
+    const delay = masterLimiterNode && config.enabled && audioContext
+      ? Math.ceil(config.attackMs * audioContext.sampleRate / 1000) / audioContext.sampleRate * 1000 : 0
+    if (delay > 0) masterLimiterDrainTimer = setTimeout(finish, delay)
+    else finish()
   }
 
   function ensureMeterBuffer(node: AnalyserNode) {
@@ -494,9 +571,7 @@ export function useEditorPlayback(options: PlaybackOptions) {
             rafId = requestAnimationFrame(tick)
           }
         }, () => {
-          if (intent.value !== 'play') return
-          if (loop.value) void requestPlay(0)
-          else requestPause(true)
+          finishAtEnd()
         })
     }
     return timelinePlayback
@@ -721,8 +796,13 @@ export function useEditorPlayback(options: PlaybackOptions) {
   }
 
   function pauseAllAudios(keepPending = false) {
+    if (masterLimiterDrainTimer !== null) {
+      clearTimeout(masterLimiterDrainTimer)
+      masterLimiterDrainTimer = null
+    }
     timelinePlayback?.pause(keepPending)
     audioEntries.forEach(pauseEntry)
+    masterLimiterNode?.port.postMessage({ type: 'reset' })
   }
 
   function syncPauseAt(time: number) {
@@ -895,6 +975,9 @@ export function useEditorPlayback(options: PlaybackOptions) {
     }
     if (expectedRequestId !== activeRequestId) return 0
     if (ctx && ctx.state !== 'running') throw new Error(ERROR_AUDIO_CONTEXT)
+    if (normalizeMasterLimiter(editor.session?.masterLimiter).enabled && !ctx) throw new Error(ERROR_AUDIO_CONTEXT)
+    await syncMasterLimiter()
+    if (expectedRequestId !== activeRequestId) return 0
 
     const timeline = ensureTimelinePlayback()
     if (timeline) {
@@ -917,6 +1000,9 @@ export function useEditorPlayback(options: PlaybackOptions) {
       entry: ensureAudioEntry(track, clip, source),
     }))
 
+    if (normalizeMasterLimiter(editor.session?.masterLimiter).enabled && managed.some(({ entry }) => !entry.graphEnabled)) {
+      throw new Error(ERROR_AUDIO_CONTEXT)
+    }
     const nextTime = clampTime(targetTime)
     playback.setCurrentTime(nextTime)
     playbackAnchorTime = performance.now() / 1000 - nextTime
@@ -1033,29 +1119,8 @@ export function useEditorPlayback(options: PlaybackOptions) {
     followPlayhead()
 
     const total = computeDuration()
-    if (total > 0 && time >= total - (timelinePlayback ? 0 : 0.04)) {
-      if (loop.value && intent.value === 'play') {
-        const id = playback.beginRequest('play', 'starting')
-        activeRequestId = id
-        void syncActiveAudios(0, id).then((count) => {
-          if (id !== activeRequestId || intent.value !== 'play') return
-          if (count <= 0) {
-            playback.fail(id, ERROR_NO_LOADED_AUDIO)
-            return
-          }
-          if (!playback.finishPlay(id)) return
-          playback.setCurrentTime(0)
-          playbackAnchorTime = performance.now() / 1000
-          followPlayhead('seek')
-          stopRaf()
-          rafId = requestAnimationFrame(tick)
-        }).catch((cause) => {
-          failPlayback(id, cause)
-        })
-        return
-      }
-
-      requestPause(true)
+    if (total > 0 && time >= total - (timelinePlayback || normalizeMasterLimiter(editor.session?.masterLimiter).enabled ? 0 : 0.04)) {
+      finishAtEnd()
       return
     }
 
@@ -1101,6 +1166,11 @@ export function useEditorPlayback(options: PlaybackOptions) {
   watch(() => editor.masterVolume, () => {
     applyMasterVolume()
   })
+
+  watch(() => editor.session?.masterLimiter, () => {
+    const id = activeRequestId
+    void syncMasterLimiter().catch(cause => failPlayback(id, cause))
+  }, { deep: true })
 
   watch(trackMixSignature, applyMasterVolume)
 
@@ -1160,6 +1230,12 @@ export function useEditorPlayback(options: PlaybackOptions) {
     disposed = true
     stop(true)
     releaseAudios()
+    if (masterLimiterNode) {
+      masterLimiterNode.onprocessorerror = null
+      masterLimiterNode.disconnect()
+      masterLimiterNode.port.close()
+      masterLimiterNode = null
+    }
     if (audioContext) {
       void audioContext.close().catch(() => undefined)
       audioContext = null

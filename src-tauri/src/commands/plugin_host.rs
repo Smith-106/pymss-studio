@@ -1706,8 +1706,12 @@ pub async fn plugin_host_render(
     state: State<'_, PluginHostState>,
     mut project: Value,
     task_id: String,
+    sample_rate: Option<u32>,
 ) -> Result<Value, String> {
     require_enabled()?;
+    if sample_rate.is_some_and(|rate| !(8000..=48000).contains(&rate)) {
+        return Err("The render sample rate must be between 8000 and 48000 Hz".into());
+    }
     let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
     let directory = render_directory(&root, &task_id)?;
     let state = state.inner().clone();
@@ -1731,7 +1735,9 @@ pub async fn plugin_host_render(
             }
             let project_id = project.get("id").and_then(Value::as_str).unwrap_or("render").to_string();
             let load_timeout = plugin_load_timeout(&project);
-            process.request(json!({"op":"load","projectId":project_id,"project":project,"ffmpeg":ffmpeg,"offline":true}), load_timeout)
+            let mut load = json!({"op":"load","projectId":project_id,"project":project,"ffmpeg":ffmpeg,"offline":true});
+            if let Some(rate) = sample_rate { load["sampleRate"] = json!(rate); }
+            process.request(load, load_timeout)
                 .map_err(|error| error.to_string())?;
             let mut result = process.request(json!({"op":"render","projectId":project_id,"path":output}), RENDER_TIMEOUT)
                 .map_err(|error| error.to_string())?;

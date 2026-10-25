@@ -153,7 +153,7 @@ export function hasEditorPlugins(project: EditorSession | null | undefined) {
 }
 
 export function pluginProjectVersion(project: EditorSession) {
-  return hasEditorPlugins(project) ? 4 : 3
+  return hasEditorPlugins(project) || project.masterLimiter ? 4 : 3
 }
 
 export function pluginProjectBlockReason(project: EditorSession, formats: readonly string[] = ['vst3', 'vst2', 'au']): 'format' | null {
@@ -180,7 +180,7 @@ export function pluginProjectSignature(project: EditorSession) {
 export function neutralPluginRenderProject(project: EditorSession, render: { path: string; duration: number; sampleRate: number; channels: number }): EditorSession {
   const source = { id: 'plugin-render', role: 'stem' as const, name: project.name, ...render }
   return {
-    ...project, masterVolume: 1, masterPan: 0, pluginChain: undefined, sources: [source],
+    ...project, masterVolume: 1, masterPan: 0, masterLimiter: undefined, pluginChain: undefined, sources: [source],
     tracks: [{ id: 'plugin-render', sourceId: source.id, role: 'stem', name: project.name,
       volume: 1, pan: 0, muted: false, solo: false, fadeIn: 0, fadeOut: 0,
       clips: [{ id: 'plugin-render', assetId: source.id, start: 0, offset: 0, duration: render.duration,

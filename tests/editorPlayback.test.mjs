@@ -8,6 +8,7 @@ import { createPinia, setActivePinia, storeToRefs } from 'pinia'
 import { useEditorPlaybackStore } from '../src/stores/editorPlayback.ts'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '../src/utils/editorClips.ts'
 import { EditorTimelinePlayback } from '../src/utils/editorAudio.ts'
+import { normalizeMasterLimiter } from '../src/utils/masterLimiter.ts'
 import { hasEditorPlugins, pluginProjectSignature } from '../src/utils/editorPlugins.ts'
 
 const source = ts.createSourceFile('playback.ts', readFileSync(new URL('../src/composables/useEditorPlayback.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
@@ -25,11 +26,12 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], contextState = 'running', resumeGate, platform = '', chunksGate, metadataReadyState = 4, nativePlugins = false, nativePauseGate } = {}) {
+function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], contextState = 'running', resumeGate, platform = '', chunksGate, metadataReadyState = 4, nativePlugins = false, nativePauseGate, limiter, workletGate, graphFailure = false } = {}) {
   let now = 0, rafId = 0, parameterWrites = 0, contextCreations = 0, chunkReads = 0
   const unmount = [], nativeCalls = []
   const frames = new Map(), audios = []
   const graphNodes = new Map()
+  const worklets = [], workletModules = []
   const node = () => new Proxy({
     connections: [],
     connect(destination) { this.connections.push(destination) },
@@ -46,6 +48,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
   } })
   const ctx = new Proxy({
     state: contextState, sampleRate: 48000, currentTime: 0, destination: node(),
+    audioWorklet: { async addModule(url) { workletModules.push(url); if (workletGate) await workletGate.promise } },
     async resume() { if (resumeGate) await resumeGate.promise; this.state = 'running' },
     async close() { this.state = 'closed' },
     createBuffer(channels, length) { return { sampleRate: 48000, length, duration: length / 48000,
@@ -53,6 +56,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
   }, { get(target, key) {
     if (key in target) return target[key]
     return () => {
+      if (key === 'createMediaElementSource' && graphFailure) throw new Error('Graph unavailable')
       const created = node()
       if (key === 'createBufferSource') {
         created.starts = []
@@ -139,6 +143,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
     masterVolume: 1, masterPan: 0,
     async releasePluginSession(project) { nativeCalls.push({ op: 'unload', projectId: project.id }) },
   })
+  if (limiter) editor.session.masterLimiter = normalizeMasterLimiter(limiter)
   if (nativePlugins) editor.session.pluginChain = [{ id: 'slot', format: 'vst3', pluginId: 'gain', path: '/gain.vst3', bypassed: false }]
   let nativePlaying = false, nativePosition = 0
   const createNative = vm.runInNewContext(`${nativeCode}\nuseEditorNativePlayback`, {
@@ -157,7 +162,16 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
   })
   const create = vm.runInNewContext(`${code}\nuseEditorPlayback`, {
     useEditorNativePlayback: nativePlugins ? createNative : () => ({ required: ref(false) }),
-    watch, storeToRefs, useEditorPlaybackStore, clipIsActive, clipMediaTime, clipsForTrack, EditorTimelinePlayback,
+    masterLimiterWorkletUrl: '/limiter-worklet.js',
+    AudioWorkletNode: function (context, name, options) {
+      const created = node()
+      created.port = { messages: [], postMessage(value) { this.messages.push(value) }, close() { this.closed = true } }
+      created.options = options
+      worklets.push(created)
+      return created
+    },
+    setTimeout, clearTimeout,
+    normalizeMasterLimiter, watch, storeToRefs, useEditorPlaybackStore, clipIsActive, clipMediaTime, clipsForTrack, EditorTimelinePlayback,
     createPreviewChunkReader: () => async () => {
       chunkReads++
       if (chunksGate) await chunksGate.promise
@@ -185,7 +199,7 @@ function environment(t, { clips = [{ start: 0, offset: 0, duration: 20 }], conte
     frames.clear()
     pending.forEach(callback => callback(now))
   }
-  return { playback, store, editor, audios, ctx, graphNodes, frame, dispose, nativeCalls,
+  return { playback, store, editor, audios, ctx, graphNodes, frame, dispose, nativeCalls, worklets, workletModules,
     resources: () => ({ contextCreations, chunkReads }), parameterWrites: () => parameterWrites }
 }
 
@@ -837,4 +851,188 @@ test('metadata completion from a previous project cannot start a new project war
   await pending
   await flush()
   assert.deepEqual(env.resources(), resources)
+})
+
+test('master limiter setup waits before playback, uses the latest config and bypass preserves its node', async t => {
+  const gate = deferred()
+  const env = environment(t, { limiter: { enabled: true }, workletGate: gate })
+  const starting = env.playback.requestPlay()
+  await flush()
+  assert.equal(env.workletModules.length, 1)
+  assert.equal(env.audios[0].playCalls, 0)
+  env.editor.session.masterLimiter.gainDb = 12
+  await flush()
+  gate.resolve()
+  assert.equal(await starting, true)
+  assert.equal(env.worklets.length, 1)
+  assert.equal(env.worklets[0].options.processorOptions.gainDb, 12)
+  const node = env.worklets[0]
+  assert.equal(node.connections.length, 2, 'output feeds both final meters and speakers')
+  env.editor.session.masterLimiter.enabled = false
+  await flush()
+  assert.equal(node.port.messages.at(-1).config.enabled, false)
+  env.editor.session.masterLimiter.enabled = true
+  await flush()
+  assert.equal(env.worklets.length, 1)
+  env.playback.requestPause()
+  assert.equal(node.port.messages.at(-1).type, 'reset')
+  env.dispose()
+  assert.equal(node.port.closed, true)
+  assert.equal(node.connections.length, 0)
+})
+
+test('disabling a pending limiter ignores its late load failure and keeps dry playback running', async t => {
+  const gate = deferred()
+  const env = environment(t, { workletGate: gate })
+  assert.equal(await env.playback.requestPlay(), true)
+  env.editor.session.masterLimiter = normalizeMasterLimiter({ enabled: true })
+  await flush()
+  assert.equal(env.workletModules.length, 1)
+  env.editor.session.masterLimiter.enabled = false
+  await flush()
+  gate.reject(new Error('Stale module load failed'))
+  await flush()
+  assert.equal(env.store.status, 'playing')
+  assert.equal(env.store.error, null)
+  assert.equal(env.worklets.length, 0)
+  assert.ok(env.audios.every(audio => !audio.paused))
+  env.ctx.audioWorklet.addModule = async () => {}
+  env.editor.session.masterLimiter.enabled = true
+  await flush()
+  assert.equal(env.worklets.length, 1, 're-enabling after the discarded failure retries setup')
+  assert.equal(env.store.status, 'playing')
+})
+
+test('disabling a limiter during startup allows dry playback when its old load fails', async t => {
+  const gate = deferred()
+  const env = environment(t, { limiter: { enabled: true }, workletGate: gate })
+  const starting = env.playback.requestPlay()
+  await flush()
+  env.editor.session.masterLimiter.enabled = false
+  await flush()
+  gate.reject(new Error('Stale startup module load failed'))
+  assert.equal(await starting, true)
+  assert.equal(env.store.status, 'playing')
+  assert.equal(env.store.error, null)
+  assert.equal(env.worklets.length, 0)
+})
+
+test('a pending limiter load failure still stops playback if the effect remains enabled', async t => {
+  const gate = deferred()
+  const env = environment(t, { workletGate: gate })
+  await env.playback.requestPlay()
+  env.editor.session.masterLimiter = normalizeMasterLimiter({ enabled: true })
+  await flush()
+  gate.reject(new Error('Current module load failed'))
+  await flush()
+  assert.equal(env.store.status, 'error')
+  assert.match(env.store.error, /Current module load failed/)
+  assert.ok(env.audios.every(audio => audio.paused))
+})
+
+test('a disabled limiter processor failure restores dry routing without interrupting playback', async t => {
+  const env = environment(t, { limiter: { enabled: true } })
+  assert.equal(await env.playback.requestPlay(), true)
+  const failedNode = env.worklets[0]
+  const [masterMerger] = env.graphNodes.get('createChannelMerger')
+  const [masterMeterSplitter] = env.graphNodes.get('createChannelSplitter').slice(1)
+  env.editor.session.masterLimiter.enabled = false
+  await flush()
+  const request = env.store.requestId
+  failedNode.onprocessorerror()
+  assert.equal(env.store.status, 'playing')
+  assert.equal(env.store.error, null)
+  assert.equal(env.store.requestId, request)
+  assert.ok(env.audios.every(audio => !audio.paused))
+  assert.equal(failedNode.port.closed, true)
+  assert.equal(failedNode.connections.length, 0)
+  assert.ok(masterMerger.connections.includes(env.ctx.destination))
+  assert.ok(masterMerger.connections.includes(masterMeterSplitter))
+  assert.ok(!masterMerger.connections.includes(failedNode))
+  env.editor.session.masterLimiter.enabled = true
+  await flush()
+  assert.equal(env.worklets.length, 2, 're-enabling creates a replacement processor')
+  assert.equal(env.store.status, 'playing')
+})
+
+test('a retired Web Audio limiter processor cannot invalidate native playback', async t => {
+  const env = environment(t, { nativePlugins: true, limiter: { enabled: true } })
+  const plugin = env.editor.session.pluginChain[0]
+  env.editor.session.pluginChain = []
+  await flush()
+  assert.equal(await env.playback.requestPlay(), true)
+  const failedNode = env.worklets[0]
+  env.editor.session.pluginChain = [plugin]
+  await flush()
+  assert.equal(await env.playback.requestPlay(2), true)
+  const request = env.store.requestId
+  const calls = env.nativeCalls.length
+  failedNode.onprocessorerror()
+  assert.equal(env.store.requestId, request)
+  assert.equal(env.store.status, 'playing')
+  assert.equal(env.store.error, null)
+  assert.equal(env.nativeCalls.length, calls)
+  assert.equal(failedNode.port.closed, true)
+  assert.equal(failedNode.connections.length, 0)
+})
+
+test('an enabled current limiter processor failure stops playback and releases the failed node', async t => {
+  const env = environment(t, { limiter: { enabled: true } })
+  await env.playback.requestPlay()
+  const failedNode = env.worklets[0]
+  failedNode.onprocessorerror()
+  assert.equal(env.store.status, 'error')
+  assert.match(env.store.error, /limiter.failed/)
+  assert.ok(env.audios.every(audio => audio.paused))
+  assert.equal(failedNode.port.closed, true)
+  assert.equal(failedNode.connections.length, 0)
+})
+
+test('late worklet creation is cancelled on unmount and module failure can be retried', async t => {
+  const gate = deferred()
+  const env = environment(t, { limiter: { enabled: true }, workletGate: gate })
+  const pending = env.playback.requestPlay()
+  await flush()
+  env.dispose()
+  gate.resolve()
+  assert.equal(await pending, false)
+  assert.equal(env.worklets.length, 0)
+  const retry = environment(t, { limiter: { enabled: true } })
+  let attempts = 0
+  retry.ctx.audioWorklet.addModule = async () => { if (++attempts === 1) throw new Error('Module load failed') }
+  assert.equal(await retry.playback.requestPlay(), false)
+  assert.match(retry.store.error, /Module load failed/)
+  assert.equal(await retry.playback.requestPlay(), true)
+  retry.worklets[0].onprocessorerror()
+  assert.equal(retry.store.status, 'error')
+  retry.editor.session.masterLimiter.enabled = false
+  await flush()
+  assert.equal(await retry.playback.requestPlay(), true, 'bypass remains audible after a processor failure')
+})
+
+test('an enabled limiter rejects unconnected media and live enabling stops a dry fallback', async t => {
+  const env = environment(t, { limiter: { enabled: true }, graphFailure: true })
+  assert.equal(await env.playback.requestPlay(), false)
+  assert.equal(env.audios[0].playCalls, 0)
+  const live = environment(t, { graphFailure: true })
+  assert.equal(await live.playback.requestPlay(), true)
+  live.editor.session.masterLimiter = normalizeMasterLimiter({ enabled: true })
+  await flush()
+  assert.equal(live.store.status, 'error')
+  assert.ok(live.audios.every(audio => audio.paused))
+})
+
+test('media playback reaches the final source frame then drains limiter lookahead', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const env = environment(t, { clips: [{ start: 0, offset: 0, duration: 1 }], limiter: { enabled: true, attackMs: 100 } })
+  assert.equal(await env.playback.requestPlay(), true)
+  env.frame(970)
+  assert.equal(env.store.status, 'playing', 'do not stop 40 ms before the source end')
+  env.frame(30)
+  assert.equal(env.store.status, 'playing', 'keep processing the buffered final frames')
+  t.mock.timers.tick(99)
+  assert.equal(env.store.status, 'playing')
+  t.mock.timers.tick(1)
+  assert.equal(env.store.status, 'paused')
+  assert.equal(env.worklets[0].port.messages.at(-1).type, 'reset')
 })

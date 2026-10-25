@@ -98,7 +98,7 @@ test('meters read the matching stereo levels and never invent activity or retain
   assert.equal(env.call('formatLevel', 0), '−∞')
   assert.equal(env.call('meterValue', 0), -60)
   assert.equal(env.call('meterScale', 0), 0)
-  assert.ok(Math.abs(env.call('meterScale', 0.1) - 2 / 3) < 1e-12)
+  assert.ok(Math.abs(env.call('meterScale', 0.1) - (0.24 + 4 / 9 * 0.16)) < 1e-12)
   env.props.selectedTrackId = null
   await flush()
   assert.deepEqual(Array.from(env.read('channelLevels')), [0.5, 0.25])
@@ -113,6 +113,23 @@ test('meters read the matching stereo levels and never invent activity or retain
   env.playback.trackLevels['track:voice'] = [-0.3, 1.4]
   assert.deepEqual(Array.from(env.read('channelLevels')), [0, 1])
   assert.equal(env.events.length, 0)
+})
+
+test('meter spacing expands the upper 12 dB and keeps tick positions aligned with actual levels', t => {
+  const env = environment(t)
+  const ticks = [[0, 1], [-3, 0.88], [-6, 0.76], [-9, 0.64], [-12, 0.52], [-15, 0.4], [-24, 0.24], [-30, 0.12], [-60, 0]]
+  for (const [db, position] of ticks) {
+    assert.ok(Math.abs(env.call('meterScale', 10 ** (db / 20)) - position) < 1e-12, `${db} dB tick must match the level bar`)
+  }
+  assert.ok(env.call('meterDbScale', 0) - env.call('meterDbScale', -12) > 0.45)
+  assert.ok(env.call('meterDbScale', -30) - env.call('meterDbScale', -60) < 0.15)
+  let previous = 0
+  for (let db = -72; db <= 6; db += 0.25) {
+    const position = env.call('meterScale', 10 ** (db / 20))
+    assert.ok(position >= previous && position >= 0 && position <= 1)
+    previous = position
+  }
+  assert.equal(env.call('meterScale', 0), 0)
 })
 
 test('channel strip mute/solo targets only the selected track and readouts stay compact', async t => {

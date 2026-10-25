@@ -733,3 +733,34 @@ test('legacy track effects are dropped on load and never reach the plugin host',
  assert.equal(load.project.tracks.length,1)
  assert.equal('effects' in load.project.tracks[0],false)
 })
+
+test('master limiter toggle and drag are undoable, preserve disabled parameters and survive save/reopen',async t=>{
+ const env=environment(t)
+ env.editor.session.pluginChain=undefined
+ env.editor.clearHistory()
+ env.editor.setMasterLimiter({enabled:true})
+ assert.deepEqual(JSON.parse(JSON.stringify(env.editor.session.masterLimiter)),{enabled:true,gainDb:0,ceilingDb:0,attackMs:3,releaseMs:250})
+ env.editor.beginInteraction()
+ env.editor.setMasterLimiter({gainDb:6})
+ env.editor.setMasterLimiter({gainDb:12})
+ env.editor.commitInteraction()
+ env.editor.undo()
+ assert.equal(env.editor.session.masterLimiter.gainDb,0)
+ env.editor.redo()
+ assert.equal(env.editor.session.masterLimiter.gainDb,12)
+ env.editor.setMasterLimiter({enabled:false})
+ assert.equal(env.editor.session.masterLimiter.gainDb,12)
+ await env.editor.saveProject()
+ const saved=env.saved().at(-1).args.project
+ assert.equal(saved.version,4)
+ assert.equal(saved.masterLimiter.enabled,false)
+ assert.equal(saved.masterLimiter.gainDb,12)
+ await env.editor.loadProject('project')
+ assert.equal(env.editor.session.masterLimiter.enabled,false)
+ assert.equal(env.editor.session.masterLimiter.gainDb,12)
+ env.controls.persisted.masterLimiter.gainDb=99
+ env.controls.persisted.masterLimiter.attackMs=null
+ await env.editor.loadProject('project')
+ assert.equal(env.editor.session.masterLimiter.gainDb,30)
+ assert.equal(env.editor.session.masterLimiter.attackMs,3)
+})

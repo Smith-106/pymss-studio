@@ -304,6 +304,15 @@ fn host_tick(
                 None => op == "update" && session.as_ref().is_some_and(Session::is_offline),
                 Some(value) => value.as_bool().ok_or("Offline mode must be a boolean")?,
             };
+            let sample_rate = match message.get("sampleRate") {
+                None => None,
+                Some(value) => {
+                    let rate = value.as_u64().filter(|rate| (8000..=48000).contains(rate))
+                        .ok_or("Render sample rate must be an integer between 8000 and 48000 Hz")?;
+                    if !offline { return Err("An explicit sample rate requires offline mode".into()); }
+                    Some(rate as u32)
+                }
+            };
             let mut spec = project(&message)?;
             spec.validate()?;
             let restore: Vec<String> = match message.get("stateRestoreSlotIds") {
@@ -331,6 +340,7 @@ fn host_tick(
                         && topology(&current.spec) == topology(&spec)
                         && current.can_update_in_place(&spec)
                         && current.is_offline() == offline
+                        && sample_rate.is_none_or(|rate| rate == current.sample_rate)
                     {
                         return current.update_mix(spec).map(Some);
                     }
@@ -363,7 +373,10 @@ fn host_tick(
                     open = current.open_editors();
                 }
             }
-            let mut new_session = Session::load_mode(spec, ffmpeg, offline)?;
+            let mut new_session = match sample_rate {
+                Some(rate) => Session::load_at_rate(spec, ffmpeg, rate, offline)?,
+                None => Session::load_mode(spec, ffmpeg, offline)?,
+            };
             if !suppressed.is_empty() {
                 new_session.monitor(suppressed)?;
             }
