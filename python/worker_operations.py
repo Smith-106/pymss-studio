@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from worker_protocol import emit, emit_error
+from worker_paths import normalize_output_dir
 
 
 def _runtime():
@@ -109,7 +110,6 @@ def _serialize_output(name: str, value: Any, output_dir: Path) -> Any:
 def cmd_run_operation(payload: dict[str, Any]) -> int:
     operation_id = str(payload.get("operation") or "").strip()
     request_id = str(payload.get("requestId") or "").strip() or None
-    output_dir = Path(str(payload.get("outputDir") or "") or ".")
     if not operation_id:
         return emit_error("OPERATION_INVALID", "Missing operation id", request_id=request_id)
     params = payload.get("params") or {}
@@ -117,6 +117,7 @@ def cmd_run_operation(payload: dict[str, Any]) -> int:
         return emit_error("OPERATION_INVALID", "params must be an object", request_id=request_id)
 
     try:
+        output_dir = Path(normalize_output_dir(payload.get("outputDir")))
         runtime = _runtime()
         raw_inputs = payload.get("inputs") or {}
         inputs = {name: _resolve_input(value) for name, value in raw_inputs.items()}

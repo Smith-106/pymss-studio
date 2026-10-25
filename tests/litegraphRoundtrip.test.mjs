@@ -18,6 +18,7 @@ after(() => vite.close())
 const { LGraph, LGraphCanvas, LiteGraph } = await vite.ssrLoadModule('@comfyorg/litegraph')
 const {
   registerPymssNodes,
+  registerPluginNodeSpecs,
   allNodeTypes,
   NODE_SPECS,
   BUILTIN_SPECS,
@@ -30,6 +31,29 @@ const {
 } = await vite.ssrLoadModule('/src/litegraph/registerNodes.ts')
 const adapter = await vite.ssrLoadModule('/src/litegraph/graphAdapter.ts')
 registerPymssNodes()
+
+test('plugin node declarations update new instances and remove stale creation entries', () => {
+  const type = 'test_plugin_gain'
+  const spec = { type, title: 'Gain', category: 'pymss/plugins', inputs: [], outputs: [], widgets: [{ name: 'gain', type: 'number', default: 2 }] }
+  const builtin = LiteGraph.registered_node_types.AudioAdjustVolume
+  try {
+    registerPluginNodeSpecs([spec])
+    const original = LiteGraph.createNode(type)
+    assert.equal(original.widgets[0].value, 2)
+    registerPluginNodeSpecs([{ ...spec, title: 'Updated Gain', widgets: [{ name: 'amount', type: 'number', default: 6 }] }])
+    const updated = LiteGraph.createNode(type)
+    assert.equal(updated.widgets[0].name, 'amount')
+    assert.equal(updated.widgets[0].value, 6)
+    assert.equal(original.widgets[0].name, 'gain')
+    registerPluginNodeSpecs([{ ...spec, type: 'AudioAdjustVolume' }])
+    assert.equal(LiteGraph.registered_node_types.AudioAdjustVolume, builtin)
+    assert.ok(!allNodeTypes().includes(type))
+    assert.equal(LiteGraph.registered_node_types[type], undefined)
+    assert.equal(original.serialize().type, type)
+  } finally {
+    registerPluginNodeSpecs([])
+  }
+})
 
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/comfy-mss/${name}.json`, import.meta.url), 'utf8'))
 const jsonClone = value => JSON.parse(JSON.stringify(value))

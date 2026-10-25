@@ -1944,6 +1944,7 @@
     "backToNodeEditor": "回到节点编辑器",
     "addNode": "添加节点",
     "advancedEditor": {
+      "loadingNodes": "正在加载工作流节点…",
       "searchNodes": "搜索节点",
       "value": "值",
       "confirm": "确定",

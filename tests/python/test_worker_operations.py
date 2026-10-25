@@ -21,20 +21,10 @@ else:
 
 import worker_operations
 
-def _loudnorm_fixture() -> Path:
-    """Minimal loudnorm-like plugin source for tests.
-
-    Prefers the real plugin from a sibling pymss-plugins checkout (local dev);
-    CI has no sibling repo, so fall back to a self-contained fixture. The
-    fixture normalizes peak to 0.7079 (-3 dBFS) deterministically so loudness
-    assertions remain meaningful without pyloudnorm.
-    """
-    real = Path(__file__).resolve().parents[2] / ".." / "pymss-plugins" / "plugins" / "loudnorm"
-    if real.is_dir():
-        return real
-    import tempfile
-    fixture = Path(tempfile.mkdtemp()) / "loudnorm"
-    fixture.mkdir()
+def _loudnorm_fixture(root: Path) -> Path:
+    """Self-contained audio operation for worker I/O and parameter transport."""
+    fixture = root / "source" / "loudnorm"
+    fixture.mkdir(parents=True)
     (fixture / "pyproject.toml").write_text(
         '[project]\n'
         'name="pymss-plugin-loudnorm"\n'
@@ -53,11 +43,10 @@ def _loudnorm_fixture() -> Path:
         '    from pymss.graph.core import audio_to_numpy, numpy_to_audio\n'
         '    waveform, sr = audio_to_numpy(audio_in)\n'
         '    target = float(params.get("target_lufs", -14.0))\n'
-        '    # Map the LUFS target onto a deterministic peak scale so the\n'
-        '    # fixture produces a stable, testable output level.\n'
+        '    # A deterministic peak target isolates the worker transport.\n'
         '    peak = float(np.max(np.abs(waveform))) or 1.0\n'
         '    scale = (10 ** (target / 20.0)) / max(peak, 1e-9)\n'
-        '    out = np.asarray(waveform * min(scale, 8.0), dtype=np.float32)\n'
+        '    out = np.asarray(waveform * scale, dtype=np.float32)\n'
         '    return {"audio": numpy_to_audio(out, sr)}\n'
         '\n'
         'def setup(plugin):\n'
@@ -69,7 +58,7 @@ def _loudnorm_fixture() -> Path:
         '            "target_lufs": {"type": "number", "default": -14.0, "minimum": -70.0, "maximum": -5.0},\n'
         '        }, "additionalProperties": False},\n'
         '        outputs={"audio": {"type": "audio"}},\n'
-        '        run=lambda ctx, inputs, params: {"audio": _peak_normalize(inputs["audio"], params)},\n'
+        '        run=lambda ctx, inputs, params: _peak_normalize(inputs["audio"], params),\n'
         '    )\n'
     )
     return fixture
@@ -87,7 +76,7 @@ class ListOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             plugins = Path(d) / "plugins"
             plugins.mkdir()
-            shutil.copytree(_loudnorm_fixture(), plugins / "loudnorm")
+            shutil.copytree(_loudnorm_fixture(Path(d)), plugins / "loudnorm")
             old = os.environ.get("PYMSS_PLUGINS_DIR")
             os.environ["PYMSS_PLUGINS_DIR"] = str(plugins)
             try:
@@ -131,7 +120,7 @@ class RunOperationTests(unittest.TestCase):
     def _install_plugin(self, d: Path) -> None:
         plugins = d / "plugins"
         plugins.mkdir()
-        shutil.copytree(_loudnorm_fixture(), plugins / "loudnorm")
+        shutil.copytree(_loudnorm_fixture(d), plugins / "loudnorm")
         os.environ["PYMSS_PLUGINS_DIR"] = str(plugins)
 
     def _reset_runtime(self) -> None:
@@ -156,35 +145,30 @@ class RunOperationTests(unittest.TestCase):
                 wav = work / "tone.wav"
                 sf.write(str(wav), tone.T, sr)
 
-                out_dir = work / "out"
+                out_dir = work / "configured-output"
                 output = io.StringIO()
-                with redirect_stdout(output):
+                with (
+                    mock.patch.dict(os.environ, {"PYMSS_STUDIO_DEFAULT_OUTPUT_DIR": str(out_dir)}),
+                    redirect_stdout(output),
+                ):
                     code = worker_operations.cmd_run_operation({
                         "operation": "pymss.loudnorm.normalize",
                         "inputs": {"audio": {"kind": "file", "path": str(wav)}},
                         "params": {"target_lufs": -18.0},
-                        "outputDir": str(out_dir),
                         "requestId": "req-1",
                     })
                 events = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+                self.assertEqual(code, 0, events)
                 result_event = next(e for e in events if e["type"] == "operation_result")
                 audio_out = result_event["payload"]["outputs"]["audio"]
-                self.assertEqual(code, 0)
                 self.assertEqual(audio_out["kind"], "audio_file")
+                self.assertEqual(Path(audio_out["path"]).parent, out_dir)
 
                 data, srr = sf.read(audio_out["path"], dtype="float32")
-                try:
-                    import pyloudnorm as pyln
-
-                    meter = pyln.Meter(srr)
-                    lufs = meter.integrated_loudness(data if data.ndim == 2 else data[:, None])
-                    # Exact LUFS only holds for the real plugin (pyloudnorm).
-                    self.assertLess(abs(lufs - (-18.0)), 0.5)
-                except ImportError:
-                    # CI fallback fixture peak-normalizes deterministically:
-                    # assert the level actually changed from the 0.3 input.
-                    peak = float(abs(data).max())
-                    self.assertGreater(peak, 0.35, "fixture output should be scaled up")
+                self.assertEqual(srr, sr)
+                self.assertEqual(data.shape, (sr * 2, 2))
+                self.assertTrue(np.isfinite(data).all())
+                self.assertAlmostEqual(float(abs(data).max()), 10 ** (-18.0 / 20.0), places=4)
             finally:
                 self._reset_runtime()
                 os.environ.pop("PYMSS_PLUGINS_DIR", None)

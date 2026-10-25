@@ -1,86 +1,112 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 
-/// Registered per-launch plugins root (marketplace managed dir), set via set_plugins_root.
-static PLUGINS_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static PLUGINS_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 pub fn set_plugins_root(root: PathBuf) {
-    let _ = PLUGINS_ROOT.set(root);
+    *PLUGINS_ROOT
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = Some(root);
 }
 
-pub fn plugins_root() -> Option<&'static PathBuf> {
-    PLUGINS_ROOT.get()
+pub fn plugins_root() -> Option<PathBuf> {
+    PLUGINS_ROOT
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
 }
 
-/// Serve `pymss-plugin://view/<plugin>/<view>/<relpath>` requests.
-/// Containment is enforced twice: the manifest entry must stay inside the
-/// plugin dir, and the requested file must resolve under that entry's dir.
+fn response(status: u16, mime: &str, bytes: Vec<u8>) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header("Content-Type", mime)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "no-cache")
+        .body(bytes)
+        .expect("static protocol headers are valid")
+}
+
+fn failure(status: u16, message: &str) -> tauri::http::Response<Vec<u8>> {
+    response(
+        status,
+        "text/plain; charset=utf-8",
+        message.as_bytes().to_vec(),
+    )
+}
+
+fn decode_path(path: &str) -> Result<Vec<String>, String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            percent_encoding::percent_decode_str(segment)
+                .decode_utf8()
+                .map(|value| value.into_owned())
+                .map_err(|_| "invalid UTF-8 path".into())
+        })
+        .collect()
+}
+
+/// Serve view files and the bundled SDK through Tauri's platform-specific protocol URL.
 pub fn serve_view(
-    _app: &tauri::AppHandle,
+    app: &tauri::AppHandle,
     request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    use tauri::http::StatusCode;
-
-    let failure = |status: u16, message: &str| {
-        tauri::http::Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND))
-            .body(message.as_bytes().to_vec())
-            .unwrap()
+    let segments = match decode_path(request.uri().path()) {
+        Ok(segments) => segments,
+        Err(error) => return failure(400, &error),
     };
-    let path = request.uri().path().trim_start_matches('/');
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // Official SDK assets: pymss-plugin://sdk/pymss-sdk.css|js — served from the
-    // bundled resources so plugin pages share Studio's design tokens without
-    // shipping their own copy. Sandboxed iframes reference them by absolute
-    // protocol URL, same as view files.
     if segments.len() == 2 && segments[0] == "sdk" {
-        return serve_sdk_asset(_app, &segments[1]);
+        return serve_sdk_asset(app, &segments[1]);
     }
     if segments.len() < 4 || segments[0] != "view" {
         return failure(404, "not found");
     }
-    let (plugin_id, view_id) = (segments[1], segments[2]);
-    let rel: Vec<&str> = segments[3..].to_vec();
-
-    let root = match plugins_root() {
-        Some(root) => root.clone(),
-        None => return failure(503, "plugins root not ready"),
+    let Some(root) = plugins_root() else {
+        return failure(503, "plugins root not ready");
     };
-    let entry = match resolve_view(&root, plugin_id, view_id) {
+    serve_view_file(&root, &segments[1], &segments[2], &segments[3..])
+}
+
+fn serve_view_file(
+    root: &Path,
+    plugin_id: &str,
+    view_id: &str,
+    relative: &[String],
+) -> tauri::http::Response<Vec<u8>> {
+    let entry = match resolve_view(root, plugin_id, view_id) {
         Ok(entry) => entry,
         Err(error) => return failure(404, &error),
     };
-    let base = match entry.parent() {
-        Some(parent) => parent.to_path_buf(),
-        None => return failure(500, "view entry has no parent"),
+    let Some(base) = entry.parent() else {
+        return failure(500, "view entry has no parent");
     };
-    let joined = base.join(rel.join("/"));
-    let resolved = match joined.canonicalize() {
+    let resolved = match base.join(relative.join("/")).canonicalize() {
         Ok(resolved) => resolved,
         Err(_) => return failure(404, "file not found"),
     };
-    if !resolved.starts_with(&base.canonicalize().unwrap_or(base.clone())) {
+    if !resolved.starts_with(base) {
         return failure(403, "path escapes the plugin view");
     }
-    let bytes = match std::fs::read(&resolved) {
-        Ok(bytes) => bytes,
-        Err(_) => return failure(404, "file not found"),
-    };
-    let mime = match resolved.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html",
-        Some("js") => "application/javascript",
+    match std::fs::read(&resolved) {
+        Ok(bytes) => response(200, mime_type(&resolved), bytes),
+        Err(_) => failure(404, "file not found"),
+    }
+}
+
+fn mime_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "application/javascript",
         Some("css") => "text/css",
-        Some("json") => "application/json",
+        Some("json") | Some("map") => "application/json",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
-    };
-    tauri::http::Response::builder()
-        .header("Content-Type", mime)
-        .body(bytes)
-        .unwrap_or_else(|_| failure(500, "response build failed"))
+    }
 }
 
 /// Resolved plugin view contribution served to the Studio frontend.
@@ -100,24 +126,34 @@ pub struct PluginView {
 /// Guarded resolution of a plugin view entry: the path must live inside the
 /// given plugins root (no `..` traversal, no absolute override from the webview).
 pub fn resolve_view(root: &Path, plugin_id: &str, view_id: &str) -> Result<PathBuf, String> {
-    let root = root.canonicalize().map_err(|e| format!("plugins root unavailable: {e}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("plugins root unavailable: {e}"))?;
     // Plugin and view ids are restricted to filesystem-safe characters by the
     // manifest layer; reject anything exotic before touching the disk.
     for part in [plugin_id, view_id] {
         if part.is_empty()
-            || !part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
             || part.starts_with('.')
         {
-            return Err(format!("invalid plugin view reference: {plugin_id}/{view_id}"));
+            return Err(format!(
+                "invalid plugin view reference: {plugin_id}/{view_id}"
+            ));
         }
     }
-    let plugin_dir = root.join(plugin_id);
+    let plugin_dir = root
+        .join(plugin_id)
+        .canonicalize()
+        .map_err(|_| format!("plugin {plugin_id} is not installed"))?;
+    if !plugin_dir.starts_with(&root) {
+        return Err(format!("plugin {plugin_id} escapes the plugins root"));
+    }
     let manifest = plugin_dir.join("pyproject.toml");
     if !manifest.is_file() {
         return Err(format!("plugin {plugin_id} is not installed"));
     }
-    // Reuse the Python manifest parser through the worker would round-trip;
-    // here we parse only the views table we need with a minimal scan.
     let views = parse_views(&manifest)?;
     let view = views
         .into_iter()
@@ -127,8 +163,11 @@ pub fn resolve_view(root: &Path, plugin_id: &str, view_id: &str) -> Result<PathB
     let resolved = entry
         .canonicalize()
         .map_err(|_| format!("view entry missing: {}", view.entry))?;
-    if !resolved.starts_with(&root) || !resolved.is_file() {
-        return Err(format!("view entry escapes the plugins root: {}", view.entry));
+    if !resolved.starts_with(&plugin_dir) || !resolved.is_file() {
+        return Err(format!(
+            "view entry escapes the plugin directory: {}",
+            view.entry
+        ));
     }
     Ok(resolved)
 }
@@ -138,53 +177,49 @@ struct RawView {
     entry: String,
 }
 
-/// Minimal TOML scan for [[tool.pymss.plugin.contributions.views]] id/entry pairs.
-/// Full validation (permissions, placements, path containment) happens in the
-/// Python manifest parser; this only needs id+entry to serve files safely.
+/// Read only view identities and entry paths; Python validates the full protocol.
 fn parse_views(manifest: &Path) -> Result<Vec<RawView>, String> {
-    let text = std::fs::read_to_string(manifest).map_err(|e| format!("cannot read manifest: {e}"))?;
-    let mut views: Vec<RawView> = Vec::new();
-    let mut current: Option<RawView> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("[[tool.pymss.plugin.contributions.views]]") {
-            if let Some(view) = current.take() {
-                views.push(view);
-            }
-            current = Some(RawView { view_id: String::new(), entry: String::new() });
-            continue;
-        }
-        let Some(view) = current.as_mut() else { continue };
-        if let Some(value) = trimmed.strip_prefix("id") {
-            if let Some(stripped) = value.trim_start().strip_prefix('=') {
-                view.view_id = strip_quotes(stripped.trim());
-            }
-        } else if let Some(value) = trimmed.strip_prefix("entry") {
-            if let Some(stripped) = value.trim_start().strip_prefix('=') {
-                view.entry = strip_quotes(stripped.trim());
-            }
-        }
-    }
-    if let Some(view) = current {
-        views.push(view);
-    }
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|error| format!("cannot read manifest: {error}"))?;
+    let document: toml::Value =
+        toml::from_str(&text).map_err(|error| format!("invalid plugin manifest: {error}"))?;
+    let Some(views) = document
+        .get("tool")
+        .and_then(|value| value.get("pymss"))
+        .and_then(|value| value.get("plugin"))
+        .and_then(|value| value.get("contributions"))
+        .and_then(|value| value.get("views"))
+    else {
+        return Ok(Vec::new());
+    };
+    let views = views.as_array().ok_or("plugin views must be an array")?;
     views
-        .into_iter()
-        .filter(|v| !v.view_id.is_empty() && !v.entry.is_empty())
-        .map(|v| {
-            if v.entry.contains("..") || Path::new(&v.entry).is_absolute() {
-                Err(format!("view entry path is not relative: {}", v.entry))
-            } else {
-                Ok(v)
+        .iter()
+        .map(|view| {
+            let view_id = view
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("plugin view id is missing")?;
+            let entry = view
+                .get("entry")
+                .and_then(toml::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("plugin view entry is missing")?;
+            if Path::new(entry).components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            }) {
+                return Err(format!("view entry path is not relative: {entry}"));
             }
+            Ok(RawView {
+                view_id: view_id.to_string(),
+                entry: entry.to_string(),
+            })
         })
         .collect()
-}
-
-fn strip_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    let trimmed = trimmed.split('#').next().unwrap_or(trimmed).trim();
-    trimmed.trim_matches('"').trim_matches('\'').to_string()
 }
 
 #[cfg(test)]
@@ -277,34 +312,114 @@ mod tests {
         .unwrap();
         assert!(resolve_view(&guard.path, "author.evil", "v").is_err());
     }
+
+    #[test]
+    fn parses_quoted_paths_and_stops_at_other_contributions() {
+        let (_guard, root) = fixture(concat!(
+            "[[tool.pymss.plugin.contributions.views]]\n",
+            "id = \"editor\"\nentry = \"ui/panel #1.html\" # entry comment\n",
+            "[[tool.pymss.plugin.contributions.graphs]]\n",
+            "id = \"chain\"\nfile = \"graphs/chain.json\"\n",
+        ));
+        fs::write(root.join("author.chain/ui/panel #1.html"), "panel").unwrap();
+        let entry = resolve_view(&root, "author.chain", "editor").unwrap();
+        assert!(entry.ends_with("ui/panel #1.html"));
+    }
+
+    #[test]
+    fn serves_encoded_entry_names_and_module_scripts_with_cors() {
+        let (_guard, root) = fixture(concat!(
+            "[[tool.pymss.plugin.contributions.views]]\n",
+            "id = \"editor\"\nentry = \"ui/panel #1.html\"\n",
+        ));
+        fs::write(root.join("author.chain/ui/panel #1.html"), "panel").unwrap();
+        fs::write(
+            root.join("author.chain/ui/main.mjs"),
+            "export const value = 1",
+        )
+        .unwrap();
+        let segments = decode_path("/view/author.chain/editor/panel%20%231.html").unwrap();
+        let html = serve_view_file(&root, &segments[1], &segments[2], &segments[3..]);
+        assert_eq!(html.status(), 200);
+        assert_eq!(html.body(), b"panel");
+        let module = serve_view_file(&root, "author.chain", "editor", &["main.mjs".into()]);
+        assert_eq!(module.status(), 200);
+        assert_eq!(module.headers()["Content-Type"], "application/javascript");
+        assert_eq!(module.headers()["Access-Control-Allow-Origin"], "*");
+        let escaped = serve_view_file(
+            &root,
+            "author.chain",
+            "editor",
+            &["..".into(), "pyproject.toml".into()],
+        );
+        assert_eq!(escaped.status(), 403);
+    }
+
+    #[test]
+    fn reads_sdk_from_the_bundled_resource_layout() {
+        let guard = tempdir::TempDirGuard::new();
+        let sdk = guard.path.join("resources/plugin-sdk");
+        fs::create_dir_all(&sdk).unwrap();
+        fs::write(sdk.join("pymss-sdk.js"), "window.pymss = {}").unwrap();
+        let result = read_sdk_asset(&guard.path, "pymss-sdk.js");
+        assert_eq!(result.status(), 200);
+        assert_eq!(result.headers()["Content-Type"], "application/javascript");
+        assert_eq!(result.headers()["Access-Control-Allow-Origin"], "*");
+        assert_eq!(read_sdk_asset(&guard.path, "../secret").status(), 404);
+    }
+
+    #[test]
+    fn switches_the_plugins_root_between_runtimes() {
+        let first = tempdir::TempDirGuard::new();
+        let second = tempdir::TempDirGuard::new();
+        set_plugins_root(first.path.clone());
+        assert_eq!(plugins_root(), Some(first.path.clone()));
+        set_plugins_root(second.path.clone());
+        assert_eq!(plugins_root(), Some(second.path.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_entry_symlink_into_another_plugin() {
+        let (_guard, root) = fixture(concat!(
+            "[[tool.pymss.plugin.contributions.views]]\n",
+            "id = \"editor\"\nentry = \"ui/foreign.html\"\n",
+        ));
+        let foreign = root.join("other.plugin/ui");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("index.html"), "foreign").unwrap();
+        std::os::unix::fs::symlink(
+            foreign.join("index.html"),
+            root.join("author.chain/ui/foreign.html"),
+        )
+        .unwrap();
+        assert!(resolve_view(&root, "author.chain", "editor").is_err());
+    }
 }
 
-/// Serve a bundled SDK asset (pymss-sdk.css / pymss-sdk.js).
-/// Resolved from the app resource dir, one file, no traversal.
-fn serve_sdk_asset(app: &tauri::AppHandle, name: &str) -> tauri::http::Response<Vec<u8>> {
-    use tauri::http::StatusCode;
-    use tauri::Manager;
-    let failure = |status: u16, message: &str| {
-        tauri::http::Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND))
-            .body(message.as_bytes().to_vec())
-            .unwrap()
+fn sdk_asset_path(resource_dir: &Path, name: &str) -> Option<PathBuf> {
+    match name {
+        "pymss-sdk.css" | "pymss-sdk.js" => {
+            Some(resource_dir.join("resources").join("plugin-sdk").join(name))
+        }
+        _ => None,
+    }
+}
+
+fn read_sdk_asset(resource_dir: &Path, name: &str) -> tauri::http::Response<Vec<u8>> {
+    let Some(path) = sdk_asset_path(resource_dir, name) else {
+        return failure(404, "unknown sdk asset");
     };
-    let (file, mime) = match name {
-        "pymss-sdk.css" => ("pymss-sdk.css", "text/css"),
-        "pymss-sdk.js" => ("pymss-sdk.js", "application/javascript"),
-        _ => return failure(404, "unknown sdk asset"),
-    };
-    let Ok(resource_dir) = app.path().resource_dir() else {
-        return failure(503, "resource dir not available");
-    };
-    let path = resource_dir.join("plugin-sdk").join(file);
     match std::fs::read(&path) {
-        Ok(bytes) => tauri::http::Response::builder()
-            .header(tauri::http::header::CONTENT_TYPE, mime)
-            .header(tauri::http::header::CACHE_CONTROL, "no-cache")
-            .body(bytes)
-            .unwrap_or_else(|_| failure(500, "response build failed")),
+        Ok(bytes) => response(200, mime_type(&path), bytes),
         Err(_) => failure(404, "sdk asset not bundled"),
+    }
+}
+
+fn serve_sdk_asset(app: &tauri::AppHandle, name: &str) -> tauri::http::Response<Vec<u8>> {
+    use tauri::Manager;
+    match app.path().resource_dir() {
+        Ok(root) => read_sdk_asset(&root, name),
+        Err(_) => failure(503, "resource dir not available"),
     }
 }

@@ -16,6 +16,7 @@ Contract (payload fields, sent by stores/task.ts via start_workflow_inference):
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -1284,51 +1285,30 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         callbacks = {"execution_event_callback": _emit_execution(task_id, log_scope)} \
             if fmt != "yaml" and getattr(graph, "EXECUTION_EVENT_VERSION", 0) >= 1 \
             else {"progress_event_callback": _emit_progress(task_id, log_scope)}
-        run_kwargs = {
-            "node_results": node_results,
-        }
-        try:
-            saved = graph.run_dag(
-                dag,
-                output_dir=graph_output_dir,
-                input_path=input_path,
-                inputs=runtime_inputs or None,
-                **run_kwargs,
-                **callbacks,
-                logger=log_scope.logger,
-                    device=_resolve_device(payload),
-                model_dir=payload.get("modelDir") or None,
-                download=bool(payload.get("downloadMethod") and payload.get("downloadMethod") != "never"),
-                source=str(payload.get("source") or "modelscope"),
-                output_format=output_format,
-                audio_params=payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else None,
-                debug=bool(payload.get("debug")),
-                strict=True,
-                separator_cache=separator_cache,
-            )
-        except TypeError:
-            # Older runtime cores (pymss < protocol PR) do not accept
-            # node_results — degrade gracefully: run without it, leaf node
-            # values (nodeValues) are simply not surfaced.
-            run_kwargs.pop("node_results", None)
-            saved = graph.run_dag(
-                dag,
-                output_dir=graph_output_dir,
-                input_path=input_path,
-                inputs=runtime_inputs or None,
-                **run_kwargs,
-                **callbacks,
-                logger=log_scope.logger,
-                device=_resolve_device(payload),
-                model_dir=payload.get("modelDir") or None,
-                download=bool(payload.get("downloadMethod") and payload.get("downloadMethod") != "never"),
-                source=str(payload.get("source") or "modelscope"),
-                output_format=output_format,
-                audio_params=payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else None,
-                debug=bool(payload.get("debug")),
-                strict=True,
-                separator_cache=separator_cache,
-            )
+        run_kwargs = {}
+        parameters = inspect.signature(graph.run_dag).parameters
+        if "node_results" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            run_kwargs["node_results"] = node_results
+        saved = graph.run_dag(
+            dag,
+            output_dir=graph_output_dir,
+            input_path=input_path,
+            inputs=runtime_inputs or None,
+            **run_kwargs,
+            **callbacks,
+            logger=log_scope.logger,
+            device=_resolve_device(payload),
+            model_dir=payload.get("modelDir") or None,
+            download=bool(payload.get("downloadMethod") and payload.get("downloadMethod") != "never"),
+            source=str(payload.get("source") or "modelscope"),
+            output_format=output_format,
+            audio_params=payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else None,
+            debug=bool(payload.get("debug")),
+            strict=True,
+            separator_cache=separator_cache,
+        )
         if ensemble_stem is not None:
             return _finalize_ensemble_output(
                 saved, payload=payload, input_path=primary, stem=ensemble_stem,

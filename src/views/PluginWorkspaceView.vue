@@ -4,10 +4,9 @@
  * with placement "workspace") as a full page, e.g. a dedicated editor for one
  * plugin's DAG. Entry: /plugin-view/:plugin/:viewId
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
 import { usePluginMarketplace } from '@/features/plugin-marketplace/composable'
 import PluginViewHost from '@/features/plugin-marketplace/PluginViewHost.vue'
 
@@ -30,9 +29,6 @@ onMounted(async () => {
     await pluginMarket.refresh().catch(() => undefined)
   }
   loading.value = false
-  // Keep the protocol handler pointed at the active runtime's plugins dir.
-  const pluginsDir = pluginMarket.snapshot.value?.pluginsDir
-  if (pluginsDir) await invoke('set_plugin_view_root', { root: pluginsDir }).catch(() => undefined)
 })
 </script>
 
@@ -47,8 +43,9 @@ onMounted(async () => {
     <n-alert v-if="!loading && !entry" type="warning">{{ t('plugins.workspaceMissing') }}</n-alert>
     <PluginViewHost
       v-if="entry"
-      :key="`${pluginName}/${viewId}`"
+      :key="`${pluginMarket.snapshot.value?.pluginsDir}/${pluginName}/${viewId}`"
       :plugin-name="pluginName"
+      :plugins-root="pluginMarket.snapshot.value?.pluginsDir || ''"
       :view="entry.view"
     />
   </div>

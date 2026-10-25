@@ -18,6 +18,8 @@ reqwest = { version = "0.13", default-features = false, features = ["socks", "sy
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
+percent-encoding = "2"
 tempfile = "3"
 thiserror = "2"
 trash = "5"

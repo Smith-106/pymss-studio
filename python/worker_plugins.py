@@ -142,8 +142,9 @@ def plugin_reports(runtime, installed_dir: Path | None = None) -> list[dict[str,
         for item in (report.results if report else [])
     ]
     managed = []
+    manual_names = {item["name"] for item in manual}
     for item in runtime.plugin_report():
-        item = {**item, "error": _describe_error(item.get("error")), "managed": True}
+        item = {**item, "error": _describe_error(item.get("error"), manual_names), "managed": True}
         if item.get("loaded"):
             try:
                 _validate_requirements((installed_dir or _root() / "installed") / item["name"])
@@ -193,12 +194,15 @@ def _manifest(plugin: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _describe_error(error: str | None) -> str | None:
+def _describe_error(error: str | None, manual_names: set[str] | None = None) -> str | None:
     if not error:
         return None
     return re.sub(
         r"already registered by [\'\"]_pymss_(runtime_)?plugin_([^\'\"]+)[\'\"]",
-        lambda match: "already provided by " + ("marketplace plugin " if match[1] else "manually installed plugin ") + match[2],
+        lambda match: "already provided by " + (
+            "manually installed plugin " if not match[1] or match[2] in (manual_names or set())
+            else "marketplace plugin "
+        ) + match[2],
         error,
     )
 

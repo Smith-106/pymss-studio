@@ -10,9 +10,10 @@
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
+import { pluginViewUrl } from './viewUrl'
 
 type PluginViewContribution = {
   id: string
@@ -24,13 +25,14 @@ type PluginViewContribution = {
   permissions: string[]
 }
 
-const props = defineProps<{ pluginName: string; view: PluginViewContribution }>()
+const props = defineProps<{ pluginName: string; pluginsRoot: string; view: PluginViewContribution }>()
 const { t } = useI18n()
 
 const frame = ref<HTMLIFrameElement | null>(null)
 const status = ref<'loading' | 'ready' | 'error'>('loading')
 const errorText = ref('')
 const src = ref('')
+let disposed = false
 
 const permissions = () => props.view.permissions || ['operations']
 
@@ -61,15 +63,21 @@ async function handleCall(id: number, method: string, params: Record<string, unk
       const promise = new Promise<unknown>((resolve, reject) => {
         runRequests.set(requestId, { resolve, reject })
       })
-      await invoke('start_operation_task', {
-        payload: {
-          operation: params.operation,
-          inputs: params.inputs || {},
-          params: params.params || {},
-          requestId,
-        },
-      })
-      return await promise
+      // Unmount can reject the request while the native start call is pending.
+      void promise.catch(() => undefined)
+      try {
+        await invoke('start_operation_task', {
+          payload: {
+            operation: params.operation,
+            inputs: params.inputs || {},
+            params: params.params || {},
+            requestId,
+          },
+        })
+        return await promise
+      } finally {
+        runRequests.delete(requestId)
+      }
     }
     case 'files.pickAudio': {
       const selected = await open({ multiple: false, title: 'Audio' })
@@ -81,6 +89,7 @@ async function handleCall(id: number, method: string, params: Record<string, unk
 }
 
 function postToFrame(message: Record<string, unknown>) {
+  if (disposed) return
   frame.value?.contentWindow?.postMessage(message, '*')
 }
 
@@ -145,41 +154,47 @@ onMounted(async () => {
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] })
   try {
     if (!props.view.entryPath && !props.view.entry) throw new Error('view entry not found')
-    // WebView2 (Windows) cannot resolve custom schemes inside sandboxed
-    // iframes; Tauri serves registered protocols there as
-    // https://<scheme>.localhost/. Use the platform-appropriate origin.
-    const isWindows = navigator.userAgent.includes('Windows')
-    const base = isWindows ? 'https://pymss-plugin.localhost' : 'pymss-plugin://'
-    src.value = `${base}/view/${encodeURIComponent(props.pluginName)}/${encodeURIComponent(props.view.id)}/index.html`
+    if (!props.pluginsRoot) throw new Error('plugins root not ready')
+    await invoke('set_plugin_view_root', { root: props.pluginsRoot })
+    if (disposed) return
+    const unlisten = await listen<{ type: string; requestId?: string; taskId?: string; payload: Record<string, unknown> }>(
+      'pymss://worker-event',
+      ({ payload: workerEvent }) => {
+        const requestId = workerEvent.requestId || workerEvent.taskId || ''
+        const handlers = runRequests.get(requestId)
+        if (!handlers) return
+        if (workerEvent.type === 'operation_result') {
+          runRequests.delete(requestId)
+          handlers.resolve(workerEvent.payload)
+        } else if (workerEvent.type === 'error' || workerEvent.type === 'task_cancelled') {
+          runRequests.delete(requestId)
+          handlers.reject(new Error(String(workerEvent.payload?.message || workerEvent.type)))
+        } else if (workerEvent.type === 'operation_progress') {
+          handlers.onProgress?.(workerEvent.payload || {})
+          postToFrame({ jsonrpc: '2.0', method: 'task.progress', params: { requestId, ...(workerEvent.payload || {}) } })
+        }
+      },
+    )
+    if (disposed) { unlisten(); return }
+    unlistenWorker = unlisten
+    src.value = pluginViewUrl(
+      props.pluginName, props.view.id, props.view.entryPath || props.view.entry, convertFileSrc,
+    )
     status.value = 'loading'
   } catch (failure) {
+    if (disposed) return
     status.value = 'error'
     errorText.value = String(failure)
   }
-  unlistenWorker = await listen<{ type: string; requestId?: string; taskId?: string; payload: Record<string, unknown> }>(
-    'pymss://worker-event',
-    ({ payload: workerEvent }) => {
-      const requestId = workerEvent.requestId || workerEvent.taskId || ''
-      const handlers = runRequests.get(requestId)
-      if (!handlers) return
-      if (workerEvent.type === 'operation_result') {
-        runRequests.delete(requestId)
-        handlers.resolve(workerEvent.payload)
-      } else if (workerEvent.type === 'error' || workerEvent.type === 'task_cancelled') {
-        runRequests.delete(requestId)
-        handlers.reject(new Error(String(workerEvent.payload?.message || workerEvent.type)))
-      } else if (workerEvent.type === 'operation_progress') {
-        handlers.onProgress?.(workerEvent.payload || {})
-        postToFrame({ jsonrpc: '2.0', method: 'task.progress', params: { requestId, ...(workerEvent.payload || {}) } })
-      }
-    },
-  )
 })
 
 onBeforeUnmount(() => {
+  disposed = true
   window.removeEventListener('message', onWindowMessage)
   unlistenWorker?.()
   themeObserver?.disconnect()
+  for (const handlers of runRequests.values()) handlers.reject(new Error('PLUGIN_VIEW_CLOSED'))
+  runRequests.clear()
 })
 </script>
 

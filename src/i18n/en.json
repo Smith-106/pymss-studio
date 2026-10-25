@@ -1944,6 +1944,7 @@
     "backToNodeEditor": "Back to Node Editor",
     "addNode": "Add node",
     "advancedEditor": {
+      "loadingNodes": "Loading workflow nodes…",
       "searchNodes": "Search nodes",
       "value": "Value",
       "confirm": "OK",

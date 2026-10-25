@@ -405,14 +405,26 @@ export function refreshNodeModelOptions(node: any, values: string[]) {
 const PLUGIN_NODE_SPECS: Record<string, NodeSpec> = {}
 let pluginSpecsLoaded = false
 
-/** Merge plugin-contributed node specs (manifest [[contributions.nodes]]). */
+/** Reconcile the current runtime's plugin declarations without replacing built-ins. */
 export function registerPluginNodeSpecs(specs: NodeSpec[]) {
-  for (const spec of specs) {
-    if (!spec?.type) continue
-    if (NODE_SPECS[spec.type] || BUILTIN_SPECS[spec.type]) continue // never shadow built-ins
+  const next = new Map(specs.filter(spec => spec?.type && !NODE_SPECS[spec.type] && !BUILTIN_SPECS[spec.type])
+    .map(spec => [spec.type, spec]))
+  const remove = (type: string) => {
+    delete PLUGIN_NODE_SPECS[type]
+    if (registered) LiteGraph.unregisterNodeType(type)
+    for (let index = registeredNodeClasses.length - 1; index >= 0; index--) {
+      if (registeredNodeClasses[index]?.spec.type === type) registeredNodeClasses.splice(index, 1)
+    }
+  }
+  for (const type of Object.keys(PLUGIN_NODE_SPECS)) {
+    if (!next.has(type)) remove(type)
+  }
+  for (const spec of next.values()) {
     const existing = PLUGIN_NODE_SPECS[spec.type]
+    if (existing && JSON.stringify(existing) === JSON.stringify(spec)) continue
+    if (existing) remove(spec.type)
     PLUGIN_NODE_SPECS[spec.type] = spec
-    if (registered && !existing) {
+    if (registered) {
       const cls = makeNodeClass(spec) as any
       LiteGraph.registerNodeType(spec.type, cls)
       cls.category = translateNodeCategory(spec.category)
