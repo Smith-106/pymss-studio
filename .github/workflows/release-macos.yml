@@ -50,6 +50,9 @@ jobs:
           cargo.write_text(text, encoding="utf-8")
           PY
 
+      - name: Resolve latest stable release cores
+        run: python3 scripts/resolve-release-core.py python/runtime-manifest.json
+
       - name: Prepare bootstrap and MLX runtime environment
         working-directory: .
         env:
@@ -67,6 +70,7 @@ jobs:
           fi
           PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 -c "import importlib.util, sys, ssl, venv, xmlrpc.client, pip, pymss, pymss_core, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
           PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 -m pip install --help > /dev/null
+          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 scripts/resolve-release-core.py python/runtime-manifest.json --verify
 
       - name: Install aria2 runtime libraries
         run: brew install --formula zlib expat sqlite c-ares
@@ -240,6 +244,7 @@ jobs:
           fi
           PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -c "import importlib.util, sys, ssl, venv, xmlrpc.client, pip, pymss, pymss_core, pymss.graph, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -m pip install --help > /dev/null
+          PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" scripts/resolve-release-core.py "$(dirname "$WORKER")/runtime-manifest.json" --verify
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -c "from pathlib import Path; import shutil; expected=Path('$BIN'); assert Path(shutil.which('ffmpeg')).resolve().parent == expected.resolve(); assert Path(shutil.which('aria2c')).resolve().parent == expected.resolve(); print('bundled tools ok')"
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" -c "from pathlib import Path; from pymss.model_download import ARIA2C_PATH; assert ARIA2C_PATH and Path(ARIA2C_PATH).resolve() == Path('$BIN/aria2c').resolve(), 'pymss did not select the bundled aria2c'; print('aria2 resolver ok:', ARIA2C_PATH)"
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" "$WORKER" env_info

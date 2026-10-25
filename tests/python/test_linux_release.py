@@ -39,11 +39,14 @@ class LinuxReleaseTests(unittest.TestCase):
             hooks.mkdir(parents=True)
             (hooks / "linuxdeploy-plugin-gtk.sh").write_text("export PROBE_GTK=gtk\n", encoding="utf-8")
             (hooks / "linuxdeploy-plugin-gstreamer.sh").write_text("export PROBE_MEDIA=gstreamer\n", encoding="utf-8")
+            # The compiled probe is replaced with a shell script below. Use
+            # Bash explicitly so native Windows symlinks do not need to resolve
+            # the script's POSIX shebang interpreter.
             (original / "AppRun").write_text(
                 'set -e\n'
                 '. "$APPDIR/apprun-hooks/linuxdeploy-plugin-gtk.sh"\n'
                 '. "$APPDIR/apprun-hooks/linuxdeploy-plugin-gstreamer.sh"\n'
-                'exec "$APPDIR/AppRun.wrapped" "$@"\n',
+                'exec "$BASH" "$APPDIR/AppRun.wrapped" "$@"\n',
                 encoding="utf-8",
             )
             executable = '#!/usr/bin/env bash\nprintf "%s\\n" "$PROBE_GTK:$PROBE_MEDIA:$1"\n'
