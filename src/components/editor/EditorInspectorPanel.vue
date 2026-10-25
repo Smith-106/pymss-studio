@@ -28,6 +28,7 @@ const emit = defineEmits<{
   beginMasterPan: []
   commitMasterPan: []
   renameTrack: [trackId: string, name: string, commit?: boolean]
+  toggleTrackFlag: [trackId: string, flag: 'muted' | 'solo']
   setTrackVolume: [trackId: string, value: number]
   setTrackPan: [trackId: string, value: number]
   beginTrackVolume: []
@@ -104,6 +105,9 @@ function commitChannelPan() {
   if (selectedTrack.value) emit('commitTrackPan')
   else emit('commitMasterPan')
 }
+function toggleTrackFlag(flag: 'muted' | 'solo') {
+  if (selectedTrack.value) emit('toggleTrackFlag', selectedTrack.value.id, flag)
+}
 function normalizeLevel(value: number | undefined) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
 }
@@ -169,6 +173,19 @@ function formatTrackVolume(value: number) {
   return `${percent} · ${normalized}`
 }
 
+function formatVolumeDb(value: number) {
+  const volume = Math.max(0, Number(value || 0))
+  if (volume <= 0.0001) return '−∞ dB'
+  const db = 20 * Math.log10(volume)
+  return `${db > 0.05 ? '+' : ''}${db.toFixed(1)} dB`
+}
+
+function formatPanShort(value: number) {
+  const pan = Number(value || 0)
+  if (Math.abs(pan) < 0.025) return 'C'
+  return `${pan < 0 ? 'L' : 'R'}${Math.round(Math.abs(pan) * 100)}`
+}
+
 function formatTrackPan(value: number) {
   const pan = Number(value || 0)
   if (Math.abs(pan) < 0.025) return t('editor.panCenter')
@@ -217,78 +234,75 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
         <n-input v-if="selectedTrack && editingTrackId === selectedTrack.id" ref="renameInput" v-model:value="renameDraft" class="editor-inspector__name-input" size="small" :input-props="{ 'aria-label': t('editor.inspectorFieldName') }" @blur="commitRename()" @keydown.stop="onRenameKeydown" />
         <n-select v-else class="editor-inspector__channel-picker" size="small" :value="channelValue" :options="channelOptions" :aria-label="t('editor.selectChannel')" @update:value="selectChannel" />
         <button v-if="selectedTrack && editingTrackId !== selectedTrack.id" ref="nameButton" type="button" class="editor-inspector__name" :title="t('editor.renameTrack', { name: selectedTrack.name })" :aria-label="t('editor.renameTrack', { name: selectedTrack.name })" @click="beginRename" @keydown.stop><n-icon :component="PencilOutline" :size="14" /></button>
-        <n-button class="editor-inspector__master-button" size="tiny" secondary :type="selectedTrack ? 'default' : 'primary'" :disabled="!selectedTrack" @click="selectChannel('master')">{{ t('editor.plugins.masterOutput') }}</n-button>
+        <n-button class="editor-inspector__master-button" size="tiny" secondary :type="selectedTrack ? 'default' : 'primary'" :disabled="!selectedTrack" @keydown.space.stop @click="selectChannel('master')">{{ t('editor.plugins.masterOutput') }}</n-button>
       </div>
       <span class="editor-inspector__channel-context" :title="selectedTrack ? sourceMeta : session.name">{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : session.name }}</span>
     </div>
 
     <div class="editor-inspector__scroll">
-      <section class="inspector-group inspector-group--primary inspector-channel">
-        <div class="inspector-group__header">
-          <strong>{{ t('editor.inspectorSectionCommon') }}</strong>
-          <span>{{ selectedTrack ? t('editor.inspectorTrackContext') : t('editor.plugins.masterOutput') }}</span>
+      <section class="inspector-strip" :aria-label="selectedTrack ? selectedTrack.name : t('editor.plugins.masterOutput')">
+        <div class="inspector-strip__controls">
+          <div class="inspector-strip__pan" :title="`${t('editor.balance')} · ${formatTrackPan(channelPan)}`">
+            <div class="inspector-strip__caption"><span>{{ t('editor.balance') }}</span><strong>{{ formatPanShort(channelPan) }}</strong></div>
+            <EditorParameterSlider
+              :key="channelValue"
+              :value="channelPan"
+              :reset-value="0"
+              :label="t('editor.balance')"
+              :aria-label="t('editor.balance')"
+              :reset-label="t('editor.sliderDefaultCenter')"
+              :min="-1"
+              :max="1"
+              :step="0.01"
+              :tooltip="false"
+              @update:value="updateChannelPan"
+              @dragstart="beginChannelPan"
+              @dragend="commitChannelPan"
+            />
+          </div>
+
+          <div v-if="selectedTrack" class="inspector-strip__flags">
+            <button type="button" class="inspector-strip__flag inspector-strip__flag--mute" :class="{ 'inspector-strip__flag--active': selectedTrack.muted }" :aria-pressed="selectedTrack.muted" :title="t(selectedTrack.muted ? 'editor.unmuteTrack' : 'editor.muteTrack')" :aria-label="t(selectedTrack.muted ? 'editor.unmuteTrack' : 'editor.muteTrack')" @keydown.space.stop @click="toggleTrackFlag('muted')">M</button>
+            <button type="button" class="inspector-strip__flag inspector-strip__flag--solo" :class="{ 'inspector-strip__flag--active': selectedTrack.solo }" :aria-pressed="selectedTrack.solo" :title="t(selectedTrack.solo ? 'editor.unsoloTrack' : 'editor.soloTrack')" :aria-label="t(selectedTrack.solo ? 'editor.unsoloTrack' : 'editor.soloTrack')" @keydown.space.stop @click="toggleTrackFlag('solo')">S</button>
+          </div>
+
+          <div class="inspector-strip__fader-area" :title="t('editor.channelLevelStereo', { left: formatLevel(channelLevels[0]), right: formatLevel(channelLevels[1]) })">
+            <div class="inspector-strip__fader">
+            <EditorParameterSlider
+              :key="channelValue"
+              vertical
+              :value="channelVolume"
+              :reset-value="1"
+              :label="channelVolumeLabel"
+              :aria-label="channelVolumeLabel"
+              :reset-label="t('editor.sliderDefaultVolume')"
+              :min="0"
+              :max="2"
+              :step="0.01"
+              :tooltip="false"
+              @update:value="updateChannelVolume"
+              @dragstart="beginChannelVolume"
+              @dragend="commitChannelVolume"
+            />
+            </div>
+            <div class="inspector-strip__meter">
+              <div v-for="(value, index) in channelLevels" :key="index" class="inspector-strip__meter-bar" role="meter" :aria-label="`${t('editor.channelLevel')} · ${t(index === 0 ? 'editor.panLeft' : 'editor.panRight')}`" :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="meterValue(value)" :aria-valuetext="`${formatLevel(value)} dBFS`">
+                <span :class="{ 'inspector-strip__meter-fill--full': value >= 1 }" :style="{ transform: `scaleY(${meterScale(value)})` }" />
+              </div>
+              <div class="inspector-strip__meter-scale" aria-hidden="true"><span>0</span><span>−30</span><span>−60</span></div>
+            </div>
+          </div>
+
+          <div class="inspector-strip__readout" :title="`${channelVolumeLabel} · ${formatTrackVolume(channelVolume)}`">
+            <strong>{{ formatVolumeDb(channelVolume) }}</strong>
+            <small>{{ formatLevel(channelPeak) }} dBFS</small>
+          </div>
         </div>
 
-        <div class="inspector-group__body inspector-group__body--dense inspector-channel__body">
-          <div class="dual-fields dual-fields--stacked">
-            <div class="panel-field panel-field--compact">
-              <div class="panel-field__split panel-field__split--compact">
-                <span class="panel-field__label">{{ channelVolumeLabel }}</span>
-                <strong>{{ formatTrackVolume(channelVolume) }}</strong>
-              </div>
-              <EditorParameterSlider
-                :key="channelValue"
-                :value="channelVolume"
-                :reset-value="1"
-                :label="channelVolumeLabel"
-                :aria-label="channelVolumeLabel"
-                :reset-label="t('editor.sliderDefaultVolume')"
-                :min="0"
-                :max="2"
-                :step="0.01"
-                :tooltip="false"
-                @update:value="updateChannelVolume"
-                @dragstart="beginChannelVolume"
-                @dragend="commitChannelVolume"
-              />
-            </div>
-
-            <div class="panel-field panel-field--compact">
-              <div class="panel-field__split panel-field__split--compact">
-                <span class="panel-field__label">{{ t('editor.balance') }}</span>
-                <strong>{{ formatTrackPan(channelPan) }}</strong>
-              </div>
-              <EditorParameterSlider
-                :key="channelValue"
-                :value="channelPan"
-                :reset-value="0"
-                :label="t('editor.balance')"
-                :aria-label="t('editor.balance')"
-                :reset-label="t('editor.sliderDefaultCenter')"
-                :min="-1"
-                :max="1"
-                :step="0.01"
-                :tooltip="false"
-                @update:value="updateChannelPan"
-                @dragstart="beginChannelPan"
-                @dragend="commitChannelPan"
-              />
-            </div>
-          </div>
-          <div class="inspector-channel__meter" :title="t('editor.channelLevelStereo', { left: formatLevel(channelLevels[0]), right: formatLevel(channelLevels[1]) })">
-            <span class="inspector-channel__meter-label">{{ t('editor.channelLevel') }}</span>
-            <div class="inspector-channel__meter-bars">
-              <div v-for="(value, index) in channelLevels" :key="index" class="inspector-channel__meter-bar" role="meter" :aria-label="`${t('editor.channelLevel')} · ${t(index === 0 ? 'editor.panLeft' : 'editor.panRight')}`" :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="meterValue(value)" :aria-valuetext="`${formatLevel(value)} dBFS`">
-                <span :class="{ 'inspector-channel__meter-fill--full': value >= 1 }" :style="{ transform: `scaleY(${meterScale(value)})` }" />
-              </div>
-              <div class="inspector-channel__meter-scale" aria-hidden="true"><span>0</span><span>−30</span><span>−60</span></div>
-            </div>
-            <strong class="inspector-channel__meter-value">{{ formatLevel(channelPeak) }}<small>dBFS</small></strong>
-          </div>
+        <div class="inspector-strip__inserts">
+          <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" />
         </div>
       </section>
-
-      <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" />
 
       <section v-if="selectedTrack && selectedClip" class="inspector-group inspector-group--clip">
         <div class="inspector-group__header">
@@ -427,6 +441,7 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
 
 <style scoped>
 .editor-inspector {
+  container: channel-inspector / inline-size;
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -511,19 +526,65 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
   border-color: color-mix(in srgb, var(--outline) 78%, transparent);
 }
 
-.inspector-channel__body { grid-template-columns: minmax(0, 1fr) 50px; align-items: center; gap: 9px; }
-.inspector-channel__body > .dual-fields { min-width: 0; }
-.inspector-channel .panel-field__split { gap: 4px; }
-.inspector-channel .panel-field__split > strong { font-variant-numeric: tabular-nums; font-size: 10px; }
-.inspector-channel__meter { display: grid; justify-items: center; gap: 4px; min-width: 0; }
-.inspector-channel__meter-label { font-size: 9px; color: var(--on-surface-muted); }
-.inspector-channel__meter-bars { display: grid; grid-template-columns: 8px 8px 19px; gap: 3px; height: 70px; }
-.inspector-channel__meter-bar { position: relative; overflow: hidden; background: var(--surface-2); border: 1px solid var(--outline); border-radius: 2px; }
-.inspector-channel__meter-bar > span { position: absolute; inset: 0; background: var(--success, var(--primary)); transform-origin: bottom; }
-.inspector-channel__meter-bar > .inspector-channel__meter-fill--full { background: var(--error, var(--warning)); }
-.inspector-channel__meter-scale { display: flex; flex-direction: column; justify-content: space-between; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
-.inspector-channel__meter-value { font-size: 10px; line-height: 1.2; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.inspector-channel__meter-value > small { margin-left: 3px; color: var(--on-surface-muted); font-size: 8px; font-weight: 400; }
+/* Channel strip: fader column on the left, insert slots on the right. */
+.inspector-strip {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  height: clamp(216px, 36dvh, 380px);
+  min-height: 0;
+  border: 1px solid color-mix(in srgb, var(--outline) 78%, transparent);
+  border-radius: 8px;
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.editor-inspector--compact .inspector-strip { grid-template-columns: 66px minmax(0, 1fr); }
+.inspector-strip__controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px 7px;
+  border-right: 1px solid color-mix(in srgb, var(--outline) 70%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
+}
+.inspector-strip__caption { display: flex; justify-content: space-between; align-items: baseline; gap: 2px; font-size: 9px; color: var(--on-surface-muted); }
+.inspector-strip__caption > span { min-width: 0; overflow-wrap: anywhere; }
+.inspector-strip__caption > strong { color: var(--on-surface); font-size: 10px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.inspector-strip__pan :deep(.editor-parameter-slider) { gap: 0; }
+.inspector-strip__pan :deep(.editor-parameter-slider__reset) { display: none; }
+.inspector-strip__flags { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.inspector-strip__flag {
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--outline);
+  border-radius: 4px;
+  background: var(--surface-1);
+  color: var(--on-surface-muted);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.inspector-strip__flag:hover { color: var(--on-surface); border-color: var(--outline-strong); }
+.inspector-strip__flag:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.inspector-strip__flag--mute.inspector-strip__flag--active { border-color: transparent; background: var(--warning); color: #1b1b1b; }
+.inspector-strip__flag--solo.inspector-strip__flag--active { border-color: transparent; background: var(--primary); color: #fff; }
+.inspector-strip__fader-area { position: relative; display: flex; justify-content: center; gap: 5px; flex: 1; min-height: 150px; padding-bottom: 23px; }
+.inspector-strip__fader { display: flex; flex-direction: column; }
+.inspector-strip__fader :deep(.editor-parameter-slider) { flex-direction: column; flex: 1; min-height: 0; gap: 0; }
+.inspector-strip__fader :deep(.editor-parameter-slider__control) { display: flex; justify-content: center; flex: 1; min-height: 0; }
+.inspector-strip__fader :deep(.n-slider) { height: 100%; }
+.inspector-strip__fader :deep(.editor-parameter-slider__reset) { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); min-height: 18px; max-width: 100%; padding: 0 3px; font-size: 9px; white-space: normal; }
+.inspector-strip__meter { display: grid; grid-template-columns: 5px 5px 16px; gap: 2px; }
+.inspector-strip__meter-bar { position: relative; overflow: hidden; background: var(--surface-2); border: 1px solid var(--outline); border-radius: 2px; }
+.inspector-strip__meter-bar > span { position: absolute; inset: 0; background: var(--success, var(--primary)); transform-origin: bottom; }
+.inspector-strip__meter-bar > .inspector-strip__meter-fill--full { background: var(--error, var(--warning)); }
+.inspector-strip__meter-scale { display: flex; flex-direction: column; justify-content: space-between; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
+.inspector-strip__readout { display: grid; justify-items: center; gap: 1px; padding: 4px 0 1px; border-top: 1px solid color-mix(in srgb, var(--outline) 60%, transparent); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.inspector-strip__readout > strong { font-size: 11px; font-weight: 600; }
+.inspector-strip__readout > small { color: var(--on-surface-muted); font-size: 8px; }
+.inspector-strip__inserts { min-width: 0; min-height: 0; overflow: auto; }
 
 .inspector-group--clip {
   background: color-mix(in srgb, var(--surface-2) 20%, var(--surface-1));
@@ -631,6 +692,7 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   font-size: 11px;
   letter-spacing: 0;
 }
+
 
 .panel-field__split {
   display: flex;
@@ -758,20 +820,42 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   --n-box-shadow-focus: 0 0 0 2px color-mix(in srgb, var(--primary-soft) 34%, transparent) !important;
 }
 
+
 .editor-inspector :deep(.n-slider-rail),
 .editor-inspector :deep(.n-slider-rail__fill) {
   border-radius: 999px;
 }
 
-@media (max-width: 1480px) {
-  .stats-grid {
-    grid-template-columns: 1fr;
-  }
+@container channel-inspector (max-width: 250px) {
+  .editor-inspector__titlebar { padding-inline: 8px; }
+  .editor-inspector__channel-select { flex-wrap: wrap; }
+  .editor-inspector__channel-picker, .editor-inspector__name-input { flex-basis: calc(100% - 30px); }
+  .editor-inspector__master-button { margin-left: auto; }
+  .editor-inspector__scroll { padding-inline: 8px; }
+  .inspector-strip { grid-template-columns: 66px minmax(0, 1fr); }
+  .inspector-group { padding-inline: 8px; }
 }
-
-@media (max-width: 1360px) {
-  .inspector-group {
-    padding-inline: 8px;
-  }
+@container channel-inspector (min-width: 300px) {
+  .inspector-strip { grid-template-columns: 84px minmax(0, 1fr); }
+  .inspector-strip__controls { padding-inline: 8px; }
+  .inspector-strip__caption { font-size: 10px; }
+  .inspector-strip__readout > strong { font-size: 12px; }
+}
+@media (max-height: 760px) {
+  .inspector-strip__controls { gap: 6px; padding-block: 6px; }
+  .inspector-strip__fader-area { min-height: 104px; }
+}
+@media (max-height: 640px) {
+  .editor-inspector__titlebar { gap: 2px; padding-block: 7px; }
+  .editor-inspector__scroll { gap: 6px; padding-block: 6px; }
+  .inspector-strip { height: clamp(204px, 35dvh, 224px); }
+  .inspector-strip__controls { gap: 4px; }
+  .inspector-strip__fader-area { min-height: 76px; }
+  .inspector-strip__flag { height: 18px; }
+  .inspector-strip__readout { padding-top: 2px; }
+}
+@media (max-height: 520px) {
+  .inspector-strip { height: 200px; }
+  .inspector-strip__fader-area { min-height: 68px; }
 }
 </style>

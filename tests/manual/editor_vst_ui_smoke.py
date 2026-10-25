@@ -79,7 +79,7 @@ SETUP = """async () => {
   app.$pinia._s.get('settings').initialized=true;
   __editor.session={id:'vst-ui-project',name:'Audio Session',masterVolume:1,masterPan:0,
     sources:[],tracks:[{id:'track',sourceId:'',role:'stem',name:'人声',volume:1,pan:0,
-      muted:false,solo:false,fadeIn:0,fadeOut:0,clips:[],effects:{clarity:0,compressor:0,reverb:0,delay:0,delayTime:.24}}],createdAt:1,updatedAt:1};
+      muted:false,solo:false,fadeIn:0,fadeOut:0,clips:[]}],createdAt:1,updatedAt:1};
   __editor.selectTrack('track');
   await app.$router.replace({name:'editor',query:{projectId:'vst-ui-project'}});
 }"""

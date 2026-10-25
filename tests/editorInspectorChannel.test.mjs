@@ -115,6 +115,23 @@ test('meters read the matching stereo levels and never invent activity or retain
   assert.equal(env.events.length, 0)
 })
 
+test('channel strip mute/solo targets only the selected track and readouts stay compact', async t => {
+  const env = environment(t)
+  env.call('toggleTrackFlag', 'muted')
+  assert.equal(env.events.length, 0, 'the master strip has no mute/solo')
+  env.props.selectedTrackId = 'track:voice'
+  await flush()
+  env.call('toggleTrackFlag', 'muted')
+  env.call('toggleTrackFlag', 'solo')
+  assert.deepEqual(env.events, [['toggleTrackFlag', 'track:voice', 'muted'], ['toggleTrackFlag', 'track:voice', 'solo']])
+  assert.equal(env.call('formatVolumeDb', 1), '0.0 dB')
+  assert.equal(env.call('formatVolumeDb', 2), '+6.0 dB')
+  assert.equal(env.call('formatVolumeDb', 0), '−∞ dB')
+  assert.equal(env.call('formatPanShort', 0.01), 'C')
+  assert.equal(env.call('formatPanShort', -0.4), 'L40')
+  assert.equal(env.call('formatPanShort', 1), 'R100')
+})
+
 test('global track changes cancel a pending rename without touching another channel', async t => {
   const env = environment(t, 'master')
   await env.call('beginRename')

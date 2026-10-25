@@ -500,7 +500,7 @@ async function toggleEditor(slotId: string) {
         </div>
       </li>
     </ol>
-    <button v-else type="button" class="plugin-panel__add" @click="openManager()"><n-icon :component="AddOutline" />{{ t('editor.plugins.addInsert') }}</button>
+    <button type="button" class="plugin-panel__add" @click="openManager()"><n-icon :component="AddOutline" />{{ t('editor.plugins.addInsert') }}</button>
     <button v-if="operationError" type="button" class="plugin-panel__attention" :title="operationError" @click="openManager()">{{ t(dialogPending ? 'editor.plugins.insertWaiting' : 'editor.plugins.attentionRequired') }}</button>
   </section>
 
@@ -524,7 +524,7 @@ async function toggleEditor(slotId: string) {
         </template>
         <template #header-extra><span class="plugin-manager__badge">{{ t('editor.plugins.experimental') }}</span></template>
         <div class="plugin-manager__body" :aria-busy="busy">
-          <section class="plugin-manager__library" :aria-label="t('editor.plugins.library')">
+          <section class="plugin-manager__library" :class="{ 'plugin-manager__library--scanning': scanning }" :aria-label="t('editor.plugins.library')">
             <div class="plugin-manager__section-heading">
               <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count" :title="t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: scanReport.plugins.length })">{{ descriptors.length }}</span></div>
               <div class="plugin-manager__library-actions">
@@ -673,41 +673,56 @@ async function toggleEditor(slotId: string) {
 </template>
 
 <style scoped>
-.plugin-panel { min-width: 0; padding: 12px 10px; border-bottom: 1px solid var(--outline); }
-.plugin-panel__header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
-.plugin-panel__header > strong { display: flex; align-items: baseline; gap: 7px; font-size: 12px; }
+.plugin-panel { container: plugin-inserts / inline-size; min-width: 0; padding: 8px 7px; }
+.plugin-panel__header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 6px; }
+.plugin-panel__header > .n-button { margin-left: auto; }
+.plugin-panel__header > strong { display: flex; align-items: baseline; gap: 5px; font-size: 11px; font-weight: 600; }
 .plugin-panel__header > strong > span { font-size: 10px; font-weight: 400; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
-.plugin-panel__inserts { display: grid; gap: 0; max-height: 260px; overflow: auto; margin: 0; padding: 0; list-style: none; border: 1px solid var(--outline); border-radius: 5px; }
-.plugin-insert { min-width: 0; padding: 5px 7px; background: var(--surface-1); }
-.plugin-insert + .plugin-insert { border-top: 1px solid var(--outline); }
+.plugin-panel__inserts { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.plugin-insert { min-width: 0; padding: 3px 4px 2px; border: 1px solid var(--outline); border-left: 3px solid var(--primary); border-radius: 4px; background: var(--surface-1); }
+.plugin-insert--bypassed { border-left-color: var(--outline-strong); background: transparent; }
 .plugin-insert--bypassed .plugin-insert__editor { opacity: .55; }
-.plugin-insert__main { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.plugin-insert__number { flex-shrink: 0; width: 12px; font-size: 10px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
-.plugin-insert__editor { flex: 1; justify-content: flex-start; overflow: hidden; min-width: 0; font-size: 12px; }
+.plugin-insert__main { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.plugin-insert__number { flex-shrink: 0; width: 10px; font-size: 9px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
+.plugin-insert__editor { flex: 1; justify-content: flex-start; overflow: hidden; min-width: 0; font-size: 11px; }
 .plugin-insert__editor :deep(.n-button__content) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-insert__main > .n-switch { flex-shrink: 0; }
-.plugin-insert__tools { display: flex; align-items: center; gap: 5px; min-width: 0; padding-left: 19px; }
-.plugin-insert__tools > div { display: flex; gap: 1px; margin-left: auto; }
-.plugin-insert__tools :deep(.n-button) { width: 22px; padding: 0; }
+.plugin-insert__tools { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; min-width: 0; padding-left: 15px; opacity: .5; transition: opacity 120ms; }
+.plugin-insert:hover .plugin-insert__tools, .plugin-insert:focus-within .plugin-insert__tools { opacity: 1; }
+.plugin-insert__tools > .plugin-manager__format { padding: 0 4px; font-size: 9px; }
+.plugin-insert__tools > div { display: flex; flex-shrink: 0; gap: 0; margin-left: auto; }
+.plugin-insert__tools :deep(.n-button) { width: 20px; padding: 0; }
 .plugin-insert__missing { color: var(--warning); font-size: 10px; }
-.plugin-panel__add { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 34px; border: 1px dashed var(--outline-strong); border-radius: 5px; background: transparent; color: var(--on-surface-muted); cursor: pointer; font: inherit; font-size: 11px; }
+.plugin-panel__add { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 28px; margin-top: 3px; border: 1px dashed var(--outline-strong); border-radius: 4px; background: transparent; color: var(--on-surface-muted); cursor: pointer; font: inherit; font-size: 11px; }
 .plugin-panel__add:hover { color: var(--primary); border-color: var(--primary-border); background: var(--primary-softer); }
 .plugin-panel__attention { display: block; width: 100%; margin-top: 7px; padding: 0; border: 0; background: transparent; color: var(--warning); text-align: left; font: inherit; font-size: 11px; cursor: pointer; }
 .plugin-panel__add:focus-visible, .plugin-panel__attention:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .plugin-panel__hint, .plugin-panel__warning { margin: 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .plugin-panel__warning { color: var(--warning, var(--on-surface-muted)); }
-.plugin-manager { width: min(1060px, calc(100vw - 40px)); height: min(600px, calc(100dvh - 128px)); max-height: calc(100dvh - 128px); margin: 96px auto 24px; align-self: flex-start; min-width: 0; border: 1px solid var(--outline-strong); box-shadow: var(--shadow-soft); }
+.plugin-manager {
+  --plugin-manager-top: 96px;
+  --plugin-manager-bottom: 20px;
+  --plugin-manager-inset: 24px;
+  width: min(1440px, calc(100vw - var(--plugin-manager-inset) * 2));
+  height: min(860px, calc(100dvh - var(--plugin-manager-top) - var(--plugin-manager-bottom)));
+  max-height: calc(100dvh - var(--plugin-manager-top) - var(--plugin-manager-bottom));
+  margin: var(--plugin-manager-top) auto var(--plugin-manager-bottom);
+  align-self: flex-start;
+  min-width: 0;
+  border: 1px solid var(--outline-strong);
+  box-shadow: var(--shadow-soft);
+}
 .plugin-manager :deep(.n-card-header) { padding: 13px 16px; border-bottom: 1px solid var(--outline); }
 .plugin-manager :deep(.plugin-manager__content) { display: flex; flex-direction: column; padding: 0; min-height: 0; overflow: hidden; }
 .plugin-manager :deep(.plugin-manager__error) { padding: 12px 20px; max-height: 25dvh; overflow: auto; border-top: 1px solid var(--outline); }
-.plugin-manager__heading { display: flex; align-items: center; gap: 16px; min-width: 0; }
-.plugin-manager__heading > strong { font-size: 16px; font-weight: 600; }
+.plugin-manager__heading { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; min-width: 0; }
+.plugin-manager__heading > strong { flex-shrink: 0; font-size: 16px; font-weight: 600; }
 .plugin-manager__target { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .plugin-manager__target > label { flex-shrink: 0; font-size: 11px; color: var(--on-surface-muted); }
-.plugin-manager__target > .n-select { width: 200px; max-width: 25vw; }
+.plugin-manager__target > .n-select { width: clamp(140px, 18vw, 240px); max-width: 32vw; }
 .plugin-manager__library-actions { display: flex; align-items: center; gap: 2px; }
 .plugin-manager__source-count { margin-left: 5px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
-.plugin-manager__source-manager { display: flex; flex-direction: column; width: min(360px, calc(100vw - 64px)); max-height: min(400px, calc(100dvh - 220px)); color: var(--on-surface); background: var(--surface-1); border: 1px solid var(--outline-strong); border-radius: 6px; box-shadow: var(--shadow-soft); }
+.plugin-manager__source-manager { display: flex; flex-direction: column; width: min(380px, calc(100vw - 48px)); max-height: min(420px, calc(100dvh - 180px)); color: var(--on-surface); background: var(--surface-1); border: 1px solid var(--outline-strong); border-radius: 6px; box-shadow: var(--shadow-soft); }
 .plugin-manager__source-manager > .plugin-manager__source-toolbar { flex-shrink: 0; padding: 10px 12px; border-bottom: 1px solid var(--outline); }
 .plugin-manager__source-content { display: grid; gap: 14px; min-height: 0; padding: 12px; overflow: auto; }
 .plugin-manager__scan-details { color: var(--on-surface-muted); font-size: 11px; }
@@ -717,13 +732,14 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__scan-feedback { flex-shrink: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface-muted); font-size: 11px; }
 .plugin-manager__scan-warning { align-self: flex-start; }
 .plugin-manager__editing-hint { max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.plugin-manager__parameter-dock { display: flex; flex-direction: column; flex: 0 1 250px; min-height: 0; max-height: 55%; padding-top: 10px; border-top: 1px solid var(--outline-strong); }
+.plugin-manager__parameter-dock { display: flex; flex-direction: column; flex: 0 1 clamp(210px, 32dvh, 360px); min-height: 0; max-height: 55%; padding-top: 10px; border-top: 1px solid var(--outline-strong); }
 .plugin-manager__parameter-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-shrink: 0; margin-bottom: 8px; }
 .plugin-manager__parameter-heading > strong { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 500; }
 .plugin-manager__parameter-dock > .plugin-parameters { flex: 1; min-height: 0; }
+.plugin-manager__parameter-dock :deep(.plugin-parameters) { max-height: none; }
 .plugin-manager__chain-count { flex-shrink: 0; font-size: 11px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
 .plugin-manager__badge { padding: 3px 7px; border-radius: 4px; background: var(--surface-2); font-size: 11px; color: var(--on-surface-muted); }
-.plugin-manager__body { display: grid; grid-template-columns: minmax(280px, 33%) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+.plugin-manager__body { display: grid; grid-template-columns: clamp(260px, 30%, 380px) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
 .plugin-manager__chain, .plugin-manager__library { display: flex; flex-direction: column; align-items: stretch; gap: 9px; min-width: 0; min-height: 0; padding: 12px 14px; overflow: hidden; }
 .plugin-manager__scan-progress { display: grid; flex-shrink: 0; gap: 6px; padding: 10px; border: 1px solid var(--outline); border-radius: 6px; background: var(--surface-2); }
 .plugin-manager__scan-progress-heading { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; }
@@ -808,12 +824,37 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__selection { display: grid; gap: 3px; min-width: 0; }
 .plugin-manager__selection > strong { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__selection > span { font-size: 11px; color: var(--on-surface-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@container plugin-inserts (max-width: 145px) {
+  .plugin-panel__header { gap: 4px; }
+  .plugin-insert__tools { padding-left: 0; }
+  .plugin-insert__main { gap: 3px; }
+}
+@media (max-width: 880px) {
+  .plugin-manager { --plugin-manager-inset: 16px; }
+  .plugin-manager__chain, .plugin-manager__library { gap: 7px; padding: 10px; }
+  .plugin-manager__editing-hint { max-width: 55%; }
+}
+@media (max-height: 640px) {
+  .plugin-manager { --plugin-manager-top: 80px; --plugin-manager-bottom: 16px; }
+  .plugin-manager :deep(.n-card-header) { padding-block: 9px; }
+  .plugin-manager :deep(.plugin-manager__error) { padding: 8px 12px; max-height: 28dvh; }
+  .plugin-manager__chain, .plugin-manager__library { gap: 6px; padding: 8px 10px; }
+  .plugin-manager__source-manager { max-height: calc(100dvh - 140px); }
+  .plugin-manager__selection > span { font-size: 10px; }
+  .plugin-panel__slot { padding: 8px; }
+}
 @media (max-width: 760px) {
-  .plugin-manager { width: calc(100vw - 24px); }
-  .plugin-manager__body { grid-template-columns: minmax(0, 1fr); overflow: auto; }
-  .plugin-manager__chain { border-left: 0; border-top: 1px solid var(--outline); min-height: 300px; }
-  .plugin-manager__slots { max-height: 300px; }
-  .plugin-manager__library { min-height: 400px; }
+  .plugin-manager { --plugin-manager-inset: 12px; }
+  .plugin-manager__body { display: flex; flex-direction: column; overflow: auto; }
+  .plugin-manager__library { flex: none; height: clamp(280px, 52dvh, 400px); }
+  .plugin-manager__chain { flex: none; height: clamp(280px, 52dvh, 420px); border-left: 0; border-top: 1px solid var(--outline); }
+  .plugin-manager__slots { max-height: none; }
+  .plugin-manager__group-controls :deep(.n-radio-button) { white-space: normal; height: auto; min-height: 26px; line-height: 1.3; }
+  .plugin-manager__library--scanning { height: auto; min-height: 240px; }
+  .plugin-manager__library--scanning > .n-input,
+  .plugin-manager__library--scanning > .plugin-manager__group-controls,
+  .plugin-manager__library--scanning > .plugin-manager__catalog,
+  .plugin-manager__library--scanning > .plugin-manager__library-footer { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { .plugin-manager__plugin { transition: none; } }
 </style>

@@ -67,6 +67,15 @@ with sync_playwright() as playwright:
     def value(expression):
         return page.evaluate(expression)
 
+    def rail_point(slider, fraction):
+        rail = slider.locator(".n-slider-rail")
+        rail.scroll_into_view_if_needed()
+        box = rail.bounding_box()
+        assert box is not None
+        vertical = slider.locator("[role=slider]").get_attribute("aria-orientation") == "vertical"
+        return (box["x"] + box["width"] / 2, box["y"] + box["height"] * (1 - fraction)) if vertical else (
+            box["x"] + box["width"] * fraction, box["y"] + box["height"] / 2)
+
     def check_reset(slider, expression, default, label):
         before = value(expression)
         assert not value("__editor.canUndo"), label
@@ -74,7 +83,11 @@ with sync_playwright() as playwright:
         button = slider.locator(".editor-parameter-slider__reset")
         expect(button).to_be_enabled()
         assert button.get_attribute("aria-label")
-        button.click()
+        if button.is_visible():
+            button.click()
+        else:
+            # The compact pan strip exposes the existing thumb double-click gesture.
+            slider.locator("[role=slider]").dblclick(delay=60)
         page.wait_for_function(f"{expression} === {default}")
         expect(button).to_be_disabled()
         assert value("__editor.canUndo"), label
@@ -88,26 +101,52 @@ with sync_playwright() as playwright:
         results.append(label)
         print(f"Default reset and undo verified: {label}", flush=True)
 
-    cases = [("volume", 1), ("pan", 0)]
-    for index, (field, default) in enumerate(cases):
-        check_reset(sliders.nth(index), f"__editor.session.tracks[0].{field}", default, field)
+    volume = inspector.locator(".inspector-strip__fader .editor-parameter-slider")
+    pan = inspector.locator(".inspector-strip__pan .editor-parameter-slider")
+    for slider, field, default in ((volume, "volume", 1), (pan, "pan", 0)):
+        check_reset(slider, f"__editor.session.tracks[0].{field}", default, field)
 
     # The surrounding field must not forward rail clicks to the reset button.
-    rail = sliders.first.locator(".n-slider")
-    box = rail.bounding_box()
-    assert box is not None
-    page.mouse.click(box["x"] + box["width"] * 0.85, box["y"] + box["height"] / 2)
+    page.mouse.click(*rail_point(volume, 0.85))
     page.wait_for_function("__editor.session.tracks[0].volume!==0.42")
     assert value("__editor.session.tracks[0].volume") > 1.5, "rail click also activated Default"
     page.evaluate("__editor.undo()")
     assert value("__editor.session.tracks[0].volume") == 0.42
-    sliders.first.locator(".editor-parameter-slider__reset").focus()
+    volume.locator(".editor-parameter-slider__reset").focus()
     page.keyboard.press("Space")
     page.wait_for_function("__editor.session.tracks[0].volume===1")
     page.evaluate("__editor.undo()")
     assert value("__editor.session.tracks[0].volume") == 0.42
     assert not value("__editor.canUndo")
+    page.mouse.click(*rail_point(pan, 0.85))
+    page.wait_for_function("__editor.session.tracks[0].pan > 0.5")
+    assert value("__editor.session.tracks[0].volume") == 0.42
+    page.evaluate("__editor.undo()")
+    page.wait_for_function("__editor.session.tracks[0].pan === -0.3")
+    assert not value("__editor.canUndo")
     print("Inspector rail and Space activation verified", flush=True)
+
+    # Native button Space activation must not reach the editor transport shortcut.
+    page.evaluate("""() => {
+      window.__transportRequests=[];
+      document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('editor-playback').$onAction(
+        ({name})=>{if(name==='beginRequest')__transportRequests.push(name)});
+    }""")
+    for flag, selector in (("muted", ".inspector-strip__flag--mute"), ("solo", ".inspector-strip__flag--solo")):
+        button = inspector.locator(selector)
+        button.focus()
+        page.keyboard.press("Space")
+        page.wait_for_function(f"__editor.session.tracks[0].{flag} === true")
+        expect(button).to_have_attribute("aria-pressed", "true")
+        page.evaluate("__editor.undo()")
+        page.wait_for_function(f"__editor.session.tracks[0].{flag} === false")
+        assert not value("__editor.canUndo"), flag
+    inspector.locator(".editor-inspector__master-button").focus()
+    page.keyboard.press("Space")
+    page.wait_for_function("__editor.selectedTrackId === null")
+    assert value("__transportRequests") == [], "channel button Space activated transport"
+    page.evaluate("__editor.selectTrack('track')")
+    print("Mute, solo and master button Space activation verified", flush=True)
 
     page.locator(".master-summary").click()
     master = page.locator(".master-popover .editor-parameter-slider")

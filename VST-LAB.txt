@@ -961,3 +961,49 @@ Light/dark themes and 1400x900/980x680 layouts were inspected. Reports and final
 build fingerprints: native-v22-*, channel-inspector-v4/, channel-workbench-v2/ and
 channel-regression-v2/ under E:/pymss-vst-lab-artifacts. These checks do not certify
 real DSP/hardware or macOS/Linux. Existing user windows/projects remain untouched.
+
+Twenty-third iteration: channel strip and built-in effects removal (2026-10-25)
+-----------------------------------------------------------------------------
+The inspector is now a channel strip: pan, M/S, vertical fader with stereo meter
+and dB readout on the left, insert slots on the right. When a track is selected,
+a compact master row shows the summed master level and switches to the master.
+
+The built-in reverb/delay/clarity/compressor track effects are removed from all
+layers, superseding the tenth iteration: Web Audio preview nodes, the browser
+offline effect render (editorRender/editorEffects and the Tauri commands
+append_editor_export_render_chunk/cleanup_editor_export_render), the Python
+worker effect DSP/tail, the native graph effect processor and its 128 MiB history
+budget, and the builtinEffects capability. Older projects drop track effects on
+load; the native protocol and Python worker silently ignore a legacy effects field.
+Old .export-render temporary directories are no longer cleaned automatically.
+
+Validation: frontend 1190 passed/3 skipped, production build passed; native audio
+host 65 unit + 13 integration tests; Tauri vst-lab 335 passed/3 ignored; Python
+694 passed (WorkbenchNativeTests excluded: the local pymss lacks pymss.graph,
+unrelated to this change). Channel strip UI checked with mocked IPC in light/dark
+at 1400x900 and 980x680. Manual Playwright smoke scripts touched by the removal
+were edited but not rerun.
+
+Responsive editor layout follow-up (2026-10-25)
+---------------------------------------------
+Panel visibility and fitted widths now follow the editor container, with a
+ResizeObserver and a window-resize fallback. Automatic fitting does not overwrite
+saved widths or collapsed choices. Both panels shrink to their minimums before
+hiding the lower-priority panel; expanding a hidden launcher takes priority and
+wide windows restore requested panels. Manual drag reversals remain possible when
+the opposite panel reclaims space. A new optional panelPriority preference records
+explicit user choices. Unset inspector widths adapt to wider containers.
+
+The toolbar uses compact/two-row arrangements in narrower containers. Channel
+strips adjust to their own width and available height; hidden panels cannot retain
+keyboard interaction. Plugin managers expand on wide screens, fit short windows,
+and retain bounded lists and parameter controls. No audio or project format changes.
+
+Validation: frontend 1212 passed/3 skipped; 40 actual Vue/mock IPC responsive cases
+passed across light/dark, Chinese/English and 800x600 through 3840x2160 viewports.
+These include preferred-width restoration, manual resizing, constrained reverse
+dragging, hidden-panel focus and explicit collapsed state. Plugin workbench 21,
+inline-toolbar geometry 64, and the full slider reset/keyboard/undo/save smoke passed.
+Reports: responsive-ui-v4/, responsive-workbench/, responsive-toolbar/ and
+responsive-sliders/ under E:/pymss-vst-lab-artifacts. Native DSP, physical display
+scaling and other operating systems were not tested by these browser scenarios.

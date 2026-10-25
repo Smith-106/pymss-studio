@@ -530,7 +530,7 @@ watch(
             </button>
           </div>
 
-          <div ref="assetPanelEl" class="editor-shell__asset-panel">
+          <div ref="assetPanelEl" class="editor-shell__asset-panel" :inert="!assetPanelVisible" :aria-hidden="!assetPanelVisible">
             <EditorAssetPanel
               :sources="librarySources"
               :tree="editor.assetTree"
@@ -613,7 +613,7 @@ watch(
             <n-icon :component="OptionsOutline" />
             <em>{{ t('editor.inspectorTitle') }}</em>
           </button>
-          <div class="editor-shell__inspector-panel">
+          <div class="editor-shell__inspector-panel" :inert="!inspectorPanelVisible" :aria-hidden="!inspectorPanelVisible">
             <EditorInspectorPanel
               :session="session"
               :selected-track-id="editor.selectedTrackId"
@@ -630,6 +630,7 @@ watch(
               @begin-master-pan="editor.beginInteraction"
               @commit-master-pan="editor.commitInteraction"
               @rename-track="editor.renameTrack"
+              @toggle-track-flag="(trackId, flag) => editor.toggleTrackFlag(trackId, flag)"
               @set-track-volume="setTrackVolume"
               @set-track-pan="setTrackPan"
               @begin-track-volume="editor.beginInteraction"
@@ -701,6 +702,9 @@ watch(
   --inspector-width: 268px;
   position: relative;
   height: calc(100vh - 40px);
+  height: calc(100dvh - 40px);
+  container-type: inline-size;
+  container-name: editor-shell;
   display: grid;
   grid-template-columns:
     calc(var(--asset-rail-width) + var(--asset-panel-width))
@@ -744,6 +748,11 @@ watch(
 
 .editor-shell__assets--collapsed {
   border-right-color: color-mix(in srgb, var(--outline) 46%, transparent);
+}
+
+.editor-shell__assets--collapsed .editor-shell__asset-panel {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .editor-shell__asset-rail {
