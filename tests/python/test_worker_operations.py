@@ -197,6 +197,66 @@ class RunOperationTests(unittest.TestCase):
                 os.environ.pop("PYMSS_PLUGINS_DIR", None)
 
 
+class OperationInputTests(unittest.TestCase):
+    def test_non_audio_file_descriptors_remain_objects(self):
+        from pymss.operations import OperationSpec, Runtime
+
+        runtime = Runtime()
+        runtime.register(
+            spec=OperationSpec(id="test.metadata", schema_version=1, title="Metadata", inputs={"metadata": {"type": "object"}},
+                               params={"type": "object"}, outputs={"value": {"type": "string"}}),
+            run=lambda c, inputs, p: {"value": inputs["metadata"]["path"]},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with mock.patch.object(worker_operations, "_runtime", return_value=runtime), redirect_stdout(output):
+                code = worker_operations.cmd_run_operation({
+                    "operation": "test.metadata", "inputs": {"metadata": {"kind": "file", "path": "metadata.json"}},
+                    "outputDir": directory,
+                })
+            event = _read_event(output)
+            self.assertEqual(code, 0, event)
+            self.assertEqual(event["payload"]["outputs"]["value"]["value"], "metadata.json")
+
+    def test_audio_file_inputs_keep_the_decoded_multichannel_layout(self):
+        import numpy as np
+        import soundfile as sf
+        from pymss.audio_io import load_audio
+        from pymss.operations import OperationSpec, Runtime
+
+        runtime = Runtime()
+        runtime.register(
+            spec=OperationSpec(id="test.layout", schema_version=1, title="Layout", inputs={"audio": {"type": "audio"}},
+                               params={"type": "object"}, outputs={"layout": {"type": "string"}, "channels": {"type": "integer"}}),
+            run=lambda c, inputs, p: {"layout": inputs["audio"].channel_layout, "channels": inputs["audio"].audio.shape[0]},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "surround.wav"
+            sf.write(source, np.zeros((1000, 6), dtype=np.float32), 44100)
+            _, _, expected = load_audio(str(source), sr=None, mono=False, return_layout=True)
+            output = io.StringIO()
+            with mock.patch.object(worker_operations, "_runtime", return_value=runtime), redirect_stdout(output):
+                code = worker_operations.cmd_run_operation({
+                    "operation": "test.layout", "inputs": {"audio": {"kind": "file", "path": str(source)}},
+                    "outputDir": directory,
+                })
+            event = _read_event(output)
+            self.assertEqual(code, 0, event)
+            self.assertEqual(event["payload"]["outputs"]["layout"]["value"], expected)
+            self.assertEqual(event["payload"]["outputs"]["channels"]["value"], 6)
+
+    def test_invalid_input_and_parameter_containers_are_rejected_before_execution(self):
+        for field in ["inputs", "params"]:
+            for value in [[], False, 0, ""]:
+                with self.subTest(field=field, value=value):
+                    output = io.StringIO()
+                    with mock.patch.object(worker_operations, "_runtime") as runtime, redirect_stdout(output):
+                        code = worker_operations.cmd_run_operation({"operation": "test.invalid", field: value})
+                    runtime.assert_not_called()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(_read_event(output)["payload"]["code"], "OPERATION_INVALID")
+
+
 class OperationOutputTests(unittest.TestCase):
     @staticmethod
     def audio(level):

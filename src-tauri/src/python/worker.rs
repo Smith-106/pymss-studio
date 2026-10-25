@@ -25,9 +25,30 @@ pub(crate) fn recover_audio_output_temps(app: &AppHandle) {
 }
 
 fn needs_audio_output_scope(command: &str, payload: &Value) -> bool {
-    command == "audio_tools" && payload.get("operation").and_then(Value::as_str).is_some_and(|operation| {
+    command == "run_operation" || command == "audio_tools" && payload.get("operation").and_then(Value::as_str).is_some_and(|operation| {
         ["convert", "merge", "slicer"].iter().any(|name| operation.trim().eq_ignore_ascii_case(name))
     })
+}
+
+fn requires_background_result(command: &str) -> bool {
+    matches!(command, "audio_tools" | "export_editor_mix" | "manage_plugin" | "run_operation")
+}
+
+fn operation_output_directory(payload: &Value, default: &Path) -> AppResult<PathBuf> {
+    let raw = match payload.get("outputDir") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.as_str(),
+        _ => return Err(AppError::Worker("outputDir must be a string".into())),
+    };
+    let path = PathBuf::from(raw);
+    let directory = if raw.is_empty() {
+        default.to_path_buf()
+    } else if path.is_absolute() {
+        path
+    } else {
+        default.parent().unwrap_or(default).join(path)
+    };
+    Ok(std::path::absolute(directory)?)
 }
 
 #[cfg(windows)]
@@ -1564,7 +1585,7 @@ fn spawn_worker_background_inner(
     state: State<'_, AppState>,
     command: &str,
     task_id: String,
-    payload: Value,
+    mut payload: Value,
     operation_id: String,
 ) -> AppResult<()> {
     let mut application_access = Some(acquire_application_operation()?);
@@ -1596,8 +1617,15 @@ fn spawn_worker_background_inner(
     }
 
     let command_name = command.to_string();
+    if command == "run_operation" {
+        let directory = operation_output_directory(&payload, &default_output_dir(&app)?)?;
+        payload.as_object_mut()
+            .ok_or_else(|| AppError::Worker("invalid operation request".into()))?
+            .insert("outputDir".into(), Value::String(directory.to_string_lossy().into_owned()));
+    }
     let mut audio_scope = if needs_audio_output_scope(command, &payload) {
-        let raw = payload.get("outputDir").and_then(Value::as_str).unwrap_or("").trim();
+        let raw = payload.get("outputDir").and_then(Value::as_str).unwrap_or("");
+        let raw = if command == "run_operation" { raw } else { raw.trim() };
         if raw.is_empty() { None } else {
             let path = if raw == "~" { storage::home_dir(&app)? }
                 else if raw.starts_with("~/") || raw.starts_with("~\\") { storage::home_dir(&app)?.join(&raw[2..]) }
@@ -1847,7 +1875,7 @@ fn spawn_worker_background_inner(
                 }
                 Some(status)
                     if status.success()
-                        && matches!(command_name.as_str(), "audio_tools" | "export_editor_mix" | "manage_plugin") =>
+                        && requires_background_result(&command_name) =>
                 {
                     emit_task_error_to_all(
                         &app,
@@ -1899,6 +1927,27 @@ mod tests {
         assert!(!super::needs_audio_output_scope("audio_tools", &json!({"operation": "scan"})));
         assert!(!super::needs_audio_output_scope("infer", &json!({"operation": "convert"})));
         assert!(!super::needs_audio_output_scope("audio_tools", &json!({})));
+        assert!(super::needs_audio_output_scope("run_operation", &json!({})));
+    }
+
+    #[test]
+    fn operation_output_scopes_use_the_same_directory_as_python() {
+        let root = std::env::temp_dir().join("pymss-operation-scope");
+        let default = root.join("outputs");
+        for payload in [json!({}), json!({"outputDir": null}), json!({"outputDir": ""})] {
+            assert_eq!(super::operation_output_directory(&payload, &default).unwrap(), std::path::absolute(&default).unwrap());
+        }
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": "relative"}), &default).unwrap(), std::path::absolute(root.join("relative")).unwrap());
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": " spaced "}), &default).unwrap(), std::path::absolute(root.join(" spaced ")).unwrap());
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": &default}), &default).unwrap(), std::path::absolute(&default).unwrap());
+        assert!(super::operation_output_directory(&json!({"outputDir": []}), &default).is_err());
+    }
+
+    #[test]
+    fn operation_workers_must_emit_a_terminal_result_even_after_a_successful_exit() {
+        assert!(super::requires_background_result("run_operation"));
+        assert!(super::requires_background_result("manage_plugin"));
+        assert!(!super::requires_background_result("list_operations"));
     }
 
     #[test]

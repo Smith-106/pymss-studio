@@ -246,26 +246,19 @@ mod tests {
 
         pub struct TempDirGuard {
             pub path: PathBuf,
+            _guard: tempfile::TempDir,
         }
 
         impl TempDirGuard {
             pub fn new() -> Self {
-                let path = std::env::temp_dir().join(format!(
-                    "pymss-view-test-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
-                std::fs::create_dir_all(&path).unwrap();
-                Self { path }
-            }
-        }
-
-        impl Drop for TempDirGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.path);
+                let guard = tempfile::Builder::new()
+                    .prefix("pymss-view-test-")
+                    .tempdir()
+                    .unwrap();
+                Self {
+                    path: guard.path().to_path_buf(),
+                    _guard: guard,
+                }
             }
         }
 

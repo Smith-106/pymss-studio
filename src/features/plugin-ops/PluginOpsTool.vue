@@ -130,6 +130,7 @@ async function reveal(path?: string) {
               <n-button text type="primary" @click="reveal(out.path)">{{ out.path }}</n-button>
             </template>
             <template v-else-if="out.kind === 'scalar'">{{ String(out.value) }}</template>
+            <pre v-else>{{ JSON.stringify(out.value ?? out, null, 2) }}</pre>
           </div>
         </div>
       </template>
@@ -147,5 +148,6 @@ async function reveal(path?: string) {
 .plugin-ops-field > label { font-size: 13px; opacity: 0.8; }
 .plugin-ops-error { margin-top: 8px; }
 .plugin-ops-results { display: flex; flex-direction: column; gap: 4px; }
+.plugin-ops-result pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .plugin-ops-loading { align-self: center; margin-top: 40px; }
 </style>

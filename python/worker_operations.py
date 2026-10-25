@@ -72,13 +72,12 @@ def _resolve_input(value: Any) -> Any:
     if isinstance(value, dict) and value.get("kind") == "file":
         from pymss.audio_io import load_audio
 
-        audio, sr = load_audio(str(value["path"]), sr=None, mono=False)
+        audio, sr, layout = load_audio(str(value["path"]), sr=None, mono=False, return_layout=True)
         import numpy as np
 
         from pymss.graph.core import AudioArtifact
 
         arr = np.asarray(audio, dtype=np.float32)
-        layout = "stereo" if arr.ndim == 2 and arr.shape[0] == 2 else "mono"
         return AudioArtifact(arr, int(sr), source_path=str(value["path"]), channel_layout=layout)
     return value
 
@@ -121,15 +120,25 @@ def cmd_run_operation(payload: dict[str, Any]) -> int:
     request_id = str(payload.get("requestId") or "").strip() or None
     if not operation_id:
         return emit_error("OPERATION_INVALID", "Missing operation id", request_id=request_id)
-    params = payload.get("params") or {}
+    params = payload.get("params")
+    if params is None:
+        params = {}
     if not isinstance(params, dict):
         return emit_error("OPERATION_INVALID", "params must be an object", request_id=request_id)
+    raw_inputs = payload.get("inputs")
+    if raw_inputs is None:
+        raw_inputs = {}
+    if not isinstance(raw_inputs, dict):
+        return emit_error("OPERATION_INVALID", "inputs must be an object", request_id=request_id)
 
     try:
         output_dir = Path(normalize_output_dir(payload.get("outputDir")))
         runtime = _runtime()
-        raw_inputs = payload.get("inputs") or {}
-        inputs = {name: _resolve_input(value) for name, value in raw_inputs.items()}
+        input_specs = runtime.describe_operation(operation_id).get("inputs", {})
+        inputs = {
+            name: _resolve_input(value) if str(input_specs.get(name, {}).get("type", "")).lower() == "audio" else value
+            for name, value in raw_inputs.items()
+        }
 
         from pymss.operations import OperationContext
 
