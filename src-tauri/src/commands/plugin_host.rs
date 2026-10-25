@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 mod blacklist;
 mod dialogs;
@@ -22,6 +22,8 @@ mod scan_pipeline;
 mod scan_tests;
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod progress_tests;
 use blacklist::{BlacklistEntry, BlacklistReason};
 use scan_control::{Decision as ScanDecision, ScanControl, ScanRun, Ticket as ScanTicket};
 #[cfg(test)]
@@ -378,6 +380,47 @@ impl std::fmt::Display for HostRequestError {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NativeRenderProgress {
+    phase: String,
+    completed: u64,
+    total: u64,
+}
+
+fn receive_render_result(
+    id: u64,
+    started: std::time::Instant,
+    timeout: Duration,
+    mut receive: impl FnMut(Duration) -> Result<Value, HostRequestError>,
+    mut progress: impl FnMut(NativeRenderProgress) -> Result<(), HostRequestError>,
+) -> Result<Value, HostRequestError> {
+    loop {
+        let remaining = timeout.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| HostRequestError::Transport("The audio host timed out and was terminated".into()))?;
+        let response = receive(remaining)?;
+        if let Some(update) = decode_render_progress(&response, id)? {
+            progress(update)?;
+        } else {
+            return decode_response(response, id);
+        }
+    }
+}
+
+fn decode_render_progress(response: &Value, id: u64) -> Result<Option<NativeRenderProgress>, HostRequestError> {
+    if response.get("event").is_none() { return Ok(None); }
+    if response["id"].as_u64() != Some(id) || response["event"].as_str() != Some("render_progress")
+        || response.get("ok").is_some() || response.get("result").is_some() {
+        return Err(HostRequestError::Transport("The audio host returned an invalid progress event".into()));
+    }
+    let progress: NativeRenderProgress = serde_json::from_value(response["payload"].clone())
+        .map_err(|_| HostRequestError::Transport("The audio host returned invalid render progress".into()))?;
+    if progress.total == 0 || progress.completed > progress.total
+        || !matches!(progress.phase.as_str(), "preparing" | "rendering" | "finalizing" | "completed") {
+        return Err(HostRequestError::Transport("The audio host returned invalid render progress".into()));
+    }
+    Ok(Some(progress))
+}
+
 struct HostProcess {
     child: Child,
     control: Arc<ProcessControl>,
@@ -497,6 +540,18 @@ impl HostProcess {
         let (id, started) = self.send_request(request, timeout)?;
         let response = self.receive(timeout.saturating_sub(started.elapsed()))?;
         decode_response(response, id)
+    }
+
+    fn request_with_progress(
+        &mut self,
+        mut request: Value,
+        timeout: Duration,
+        mut progress: impl FnMut(NativeRenderProgress) -> Result<(), HostRequestError>,
+    ) -> Result<Value, HostRequestError> {
+        request.as_object_mut().ok_or_else(|| HostRequestError::Request("Audio host request must be an object".into()))?
+            .insert("progress".into(), json!(true));
+        let (id, started) = self.send_request(request, timeout)?;
+        receive_render_result(id, started, timeout, |remaining| self.receive(remaining), &mut progress)
     }
 
     fn send_request(&mut self, mut request: Value, timeout: Duration) -> Result<(u64, std::time::Instant), HostRequestError> {
@@ -841,6 +896,20 @@ fn plugin_warning(message: &str) -> String {
 
 fn supported_state_format(format: &str) -> bool {
     matches!(format, "vst3" | "vst2") || (cfg!(target_os = "macos") && format == "au")
+}
+
+fn omit_bypassed_render_plugins(project: &mut Value) {
+    fn retain_active(chain: Option<&mut Value>) {
+        if let Some(Value::Array(slots)) = chain {
+            slots.retain(|slot| slot.get("bypassed").and_then(Value::as_bool) != Some(true));
+        }
+    }
+    retain_active(project.get_mut("pluginChain"));
+    if let Some(Value::Array(tracks)) = project.get_mut("tracks") {
+        for track in tracks {
+            retain_active(track.get_mut("pluginChain"));
+        }
+    }
 }
 
 fn resolve_states(root: &Path, value: &mut Value) -> Result<(), String> {
@@ -1703,6 +1772,7 @@ fn cleanup_render(state: &PluginHostState, root: &Path, task_id: &str) -> Result
 #[tauri::command]
 pub async fn plugin_host_render(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, PluginHostState>,
     mut project: Value,
     task_id: String,
@@ -1722,6 +1792,16 @@ pub async fn plugin_host_render(
         let mut created_directory = false;
         let result = (|| {
             task.require_active()?;
+            let mut emit_progress = |progress: NativeRenderProgress| -> Result<(), HostRequestError> {
+                task.require_active().map_err(HostRequestError::Operation)?;
+                let _ = app.emit_to(window.label(), "pymss://worker-event", json!({
+                    "type":"editor_plugin_render_progress", "taskId":task.task_id.as_str(), "payload":progress,
+                }));
+                Ok(())
+            };
+            emit_progress(NativeRenderProgress { phase: "preparing".into(), completed: 0, total: 1 })
+                .map_err(|error| error.to_string())?;
+            omit_bypassed_render_plugins(&mut project);
             resolve_states(&root, &mut project)?;
             task.require_active()?;
             fs::create_dir_all(directory.parent().unwrap()).map_err(|error| error.to_string())?;
@@ -1739,7 +1819,7 @@ pub async fn plugin_host_render(
             if let Some(rate) = sample_rate { load["sampleRate"] = json!(rate); }
             process.request(load, load_timeout)
                 .map_err(|error| error.to_string())?;
-            let mut result = process.request(json!({"op":"render","projectId":project_id,"path":output}), RENDER_TIMEOUT)
+            let mut result = process.request_with_progress(json!({"op":"render","projectId":project_id,"path":output}), RENDER_TIMEOUT, &mut emit_progress)
                 .map_err(|error| error.to_string())?;
             task.require_active()?;
             if !output.is_file() { return Err("The audio host did not produce a rendered mix".into()); }
@@ -2007,6 +2087,28 @@ mod tests {
         assert!(state_path(root.path(), "sha256:../../secret").is_err());
         fs::write(state_path(root.path(), &token).unwrap(), b"tampered").unwrap();
         assert!(resolve_states(root.path(), &mut json!({"state":token})).is_err());
+    }
+
+    #[test]
+    fn render_copy_omits_disabled_plugins_before_resolving_states_and_preserves_the_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project = json!({"id":"render", "pluginChain":[
+            {"id":"off", "bypassed":true, "state":"sha256:../../invalid"},
+            {"id":"on", "bypassed":false},
+            {"id":"default"}
+        ], "tracks":[{"id":"track", "pluginChain":[
+            {"id":"track-off", "bypassed":true, "state":"sha256:missing"},
+            {"id":"track-on", "bypassed":false}
+        ]}, {"id":"plain"}], "metadata":{"bypassed":true,"keep":1}});
+        let mut render = project.clone();
+        omit_bypassed_render_plugins(&mut render);
+        resolve_states(root.path(), &mut render).unwrap();
+        assert_eq!(render["pluginChain"], json!([{"id":"on","bypassed":false},{"id":"default"}]));
+        assert_eq!(render["tracks"][0]["pluginChain"], json!([{"id":"track-on","bypassed":false}]));
+        assert_eq!(render["tracks"][1], project["tracks"][1]);
+        assert_eq!(render["metadata"], project["metadata"]);
+        assert_eq!(project["pluginChain"][0]["state"], "sha256:../../invalid");
+        assert_eq!(project["tracks"][0]["pluginChain"][0]["state"], "sha256:missing");
     }
 
     #[test]

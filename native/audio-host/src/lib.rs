@@ -6,6 +6,7 @@ mod output;
 mod plugins;
 mod protocol;
 mod protocol_output;
+mod render_tail;
 pub mod timeline;
 pub use discovery::{
     default_search_paths, find_bundles, is_plugin_path, native_editor_formats, supported_formats,

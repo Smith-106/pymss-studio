@@ -197,6 +197,52 @@ test('a non-plugin export sends the project snapshot directly to the encoder wit
 
 const pluginSlot = { id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false, state: 'sha256:opaque' }
 
+test('exports with all master and track plugins disabled skip native rendering and preserve saved slots', async () => {
+  const env = environment()
+  const disabled = { ...pluginSlot, bypassed: true }
+  env.store.session.pluginChain = [disabled]
+  env.store.session.tracks[0].pluginChain = [{ ...disabled, id: 'track-fx' }]
+  const before = JSON.parse(JSON.stringify(env.store.session))
+  const exporting = env.store.exportMix()
+  await flush()
+  assert.equal(env.calls.some(call => call.command === 'plugin_host_render'), false)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.equal(start.args.payload.project.assets[0].path, 'D:/audio.wav')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/dry.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+  assert.deepEqual(env.store.session, before)
+  assert.equal(env.calls.some(call => call.command === 'plugin_host_cleanup_render'), false)
+})
+
+test('an enabled track plugin still requires native export beside a disabled master plugin', async () => {
+  const env = environment()
+  env.store.session.pluginChain = [{ ...pluginSlot, bypassed: true }]
+  env.store.session.tracks[0].pluginChain = [{ ...pluginSlot, id: 'track-fx' }]
+  const exporting = env.store.exportMix()
+  await flush()
+  assert.equal(env.calls.some(call => call.command === 'plugin_host_render'), true)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/wet.wav', duration: 1.5, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+})
+
+test('the enabled master limiter still renders when every plugin is disabled', async () => {
+  const env = environment()
+  env.store.session.pluginChain = [{ ...pluginSlot, bypassed: true }]
+  env.store.setMasterLimiter({ enabled: true, gainDb: 6 })
+  const exporting = env.store.exportMix()
+  await flush()
+  const render = env.calls.find(call => call.command === 'plugin_host_render')
+  assert.equal(render.args.project.masterLimiter.enabled, true)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/limited.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+  assert.equal(env.store.session.pluginChain[0].bypassed, true)
+})
+
 test('plugin rendering is encoded once with neutral master and cleaned after completion', async () => {
   const env = environment()
   env.store.session.masterVolume = 0.5
@@ -280,5 +326,72 @@ test('disabled master limiter keeps normal exports on the existing dry path', as
   assert.equal(start.args.payload.project.assets[0].path, 'D:/audio.wav')
   env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
     payload: { path: 'D:/dry.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+})
+
+test('plugin rendering publishes real weighted progress before the encoder starts and never moves backwards', async () => {
+  const gate = deferred()
+  const env = environment({ nativeRenderGate: gate })
+  env.store.session.pluginChain = [{ ...pluginSlot }]
+  const exporting = env.store.exportMix()
+  await flush()
+  const native = env.calls.find(call => call.command === 'plugin_host_render')
+  const update = (completed, total = 100, taskId = native.args.taskId, phase = 'rendering') => env.dispatch('pymss://worker-event', {
+    type: 'editor_plugin_render_progress', taskId, payload: { completed, total, phase },
+  })
+  assert.equal(env.calls.some(call => call.command === 'start_editor_mix_export'), false)
+  update(20)
+  assert.equal(env.store.exportProgress.completed, 15)
+  assert.equal(env.store.exportProgress.phase, 'rendering')
+  update(60)
+  assert.equal(env.store.exportProgress.completed, 45)
+  update(40)
+  update(99, 100, 'old-render')
+  update(Number.NaN)
+  update(200)
+  assert.equal(env.store.exportProgress.completed, 45)
+  gate.resolve({ path: 'D:/render.wav', duration: 1, sampleRate: 48000, channels: 2 })
+  await flush()
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.equal(env.store.exportProgress.completed, 75)
+  update(0)
+  assert.equal(env.store.exportProgress.completed, 75, 'late native progress must not affect encoding')
+  env.dispatch('pymss://worker-event', { type: 'editor_export_progress', taskId: start.args.payload.taskId,
+    payload: { phase: 'writing', completed: 40, total: 100 } })
+  assert.equal(env.store.exportProgress.completed, 85)
+  for (const payload of [
+    { phase: 'preparing', completed: 10, total: 100 },
+    { phase: 'writing', completed: Number.NaN, total: 100 },
+    { phase: 'writing', completed: 101, total: 100 },
+    { phase: 'writing', completed: 1, total: 0 },
+  ]) {
+    env.dispatch('pymss://worker-event', { type: 'editor_export_progress', taskId: start.args.payload.taskId, payload })
+    assert.equal(env.store.exportProgress.completed, 85)
+  }
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/mix.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
+  await exporting
+})
+
+test('direct encoding rejects invalid or regressive progress without changing its denominator', async () => {
+  const env = environment()
+  const exporting = env.store.exportMix()
+  await flush()
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  const taskId = start.args.payload.taskId
+  const update = (completed, total) => env.dispatch('pymss://worker-event', {
+    type: 'editor_export_progress', taskId, payload: { phase: 'writing', completed, total },
+  })
+  update(1, 2)
+  assert.equal(env.store.exportProgress.completed / env.store.exportProgress.total, 0.5)
+  for (const [completed, total] of [[40, 100], [NaN, 100], [1, Infinity], [-1, 100], [101, 100], [0, 0]]) {
+    update(completed, total)
+    assert.equal(env.store.exportProgress.completed, 1)
+    assert.equal(env.store.exportProgress.total, 2)
+  }
+  update(100, 100)
+  assert.equal(env.store.exportProgress.completed, 100)
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId,
+    payload: { path: 'D:/mix.wav', duration: 1, sampleRate: 48000, channels: 2, format: 'wav' } })
   await exporting
 })

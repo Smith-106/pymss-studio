@@ -111,6 +111,20 @@ impl Host {
         response["result"].clone()
     }
 
+    fn render_with_progress(&mut self, path: &Path) -> (Value, Vec<Value>) {
+        self.sequence += 1;
+        let id = self.sequence;
+        serde_json::to_writer(&mut self.input, &json!({"id":id,"op":"render","path":path,"progress":true})).unwrap();
+        self.input.write_all(b"\n").unwrap(); self.input.flush().unwrap();
+        let mut progress = Vec::new();
+        loop {
+            let response = self.responses.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert_eq!(response["id"], id);
+            if response["event"] == "render_progress" { progress.push(response["payload"].clone()); }
+            else { assert_eq!(response["ok"], true, "{response}"); return (response["result"].clone(), progress); }
+        }
+    }
+
     fn render(&mut self, path: &Path) -> Value {
         let response = self.request(json!({"op":"render", "path":path}));
         let audio = hound::WavReader::open(path).unwrap();
@@ -263,11 +277,12 @@ fn offline_export_uses_configured_mode_without_replacing_preview() {
         host.request(json!({"op":"monitor","suppressedTrackIds":["voice"]}));
         let before = host.request(json!({"op":"snapshot"}));
         let output = directory.path().join(format!("mode-{offline}.wav"));
-        host.render(&output);
+        let rendered = host.render(&output);
+        assert_eq!(rendered["tailProcessedFrames"], 64);
         assert_eq!(
             hound::WavReader::open(&output).unwrap().duration(),
-            64,
-            "Only an offline-configured fixture reports the 64-frame tail"
+            0,
+            "An empty project must not acquire silent padding from a declared plugin tail"
         );
         // A subsequent output conflict must release the export session as well.
         assert_eq!(
@@ -451,7 +466,7 @@ fn offline_exports_ignore_monitor_and_restore_preview_mask_after_success_and_err
 }
 
 #[test]
-fn exports_refresh_startup_and_parameter_only_tails_and_preserve_the_cap() {
+fn exports_refresh_tail_budgets_without_writing_silent_padding() {
     std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let bundle = fixture_bundle(directory.path());
@@ -484,24 +499,28 @@ fn exports_refresh_startup_and_parameter_only_tails_and_preserve_the_cap() {
     // Startup probing must capture its 128-frame tail before the first export ends.
     let first_path = directory.path().join("initial.wav");
     let first = host.render(&first_path);
-    assert_eq!(hound::WavReader::open(first_path).unwrap().duration(), 128);
+    assert_eq!(hound::WavReader::open(first_path).unwrap().duration(), 0);
+    assert_eq!(first["tailProcessedFrames"], 128);
+    assert_eq!(first["tailTrimmedFrames"], 128);
     assert_eq!(first["tailLimited"], false);
 
     // Changing only the tail parameter does not trigger a latency restart notification.
     host.request(json!({"op":"param", "slotId":"effect", "paramId":"7", "value":1.0}));
     let next_path = directory.path().join("longer.wav");
     let next = host.render(&next_path);
-    assert_eq!(hound::WavReader::open(next_path).unwrap().duration(), 256);
+    assert_eq!(hound::WavReader::open(next_path).unwrap().duration(), 0);
+    assert_eq!(next["tailProcessedFrames"], 256);
     assert_eq!(next["tailLimited"], false);
 
     host.request(json!({"op":"param", "slotId":"effect", "paramId":"7", "value":2.0}));
     let capped_path = directory.path().join("capped.wav");
     let capped = host.render(&capped_path);
-    assert_eq!(capped["tailLimited"], true);
-    assert_eq!(capped["duration"], 30.0);
+    assert_eq!(capped["tailLimited"], false, "silent padding is not an audible truncation");
+    assert_eq!(capped["duration"], 0.0);
+    assert_eq!(capped["tailProcessedFrames"], capped["sampleRate"].as_u64().unwrap() * 30);
     assert_eq!(
         hound::WavReader::open(capped_path).unwrap().duration(),
-        capped["sampleRate"].as_u64().unwrap() as u32 * 30
+        0
     );
     host.finish();
 }
@@ -617,8 +636,9 @@ fn startup_timing_changes_settle_each_insert_and_getter_notifications_remain_bou
             assert_eq!(response["ok"], false, "{response}");
             assert!(!output.exists());
         } else {
-            host.render(&output);
-            assert_eq!(hound::WavReader::open(&output).unwrap().duration(), 256);
+            let result = host.render(&output);
+            assert_eq!(hound::WavReader::open(&output).unwrap().duration(), 0);
+            assert_eq!(result["tailProcessedFrames"], 256);
         }
         host.finish();
     }
@@ -873,4 +893,104 @@ fn master_limiter_exports_at_the_encoding_rate_without_losing_or_adding_frames()
     let samples: Vec<f32> = hound::WavReader::open(path).unwrap().into_samples::<f32>().map(Result::unwrap).collect();
     assert!(samples.iter().any(|sample| sample.abs() > 1.0), "bypass must preserve the unrestricted mix");
     host.finish();
+}
+
+#[test]
+fn exports_trim_overreported_silence_but_keep_late_right_channel_echoes_and_latency() {
+    let ffmpeg = std::env::var_os("PYMSS_TEST_FFMPEG").map(PathBuf::from).or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
+            .map(|path| path.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }))
+            .find(|path| path.is_file()))
+    });
+    let Some(ffmpeg) = ffmpeg else { eprintln!("FFmpeg unavailable; skipping tail audio coverage"); return; };
+    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bundle = fixture_bundle(directory.path());
+    let scanned = Command::new(env!("CARGO_BIN_EXE_pymss-audio-host")).arg("--plugin-scan").arg(&bundle).output().unwrap();
+    assert!(scanned.status.success());
+    let catalog: Value = serde_json::from_slice(&scanned.stdout).unwrap();
+    let effect = catalog["plugins"].as_array().unwrap().iter().find(|plugin| plugin["isInstrument"] == false).unwrap();
+    let source = directory.path().join("input.wav");
+    let mut writer = hound::WavWriter::create(&source, hound::WavSpec {
+        channels: 2, sample_rate: 48000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float,
+    }).unwrap();
+    for frame in 0..4800 {
+        let value = if frame == 0 || frame == 4799 { 0.8_f32 } else { 0.1 };
+        writer.write_sample(value).unwrap(); writer.write_sample(-value * 0.5).unwrap();
+    }
+    writer.finalize().unwrap();
+    let ffmpeg = ffmpeg.canonicalize().unwrap();
+    let mut project = json!({"id":"trim-tail","name":"Audio",
+        "sources":[{"id":"source","path":source,"duration":0.1,"channels":2,"sampleRate":48000}],
+        "tracks":[{"id":"voice","sourceId":"source"}],
+        "pluginChain":[{"id":"effect","format":"vst3","pluginId":effect["id"],"name":"Gain","path":bundle}],
+        "masterLimiter":{"enabled":false,"attackMs":3.0}});
+    let mut bypassed_project = project.clone();
+    bypassed_project["pluginChain"][0]["bypassed"] = true.into();
+    let mut bypassed_track = bypassed_project["pluginChain"][0].clone();
+    bypassed_track["id"] = "disabled-track".into();
+    bypassed_project["tracks"][0]["pluginChain"] = json!([bypassed_track]);
+    let mut host = Host::with_behavior("delay,overreported-tail");
+    let loaded = host.request(json!({"op":"load","project":bypassed_project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":48000}));
+    assert_eq!(host.request(json!({"op":"snapshot"}))["states"], json!({}), "disabled plugins must not be instantiated for export");
+    let path = directory.path().join("all-disabled.wav");
+    let result = host.render(&path);
+    assert_eq!(result["tailProcessedFrames"], 0);
+    let reader = hound::WavReader::open(path).unwrap();
+    assert_eq!(reader.duration(), 4800);
+    let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+    for (frame, samples) in samples.chunks_exact(2).enumerate() {
+        let value = if frame == 0 || frame == 4799 { 0.8_f32 } else { 0.1 };
+        assert!((samples[0] - value).abs() < 1e-6 && (samples[1] + value * 0.5).abs() < 1e-6);
+    }
+    bypassed_project["pluginChain"][0]["bypassed"] = false.into();
+    let enabled = host.request(json!({"op":"update","project":bypassed_project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":48000}));
+    assert_ne!(enabled["sessionId"], loaded["sessionId"], "enabling an omitted processor must load it");
+    let states = host.request(json!({"op":"snapshot"}));
+    assert!(states["states"]["effect"].is_string());
+    assert!(states["states"].get("disabled-track").is_none());
+    host.finish();
+    for limiter in [false, true] {
+        project["masterLimiter"]["enabled"] = limiter.into();
+        let mut host = Host::with_behavior("delay,overreported-tail");
+        host.request(json!({"op":"load","project":project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":48000}));
+        host.request(json!({"op":"param","slotId":"effect","paramId":"7","value":1.0}));
+        let path = directory.path().join(format!("no-tail-{limiter}.wav"));
+        let (result, progress) = host.render_with_progress(&path);
+        assert!(progress.iter().any(|item| item["phase"] == "rendering" && item["completed"].as_u64().unwrap() > 0
+            && item["completed"].as_u64().unwrap() < item["total"].as_u64().unwrap()), "must report intermediate render work before completion");
+        let fractions: Vec<f64> = progress.iter().map(|item| item["completed"].as_f64().unwrap() / item["total"].as_f64().unwrap()).collect();
+        assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(host.request(json!({"op":"status"}))["error"].is_null(), "no progress frames may remain after the result");
+        assert_eq!(result["duration"], 0.1);
+        assert_eq!(result["tailProcessedFrames"], 1_440_000);
+        assert_eq!(result["tailTrimmedFrames"], 1_440_000);
+        assert_eq!(result["tailLimited"], false);
+        let reader = hound::WavReader::open(path).unwrap(); assert_eq!(reader.duration(), 4800);
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+        assert!((samples[0] - 0.8).abs() < 1e-6);
+        assert!((samples[samples.len() - 2] - 0.8).abs() < 1e-6, "final source frame must survive VST and limiter latency");
+        host.finish();
+    }
+    project["masterLimiter"]["enabled"] = false.into();
+    for behavior in ["sparse-tail", "sustained-tail"] {
+        let mut host = Host::with_behavior(behavior);
+        host.request(json!({"op":"load","project":project,"ffmpeg":ffmpeg,"offline":true,"sampleRate":48000}));
+        let path = directory.path().join(format!("{behavior}.wav")); let result = host.render(&path);
+        assert_eq!(result["tailProcessedFrames"], 1_440_000);
+        let reader = hound::WavReader::open(path).unwrap();
+        if behavior == "sparse-tail" {
+            assert_eq!(reader.duration(), 96_001 + 2400);
+            assert_eq!(result["tailLimited"], false);
+            let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+            assert_eq!(samples[24_000 * 2 + 1], 0.25);
+            assert_eq!(samples[50_000 * 2 + 1], 0.0);
+            assert_eq!(samples[96_000 * 2], 0.0);
+            assert_eq!(samples[96_000 * 2 + 1], 0.25, "a delayed echo after a long silent gap must be retained");
+        } else {
+            assert_eq!(reader.duration(), 4800 + 1_440_000);
+            assert_eq!(result["tailLimited"], true, "audible output still reaching the safety budget must warn");
+        }
+        host.finish();
+    }
 }

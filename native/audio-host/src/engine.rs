@@ -148,6 +148,13 @@ impl Drop for SnapshotPause {
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+pub(crate) struct RenderProgress {
+    pub phase: &'static str,
+    pub completed: u64,
+    pub total: u64,
+}
+
 pub(crate) enum Event {
     Failure(String),
     Timing(TimingRequest),
@@ -155,6 +162,7 @@ pub(crate) enum Event {
         change: LatencyChange,
         graph_revision: u64,
     },
+    RenderProgress(RenderProgress),
     Render(Result<Value, String>),
 }
 
@@ -783,18 +791,29 @@ impl Drop for Session {
     }
 }
 
+#[cfg(test)]
 fn render_file(
     graph: &mut Graph,
     path: PathBuf,
     cancel: &AtomicBool,
     refresh: &mut impl FnMut() -> Result<(), String>,
 ) -> Result<Value, String> {
+    render_file_with_progress(graph, path, cancel, refresh, &mut |_| {})
+}
+
+fn render_file_with_progress(
+    graph: &mut Graph,
+    path: PathBuf,
+    cancel: &AtomicBool,
+    refresh: &mut impl FnMut() -> Result<(), String>,
+    progress: &mut impl FnMut(RenderProgress),
+) -> Result<Value, String> {
     if !graph.is_offline() {
         return Err("Rendering requires offline plugin configuration".into());
     }
     let suppressed = graph.suppressed_track_ids();
     graph.set_monitor(&[])?;
-    let result = render_unmasked_file(graph, path, cancel, refresh);
+    let result = render_unmasked_file(graph, path, cancel, refresh, progress);
     let restored = graph.set_monitor(&suppressed);
     graph.reset();
     match (result, restored) {
@@ -809,10 +828,12 @@ fn render_unmasked_file(
     path: PathBuf,
     cancel: &AtomicBool,
     refresh: &mut impl FnMut() -> Result<(), String>,
+    progress: &mut impl FnMut(RenderProgress),
 ) -> Result<Value, String> {
     if !path.is_absolute() || path.exists() {
         return Err("Render output must be a new absolute path".into());
     }
+    progress(RenderProgress { phase: "preparing", completed: 0, total: 1 });
     // Apply pending edits before querying control-only latency/tail properties. Rebuild PDC
     // on these same instances, then run the startup probes against the refreshed timings.
     refresh_render_timing(graph, refresh)?;
@@ -878,21 +899,25 @@ fn render_unmasked_file(
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let mut writer =
+    let writer =
         hound::WavWriter::new(std::io::BufWriter::new(handle), spec).map_err(|e| e.to_string())?;
+    let mut writer = crate::render_tail::TailWriter::new(writer, graph.duration, graph.sample_rate);
     let total = graph.duration.saturating_add(graph.tail);
     if total > (u32::MAX as u64 - 128) / 8 {
         return Err("Rendered audio exceeds WAV file size limit".into());
     }
     let mut input = 0u64;
-    let mut written = 0u64;
+    let mut rendered = 0u64;
     let mut warmup = graph.latency;
     let mut waiting = Instant::now();
-    while written < total {
+    let mut last_progress = Instant::now();
+    let mut reported_frames = 0;
+    progress(RenderProgress { phase: if warmup > 0 { "preparing" } else { "rendering" }, completed: 0, total: total.max(1) });
+    while rendered < total {
         if cancel.load(Ordering::Acquire) {
             return Err("Audio rendering cancelled".into());
         }
-        let frames = BLOCK.min((total - written).saturating_add(warmup as u64) as usize);
+        let frames = BLOCK.min((total - rendered).saturating_add(warmup as u64) as usize);
         if !graph
             .render(input, frames, true)
             .map_err(|error| error.to_string())?
@@ -907,22 +932,40 @@ fn render_unmasked_file(
         let skip = warmup.min(frames);
         warmup -= skip;
         for i in skip..frames {
-            writer
-                .write_sample(graph.mix[0][i])
-                .map_err(|e| e.to_string())?;
-            writer
-                .write_sample(graph.mix[1][i])
-                .map_err(|e| e.to_string())?;
-            written += 1;
+            writer.write_frame([graph.mix[0][i], graph.mix[1][i]])?;
+            rendered += 1;
         }
         input += frames as u64;
+        if rendered > reported_frames && (reported_frames == 0 || last_progress.elapsed() >= Duration::from_millis(100)) {
+            progress(RenderProgress { phase: "rendering", completed: rendered, total: total.max(1) });
+            reported_frames = rendered;
+            last_progress = Instant::now();
+        }
     }
-    writer.finalize().map_err(|e| e.to_string())?;
+    progress(RenderProgress { phase: "finalizing", completed: total, total: total.max(1) });
+    let summary = writer.finish()?;
+    progress(RenderProgress { phase: "completed", completed: total.max(1), total: total.max(1) });
     cleanup.complete = true;
     Ok(
         json!({ "path": path, "sampleRate": graph.sample_rate, "channels": 2,
-        "duration": written as f64 / f64::from(graph.sample_rate), "tailLimited": graph.tail_limited }),
+        "duration": summary.frames as f64 / f64::from(graph.sample_rate),
+        "tailProcessedFrames": rendered.saturating_sub(graph.duration),
+        "tailTrimmedFrames": rendered.saturating_sub(summary.frames),
+        "tailLimited": graph.tail_limited && summary.audible_at_limit }),
     )
+}
+
+fn deliver_render_result(events: &Sender<Event>, result: Result<Value, String>, cancel: &AtomicBool) {
+    let mut event = Event::Render(result);
+    loop {
+        match events.send_timeout(event, Duration::from_millis(100)) {
+            Ok(()) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => break,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => {
+                if cancel.load(Ordering::Acquire) { break; }
+                event = pending;
+            }
+        }
+    }
 }
 
 fn refresh_render_timing(
@@ -1038,10 +1081,10 @@ fn process(
                 }
                 Control::Render(path) => {
                     active = false;
-                    let result = render_file(&mut graph, path, &cancel, &mut || {
+                    let result = render_file_with_progress(&mut graph, path, &cancel, &mut || {
                         request_timing_refresh(&events, &cancel, Duration::from_secs(5))
-                    });
-                    let _ = events.try_send(Event::Render(result));
+                    }, &mut |progress| { let _ = events.try_send(Event::RenderProgress(progress)); });
+                    deliver_render_result(&events, result, &cancel);
                 }
             }
         }
@@ -1296,6 +1339,20 @@ mod tests {
     }
 
     #[test]
+    fn final_render_result_survives_progress_backpressure_and_cancellation_unblocks_it() {
+        let (tx, rx) = bounded(1);
+        assert!(tx.send(Event::RenderProgress(RenderProgress { phase: "rendering", completed: 1, total: 10 })).is_ok());
+        let worker = thread::spawn(move || deliver_render_result(&tx, Ok(json!({"done":true})), &AtomicBool::new(false)));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), Event::RenderProgress(_)));
+        let Event::Render(result) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else { panic!("missing terminal result") };
+        assert_eq!(result.unwrap()["done"], true);
+        worker.join().unwrap();
+        let (tx, _rx) = bounded(1);
+        assert!(tx.send(Event::RenderProgress(RenderProgress { phase: "rendering", completed: 1, total: 10 })).is_ok());
+        deliver_render_result(&tx, Err("cancelled".into()), &AtomicBool::new(true));
+    }
+
+    #[test]
     fn monitor_acknowledgement_commits_only_applied_transient_state() {
         let spec: SessionSpec =
             serde_json::from_value(json!({"id":"monitor", "name":"Audio", "sources":[],
@@ -1520,6 +1577,7 @@ mod tests {
                     session.finish_render();
                     break;
                 }
+                Event::RenderProgress(_) => {},
                 _ => panic!("Unexpected export event"),
             }
         }

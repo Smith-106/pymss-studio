@@ -82,6 +82,9 @@ struct FixtureBehavior {
     gui_bypass: bool,
     process_error: bool,
     dynamic_tail: bool,
+    overreported_tail: bool,
+    sparse_tail: bool,
+    sustained_tail: bool,
     mode_quality: bool,
     reject_offline: bool,
     reject_rollback: bool,
@@ -117,6 +120,9 @@ impl FixtureBehavior {
                     "gui-bypass" => behavior.gui_bypass = true,
                     "process-error" => behavior.process_error = true,
                     "dynamic-tail" => behavior.dynamic_tail = true,
+                    "overreported-tail" => behavior.overreported_tail = true,
+                    "sparse-tail" => { behavior.sparse_tail = true; behavior.overreported_tail = true; behavior.delay = true; },
+                    "sustained-tail" => { behavior.sustained_tail = true; behavior.overreported_tail = true; behavior.delay = true; },
                     "mode-quality" => behavior.mode_quality = true,
                     "reject-offline" => behavior.reject_offline = true,
                     "reject-rollback" => { behavior.reject_offline = true; behavior.reject_rollback = true; },
@@ -384,7 +390,10 @@ impl IAudioProcessorTrait for GainProcessor {
             for frame in 0..frames {
                 let cursor = delay.cursor;
                 for (channel, (input, output)) in ins.iter().zip(outs.iter_mut()).enumerate() {
-                    let sample = g * input[frame];
+                    let position = unsafe { (*d.processContext).projectTimeSamples } + frame as i64;
+                    let tail = if channel == 1 && ((self.behavior.sparse_tail && [24_000, 96_000].contains(&position))
+                        || (self.behavior.sustained_tail && position >= 4_800)) { 0.25 } else { 0.0 };
+                    let sample = g * input[frame] + tail;
                     let sample = if self.behavior.clip { sample.clamp(-1.0, 1.0) } else { sample };
                     output[frame] = std::mem::replace(&mut delay.samples[channel][cursor], sample);
                 }
@@ -405,6 +414,7 @@ impl IAudioProcessorTrait for GainProcessor {
             assert_eq!(std::thread::current().id(), self.control_thread, "getTailSamples must use the control thread");
         }
         if self.behavior.mode_quality { return if self.setup_mode.load(Ordering::Relaxed) == ProcessModes_::kOffline as u32 {64} else {0}; }
+        if self.behavior.overreported_tail { return u32::MAX; }
         if !self.behavior.dynamic_tail || self.positive_calls.load(Ordering::Relaxed) == 0 {
             return 0;
         }

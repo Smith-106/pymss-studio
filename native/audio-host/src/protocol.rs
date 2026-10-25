@@ -211,10 +211,13 @@ fn preserve_states_except(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RenderRequest { id: u64, progress: bool }
+
 fn host() -> i32 {
     let input = inputs();
     let mut session: Option<Session> = None;
-    let mut render_request: Option<u64> = None;
+    let mut render_request: Option<RenderRequest> = None;
     let mut render_session: Option<Session> = None;
     while soundcraft_vst3_host::with_ui_context(|| {
         host_tick(
@@ -237,13 +240,13 @@ fn host() -> i32 {
 fn host_tick(
     input: &Receiver<Result<Value, String>>,
     session: &mut Option<Session>,
-    render_request: &mut Option<u64>,
+    render_request: &mut Option<RenderRequest>,
     render_session: &mut Option<Session>,
 ) -> bool {
     soundcraft_vst3_host::pump_ui();
     soundcraft_au_host::pump_ui();
     pymss_vst2_host::pump_ui();
-    let service = |current: &mut Session, request: &mut Option<u64>| {
+    let service = |current: &mut Session, request: &mut Option<RenderRequest>| {
         let mut finished = false;
         current.idle();
         while let Ok(event) = current.events.try_recv() {
@@ -258,10 +261,15 @@ fn host_tick(
                         current.fail(error);
                     }
                 }
+                Event::RenderProgress(progress) => {
+                    if let Some(request) = request.as_ref().filter(|request| request.progress) {
+                        let _ = crate::protocol_output::write(&json!({"id":request.id,"event":"render_progress","payload":progress}));
+                    }
+                }
                 Event::Render(result) => {
                     current.finish_render();
-                    if let Some(id) = request.take() {
-                        respond(id, result);
+                    if let Some(request) = request.take() {
+                        respond(request.id, result);
                     }
                     finished = true;
                 }
@@ -443,6 +451,10 @@ fn host_tick(
             }
             "snapshot" => current.snapshot()?,
             "render" => {
+                let progress = match message.get("progress") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or("Render progress option must be a boolean")?,
+                };
                 let path = PathBuf::from(
                     message
                         .get("path")
@@ -456,7 +468,7 @@ fn host_tick(
                     exporter.start_render(path)?;
                     *render_session = Some(exporter);
                 }
-                *render_request = Some(id);
+                *render_request = Some(RenderRequest { id, progress });
                 return Ok(None);
             }
             "unload" => {
@@ -708,7 +720,7 @@ mod tests {
         let (tx, input) = bounded(1);
         drop(tx);
         let mut session = None;
-        let mut pending = Some(12);
+        let mut pending = Some(RenderRequest { id: 12, progress: false });
         assert!(!host_tick(&input, &mut session, &mut pending, &mut None));
     }
 
@@ -717,7 +729,7 @@ mod tests {
         let (tx, input) = bounded(1);
         tx.send(Ok(json!({"id": 13, "op": "shutdown"}))).unwrap();
         let mut session = None;
-        let mut pending = Some(12);
+        let mut pending = Some(RenderRequest { id: 12, progress: false });
         assert!(!host_tick(&input, &mut session, &mut pending, &mut None));
     }
 

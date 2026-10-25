@@ -218,6 +218,11 @@ fn chain(
 ) -> Result<Vec<Slot>, String> {
     let mut result = Vec::new();
     for slot in slots {
+        // Live bypass retains controllers for editing. A fresh offline graph has
+        // no reason to load disabled processors or compensate their latency.
+        if offline && slot.bypassed {
+            continue;
+        }
         let load = || -> Result<HostedPlugin, String> {
             if !crate::discovery::supports_format(&slot.format) {
                 return Err(format!("Plugin format is unavailable: {}", slot.format));
@@ -782,6 +787,27 @@ mod tests {
             graph.spec.plugin_chain[0].state.as_deref(),
             Some("opaque-original-state")
         );
+    }
+
+    #[test]
+    fn offline_graph_omits_disabled_master_and_track_plugins_without_loading_or_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut spec = unavailable_project(&directory.path().join("missing.vst3"), true);
+        let mut track_slot = spec.plugin_chain[0].clone();
+        track_slot.id = "track-fx".into();
+        spec.tracks = serde_json::from_value(serde_json::json!([
+            {"id":"track", "clips":[]}
+        ])).unwrap();
+        spec.tracks[0].plugin_chain.push(track_slot);
+        let (graph, ui) = Graph::load_mode(spec, PathBuf::from("ffmpeg"), 48000, true).unwrap();
+        assert!(ui.is_empty());
+        assert!(graph.unavailable_plugins.is_empty(), "disabled plugins must never be loaded");
+        assert!(graph.master.is_empty());
+        assert!(graph.chains[0].is_empty());
+        assert_eq!(graph.latency, 0);
+        assert_eq!(graph.tail, 0);
+        assert_eq!(graph.spec.plugin_chain[0].state.as_deref(), Some("opaque-original-state"));
+        assert_eq!(graph.spec.tracks[0].plugin_chain[0].state.as_deref(), Some("opaque-original-state"));
     }
 
     #[test]

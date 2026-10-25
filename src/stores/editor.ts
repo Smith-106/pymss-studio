@@ -160,6 +160,7 @@ type PersistedSession = EditorSession & { version?: number }
 
 const HISTORY_LIMIT = 80
 const AUTO_SAVE_DELAY = 420
+const NATIVE_RENDER_PROGRESS_WEIGHT = 75
 const WAVEFORM_FULL_RESOLUTION = 2200
 const COLOR_BY_STEM: Record<string, string> = {
   vocals: '#ff6b7c',
@@ -1901,17 +1902,36 @@ export const useEditorStore = defineStore('editor', () => {
         const workerEvent = event.payload
         const pending = pendingExport
         const eventId = workerEvent.taskId || workerEvent.requestId
+        if (workerEvent.type === 'editor_plugin_render_progress') {
+          if (!nativeRenderTaskId || eventId !== nativeRenderTaskId || exportCancelRequested) return
+          const payload = workerEvent.payload || {}
+          const total = Number(payload.total)
+          const completed = Number(payload.completed)
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(completed) || completed < 0 || completed > total) return
+          const next = completed / total * NATIVE_RENDER_PROGRESS_WEIGHT
+          const previous = exportProgress.value
+          if (previous && next < previous.completed / Math.max(1, previous.total) * 100) return
+          const phase = payload.phase === 'preparing' ? 'preparing'
+            : payload.phase === 'rendering' ? 'rendering' : 'finalizing'
+          exportProgress.value = { phase, completed: next, total: 100, current: '' }
+          return
+        }
         if (!pending || eventId !== pending.id) return
 
         if (workerEvent.type === 'editor_export_progress') {
           const payload = workerEvent.payload || {}
-          const total = Math.max(1, Number(payload.total || 100))
-          const completed = Math.max(0, Number(payload.completed || 0))
+          const total = Number(payload.total ?? 100)
+          const completed = Number(payload.completed ?? 0)
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(completed) || completed < 0 || completed > total) return
           const offset = pending.progressOffset || 0
+          const nextCompleted = offset ? offset + completed / total * (100 - offset) : completed
+          const nextTotal = offset ? 100 : total
+          const previous = exportProgress.value
+          if (previous && nextCompleted / nextTotal < previous.completed / Math.max(1, previous.total)) return
           exportProgress.value = {
             phase: String(payload.phase || 'preparing') as EditorExportProgress['phase'],
-            completed: offset ? offset + Math.min(1, completed / total) * (100 - offset) : completed,
-            total: offset ? 100 : total,
+            completed: nextCompleted,
+            total: nextTotal,
             current: String(payload.current || ''),
           }
           return
@@ -1958,7 +1978,7 @@ export const useEditorStore = defineStore('editor', () => {
     let snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
     const renderController = new AbortController()
     exportRenderController = renderController
-    const pluginRenderRequired = hasEditorPlugins(snapshot) || normalizeMasterLimiter(snapshot.masterLimiter).enabled
+    const pluginRenderRequired = projectPluginSlots(snapshot).some(slot => !slot.bypassed) || normalizeMasterLimiter(snapshot.masterLimiter).enabled
     let pluginTailLimited = false
     exporting.value = true
     exportCancelling.value = false
@@ -1973,20 +1993,21 @@ export const useEditorStore = defineStore('editor', () => {
             const hostCapabilities = await pluginHostCapabilities()
             if (!hostCapabilities.enabled) throw new Error(String(i18n.global.t('editor.plugins.unavailable')))
             assertPluginProjectSupported(exportProject, hostCapabilities.formats || ['vst3'])
-            await capturePluginState(exportProject, true)
+            if (projectPluginSlots(exportProject).some(slot => !slot.bypassed)) await capturePluginState(exportProject, true)
             if (exportCancelRequested) throw new EditorExportCancelledError()
             // Capture can wait while the project is edited. Freeze its complete
             // post-capture version instead of mixing fresh plugin states into an older mix.
             snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
             assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'])
             nativeRenderTaskId = taskId
-            exportProgress.value = { phase: 'rendering', completed: 0, total: 100, current: '' }
+            exportProgress.value = { phase: 'preparing', completed: 0, total: 100, current: '' }
             try {
               const rendered = await invoke<{ path: string; duration: number; sampleRate: number; channels: number; tailLimited?: boolean }>('plugin_host_render', {
                 project: snapshot, taskId,
                 sampleRate: normalizeMasterLimiter(snapshot.masterLimiter).enabled
                   ? masterLimiterRenderRate(snapshot, normalized.audioParams?.sampleRate) : undefined,
               })
+              exportProgress.value = { phase: 'finalizing', completed: NATIVE_RENDER_PROGRESS_WEIGHT, total: 100, current: '' }
               pluginTailLimited = rendered.tailLimited === true
               return { session: neutralPluginRenderProject(snapshot, rendered), sourceSampleRate: rendered.sampleRate }
             } finally {
@@ -2002,7 +2023,7 @@ export const useEditorStore = defineStore('editor', () => {
           id: taskId,
           projectId: snapshot.id,
           exportDir: normalized.exportDir,
-          progressOffset: prepared.session !== snapshot ? 75 : 0,
+          progressOffset: prepared.session !== snapshot ? NATIVE_RENDER_PROGRESS_WEIGHT : 0,
           resolve,
           reject,
         }

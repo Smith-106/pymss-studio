@@ -667,6 +667,7 @@ watch(
       :exporting="editor.exporting"
       :export-cancelling="editor.exportCancelling"
       :export-progress="exportProgressPercentage"
+      :export-progress-indeterminate="!editor.exportProgress || (editor.exportProgress.phase === 'preparing' && editor.exportProgress.completed === 0)"
       :export-progress-text="exportProgressText"
       :format="exportFormatDraft"
       :wav-bit-depth="exportWavBitDepthDraft"
