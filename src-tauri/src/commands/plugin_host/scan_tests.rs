@@ -1,5 +1,151 @@
 use super::*;
 
+#[cfg(feature = "native-plugins")]
+#[test]
+fn refresh_removes_uninstalled_packages_and_finds_new_plugins_without_reprobing_unchanged_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let plugins = root.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    let removed = plugins.join("removed.vst3");
+    let retained = plugins.join(if cfg!(windows) {
+        "retained.dll"
+    } else if cfg!(target_os = "macos") {
+        "retained.vst"
+    } else {
+        "retained.so"
+    });
+    for path in [&removed, &retained] {
+        fs::write(path, b"plugin").unwrap();
+    }
+    let (_, failures) = scan_paths(vec![plugins.to_string_lossy().into_owned()]).unwrap();
+    assert!(failures.is_empty());
+    scan_bundles(
+        root.path(),
+        vec![removed.clone(), retained.clone()],
+        vec![],
+        false,
+        |path| {
+            Ok(vec![
+                json!({"id":path.file_stem().unwrap().to_string_lossy()}),
+            ])
+        },
+    )
+    .unwrap();
+    fs::remove_file(&removed).unwrap();
+    let added = plugins.join("added.vst3");
+    fs::write(&added, b"new plugin").unwrap();
+    let (paths, failures) = scan_paths(vec![plugins.to_string_lossy().into_owned()]).unwrap();
+    let report = scan_bundles(
+        root.path(),
+        selected_scan_targets(paths),
+        failures,
+        false,
+        |path| {
+            assert_eq!(path.file_name().unwrap(), "added.vst3");
+            Ok(vec![json!({"id":"added"})])
+        },
+    )
+    .unwrap();
+    assert_eq!(report.cached, 1);
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.plugins.len(), 2);
+    assert!(report
+        .plugins
+        .iter()
+        .any(|plugin| plugin["id"] == "retained"));
+    assert!(report.plugins.iter().any(|plugin| plugin["id"] == "added"));
+    assert!(report.failures.is_empty());
+    let cache: Value =
+        serde_json::from_slice(&fs::read(root.path().join("plugin-cache.json")).unwrap()).unwrap();
+    assert_eq!(cache["entries"].as_array().unwrap().len(), 2);
+    assert!(cache["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["plugins"][0]["id"] != "removed"));
+}
+
+#[test]
+fn cancelled_refresh_prunes_deleted_cache_entries_but_preserves_unvisited_existing_plugins() {
+    let root = tempfile::tempdir().unwrap();
+    let removed = root.path().join("removed.vst3");
+    let retained = root.path().join("retained.vst3");
+    for path in [&removed, &retained] {
+        fs::write(path, b"plugin").unwrap();
+    }
+    scan_bundles(
+        root.path(),
+        vec![removed.clone(), retained.clone()],
+        vec![],
+        false,
+        |path| {
+            Ok(vec![
+                json!({"id":path.file_stem().unwrap().to_string_lossy()}),
+            ])
+        },
+    )
+    .unwrap();
+    fs::remove_file(&removed).unwrap();
+    let state = PluginHostState::default();
+    let run = state
+        .scan_control
+        .start("cancelled-refresh".into())
+        .unwrap();
+    state.scan_control.cancel("cancelled-refresh");
+    let report = scan_pipeline::scan(
+        root.path(),
+        vec![retained],
+        vec![],
+        false,
+        scan_pipeline::Context {
+            run: Some(&run),
+            storage: &state.scan_storage,
+        },
+        |_, _| panic!("cancelled scanning must not probe a plugin"),
+    )
+    .unwrap();
+    assert!(report.cancelled);
+    let cache: Value =
+        serde_json::from_slice(&fs::read(root.path().join("plugin-cache.json")).unwrap()).unwrap();
+    assert_eq!(cache["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(cache["entries"][0]["plugins"][0]["id"], "retained");
+}
+
+#[test]
+fn plugins_removed_during_probing_are_absent_from_the_report_and_persistent_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let removed = root.path().join("removed.vst3");
+    let retained = root.path().join("retained.vst3");
+    for path in [&removed, &retained] {
+        fs::write(path, b"plugin").unwrap();
+    }
+    let report = scan_bundles(
+        root.path(),
+        vec![removed, retained],
+        vec![],
+        false,
+        |path| {
+            if path.file_name().unwrap() == "removed.vst3" {
+                fs::remove_file(path).unwrap();
+                Ok(vec![
+                    json!({"id":"removed-one"}),
+                    json!({"id":"removed-two"}),
+                ])
+            } else {
+                Ok(vec![json!({"id":"retained"})])
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(report.plugins.len(), 1);
+    assert_eq!(report.plugins[0]["id"], "retained");
+    assert!(report.failures.is_empty());
+    let cache: Value =
+        serde_json::from_slice(&fs::read(root.path().join("plugin-cache.json")).unwrap()).unwrap();
+    assert_eq!(cache["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(cache["entries"][0]["plugins"][0]["id"], "retained");
+}
+
 #[test]
 fn timeout_blacklists_only_its_package_continues_scanning_and_force_cannot_bypass_it() {
     let root = tempfile::tempdir().unwrap();

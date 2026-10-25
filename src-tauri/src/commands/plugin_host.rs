@@ -20,6 +20,8 @@ mod scan_control;
 mod scan_pipeline;
 #[cfg(test)]
 mod scan_tests;
+#[cfg(test)]
+mod cache_tests;
 use blacklist::{BlacklistEntry, BlacklistReason};
 use scan_control::{Decision as ScanDecision, ScanControl, ScanRun, Ticket as ScanTicket};
 #[cfg(test)]
@@ -127,6 +129,12 @@ pub fn plugin_host_capabilities() -> Value {
     };
     #[cfg(not(feature = "native-plugins"))]
     let (formats, native_editor_formats): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    #[cfg(feature = "native-plugins")]
+    let default_directories = if capabilities.enabled {
+        pymss_audio_host::default_search_paths().into_iter().filter(|path| path.is_absolute()).collect::<Vec<_>>()
+    } else { Vec::new() };
+    #[cfg(not(feature = "native-plugins"))]
+    let default_directories: Vec<PathBuf> = Vec::new();
     json!({
         "enabled": capabilities.enabled, "platform": std::env::consts::OS,
         "formats": formats, "nativeEditorFormats": native_editor_formats,
@@ -134,6 +142,8 @@ pub fn plugin_host_capabilities() -> Value {
         "nativeEditor": capabilities.native_editor, "experimental": true,
         "labBuild": cfg!(feature = "vst-lab"),
         "scanControl": capabilities.enabled,
+        "catalogCache": capabilities.enabled,
+        "defaultDirectories": default_directories,
     })
 }
 
@@ -1055,6 +1065,52 @@ pub async fn plugin_host_request(
 }
 
 fn bundle_fingerprint(path: &Path) -> Result<String, String> {
+    fn append(path: &Path, hash: &mut Sha256) -> Result<Option<fs::Metadata>, String> {
+        hash.update(blacklist::path_key(&path.to_string_lossy()).as_bytes());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hash.update([0]);
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        hash.update([1]);
+        hash.update(metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified().and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)
+        }) { hash.update(modified.as_nanos().to_le_bytes()); }
+        Ok(Some(metadata))
+    }
+    let mut hash = Sha256::new();
+    let metadata = append(path, &mut hash)?.ok_or("Plugin package is missing")?;
+    if metadata.is_dir() {
+        // Only executable and identity metadata affect identification. Do not walk skins,
+        // presets, samples or other large resource trees on every incremental refresh.
+        for relative in ["Contents", "Contents/Info.plist", "Contents/Resources",
+            "Contents/Resources/moduleinfo.json", "Contents/moduleinfo.json"] {
+            append(&path.join(relative), &mut hash)?;
+        }
+        let mut count = 0;
+        for relative in ["Contents/MacOS", "Contents/x86_64-win", "Contents/aarch64-win",
+            "Contents/arm64ec-win", "Contents/x86_64-linux", "Contents/aarch64-linux"] {
+            let directory = path.join(relative);
+            if append(&directory, &mut hash)?.is_some_and(|metadata| metadata.is_dir()) {
+                let mut children = fs::read_dir(&directory).map_err(|error| error.to_string())?
+                    .take(4097).map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+                children.sort();
+                count += children.len();
+                if count > 4096 { return Err("Plugin bundle contains too many executable files".into()); }
+                for child in children { append(&child, &mut hash)?; }
+            }
+        }
+    }
+    Ok(format!("metadata-v1:{:x}", hash.finalize()))
+}
+
+// Upgrade existing cache fingerprints without forcing all installed plugins to be loaded again.
+fn legacy_bundle_fingerprint(path: &Path) -> Result<String, String> {
     fn visit(path: &Path, hash: &mut Sha256, count: &mut usize) -> Result<(), String> {
         *count += 1;
         if *count > 4096 {
@@ -1469,6 +1525,22 @@ pub async fn plugin_host_scan(
 }
 
 #[tauri::command]
+pub async fn plugin_host_cached_scan_report(
+    app: AppHandle,
+    state: State<'_, PluginHostState>,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    require_enabled()?;
+    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Reading the last complete snapshot must not queue behind a long native scan.
+        let _guard = state.scan_storage.lock().map_err(|_| "Plugin scan storage lock failed")?;
+        scan_pipeline::cached_report(&root, &paths)
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn plugin_host_scan_report(
     app: AppHandle,
     state: State<'_, PluginHostState>,
@@ -1739,6 +1811,19 @@ mod tests {
             assert!(formats.is_empty());
         }
         assert!(!formats.contains(&json!("aax")));
+        let directories = capabilities["defaultDirectories"].as_array().unwrap();
+        #[cfg(feature = "native-plugins")]
+        if available {
+            let expected: Vec<PathBuf> = pymss_audio_host::default_search_paths().into_iter()
+                .filter(|path| path.is_absolute()).collect();
+            assert_eq!(capabilities["defaultDirectories"], json!(expected));
+            assert!(!directories.is_empty());
+            assert_eq!(directories.iter().map(|path| PathBuf::from(path.as_str().unwrap())).collect::<std::collections::HashSet<_>>().len(), directories.len());
+        }
+        if !available {
+            assert!(directories.is_empty());
+        }
+        assert!(directories.iter().all(|path| Path::new(path.as_str().unwrap()).is_absolute()));
     }
 
     #[test]
@@ -2014,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_audio_unit_catalog_is_never_fingerprinted_or_cached() {
+    fn virtual_audio_unit_catalog_is_saved_for_display_but_reenumerated_on_refresh() {
         let root = tempfile::tempdir().unwrap();
         let target = PathBuf::from("au:system");
         for count in [1, 2] {
@@ -2039,7 +2124,10 @@ mod tests {
             let cache: Value =
                 serde_json::from_slice(&fs::read(root.path().join("plugin-cache.json")).unwrap())
                     .unwrap();
-            assert_eq!(cache["entries"], json!([]));
+            assert_eq!(cache["entries"][0]["path"], "au:system");
+            let cached = scan_pipeline::cached_report(root.path(), &["au:system".into()]).unwrap();
+            assert_eq!(cached["plugins"].as_array().unwrap().len(), count);
+            assert_eq!(cached["scanned"], 0);
         }
         let empty = scan_bundles(root.path(), vec![target], Vec::new(), false, |_| {
             Ok(Vec::new())

@@ -24,7 +24,11 @@ MOCK = """enabled => {
     unregisterCallback:id=>callbacks.delete(id),convertFileSrc:path=>path,
     invoke:async(command,args={})=>{
       __vstCalls.push({command,args:JSON.parse(JSON.stringify(args))});
-      if(command==='plugin_host_capabilities') return {enabled,platform:enabled?'windows':'linux',formats:['vst3'],nativeEditor:enabled,experimental:true,labBuild:true};
+      if(command==='plugin_host_capabilities') return {enabled,platform:enabled?'windows':'linux',formats:['vst3','vst2'],nativeEditor:enabled,experimental:true,labBuild:true,catalogCache:enabled};
+      if(command==='plugin_host_cached_scan_report') {
+        const cached=localStorage.getItem('mock-plugin-catalog');
+        return cached?JSON.parse(cached):{plugins:[],failures:[],scanned:0,cached:0,hasCache:false};
+      }
       if(command==='plugin_host_scan_report') {
         await new Promise(resolve=>setTimeout(resolve,__scanDelay));
         if(__scanError) throw new Error('插件扫描未完成：目录不可访问');
@@ -32,7 +36,9 @@ MOCK = """enabled => {
           {id:'echo',classId:'echo',name:'Stereo Echo',vendor:'Room Audio',path:'C:/VST3/Echo.vst3',version:'1',isInstrument:false,category:'Delay',subCategories:['Fx','Delay']},
           {id:'synth',classId:'synth',name:'Keyboard Instrument',vendor:'Audio Tools',path:'C:/VST3/Synth.vst3',version:'1',isInstrument:true,category:'Instrument',subCategories:['Instrument','Synth']}];
         if(args.force)__scanFailures=[];
-        return {plugins,failures:[...__scanFailures],scanned:args.force?3:0,cached:args.force?0:3};
+        const report={plugins,failures:[...__scanFailures],scanned:args.force?3:0,cached:args.force?0:3};
+        localStorage.setItem('mock-plugin-catalog',JSON.stringify({...report,scanned:0,cached:plugins.length,hasCache:true}));
+        return report;
       }
       if(command==='plugin_host_render') return {path:'C:/Audio/Rendered/mix.wav',duration:40,sampleRate:48000,channels:2,tailLimited:true};
       if(command==='start_editor_mix_export') {
@@ -310,10 +316,10 @@ with sync_playwright() as playwright:
         page.screenshot(path=str(args.output_dir/'plugin-master-chain-980x680.png'))
         page.evaluate('__scanDelay=1600')
         panel.get_by_role('button',name='识别插件',exact=True).click()
-        expect(panel.locator('.plugin-manager__body')).to_have_attribute('aria-busy','true')
-        expect(panel.locator('.plugin-manager__add-button')).to_be_disabled()
+        expect(panel.locator('.plugin-manager__catalog')).to_have_attribute('aria-busy','true')
+        expect(panel.locator('.plugin-manager__add-button')).to_be_enabled()
         page.screenshot(path=str(args.output_dir/'plugin-scan-loading-980x680.png'))
-        expect(panel.locator('.plugin-manager__body')).to_have_attribute('aria-busy','false')
+        expect(panel.locator('.plugin-manager__catalog')).to_have_attribute('aria-busy','false')
         page.evaluate('__scanDelay=0;__scanError=true')
         panel.get_by_role('button',name='识别插件',exact=True).click()
         expect(panel.locator('.n-alert')).to_contain_text('插件扫描未完成：目录不可访问')

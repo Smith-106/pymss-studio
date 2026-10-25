@@ -22,7 +22,7 @@ function environment(t, { scanControl = false } = {}) {
   const writes = [], calls = [], emitted = [], mounts = [], disposals = [], timers = new Map(), windowListeners = new Map()
   let timerSequence = 0, stopped = false
   const preferences = new Map()
-  const controls = { scanControl, scanStatus: null, statusGate: null, skipGate: null, skipResult: true, cancelResult: true, blacklist: [], blacklistGate: null, directory: null, scanGate: null, editorGate: null, captureGate: capture, report: {
+  const controls = { scanControl, hostCapabilities: {}, scanStatus: null, statusGate: null, skipGate: null, skipResult: true, cancelResult: true, blacklist: [], blacklistGate: null, directory: null, cacheGate: null, cacheReport: { plugins: [], failures: [], scanned: 0, cached: 0, hasCache: false }, scanGate: null, editorGate: null, captureGate: capture, report: {
     plugins: [{ ...plugin('library'), id: 'vst3:library', classId: 'vst3:library', vendor: 'Vendor', version: '1', isInstrument: false }],
     failures: [], scanned: 1, cached: 0,
   } }
@@ -45,6 +45,11 @@ function environment(t, { scanControl = false } = {}) {
     async invoke(command, args) {
       calls.push({ kind: 'invoke', command, args })
       if (command === 'pick_input_folder') return controls.directory
+      if (command === 'plugin_host_cached_scan_report') {
+        const report = controls.cacheReport
+        if (controls.cacheGate) await controls.cacheGate.promise
+        return report
+      }
       if (command === 'plugin_host_scan_status') {
         const result = typeof controls.scanStatus === 'function' ? controls.scanStatus(args) : controls.scanStatus
         if (controls.statusGate) await controls.statusGate.promise
@@ -72,7 +77,7 @@ function environment(t, { scanControl = false } = {}) {
       if (controls.editorGate) await controls.editorGate.promise
       return { open }
     },
-    pluginHostCapabilities: async () => ({ enabled: true, platform: 'windows', formats: ['vst3'], nativeEditor: true, scanControl: controls.scanControl }),
+    pluginHostCapabilities: async () => ({ enabled: true, platform: 'windows', formats: ['vst3'], nativeEditor: true, scanControl: controls.scanControl, catalogCache: true, ...controls.hostCapabilities }),
     crypto: { randomUUID: () => 'added-slot' },
     localStorage: { getItem: key => preferences.get(key) ?? null, setItem: (key, value) => preferences.set(key, value) },
     window: { addEventListener: (name, callback) => windowListeners.set(name, callback), removeEventListener: name => windowListeners.delete(name) },
@@ -248,12 +253,100 @@ test('first launch ignores legacy fixture paths and only restores explicitly sel
   env.preferences.set('pymss-vst-lab-search-paths', JSON.stringify(['/old-development-fixtures']))
   await env.mounts[0]()
   assert.equal(env.read('directories').length, 0)
-  assert.equal(env.calls.length, 0)
+  assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
   env.preferences.set('pymss-plugin-library-directories-v1', JSON.stringify(['/chosen', '/chosen', '', 'au:system']))
   await env.mounts[0]()
   assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), ['/chosen'])
-  assert.equal(env.calls.length, 0)
+  assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
   assert.ok(env.preferences.has('pymss-vst-lab-search-paths'))
+})
+
+for (const [platform, defaults] of [
+  ['windows', ['C:\\Program Files\\Common Files\\VST3', 'C:\\Program Files\\VstPlugins']],
+  ['macos', ['/Users/musician/Library/Audio/Plug-Ins/VST3', '/Users/musician/Library/Audio/Plug-Ins/VST', '/Library/Audio/Plug-Ins/VST3', '/Library/Audio/Plug-Ins/VST']],
+]) {
+  test(`${platform} seeds host-provided standard directories without starting a scan`, async t => {
+    const env = environment(t)
+    env.controls.hostCapabilities = { platform, defaultDirectories: defaults }
+    await env.mounts[0]()
+    assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), defaults)
+    assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
+    assert.equal(env.read('scanning'), false)
+    assert.equal(env.writes.length, 0)
+  })
+}
+
+test('saved custom or explicitly empty sources override defaults and survive remounting', async t => {
+  const env = environment(t)
+  env.controls.hostCapabilities = { defaultDirectories: ['C:\\Program Files\\Common Files\\VST3', 'C:\\Program Files\\VstPlugins'] }
+  const key = 'pymss-plugin-library-directories-v1'
+  for (const selected of [['E:\\Effects'], []]) {
+    env.preferences.set(key, JSON.stringify(selected))
+    await env.mounts[0]()
+    assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), selected)
+    assert.equal(env.preferences.get(key), JSON.stringify(selected))
+  }
+  assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
+})
+
+test('adding defaults preserves custom sources, avoids duplicates and persists without probing', async t => {
+  const env = environment(t)
+  env.controls.hostCapabilities = { defaultDirectories: ['/standard/vst3', '/standard/vst2'] }
+  const key = 'pymss-plugin-library-directories-v1'
+  env.preferences.set(key, JSON.stringify(['/custom', '/standard/vst3']))
+  await env.mounts[0]()
+  assert.equal(env.read('hasMissingDefaultDirectories'), true)
+  env.call('addDefaultDirectories')
+  env.call('addDefaultDirectories')
+  const expected = ['/custom', '/standard/vst3', '/standard/vst2']
+  assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), expected)
+  assert.deepEqual(JSON.parse(env.preferences.get(key)), expected)
+  assert.equal(env.read('hasMissingDefaultDirectories'), false)
+  await env.mounts[0]()
+  assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), expected)
+  assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('invalid preferences fall back to defaults while disabled hosts never seed directories', async t => {
+  const env = environment(t)
+  const key = 'pymss-plugin-library-directories-v1'
+  env.controls.hostCapabilities = { defaultDirectories: ['/standard'] }
+  for (const invalid of ['{broken', 'null', '{}']) {
+    env.preferences.set(key, invalid)
+    await env.mounts[0]()
+    assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), ['/standard'])
+  }
+  env.preferences.delete(key)
+  env.controls.hostCapabilities.enabled = false
+  await env.mounts[0]()
+  assert.equal(env.read('directories').length, 0)
+  assert.equal(env.calls.filter(call => call.command !== 'plugin_host_cached_scan_report').length, 0)
+})
+
+test('refresh replaces cached library entries, drops removed selections and leaves project inserts intact', async t => {
+  const env = environment(t)
+  const removed = { ...plugin('removed'), vendor: 'Removed Vendor', state: 'sha256:retained-project-state' }
+  const retained = { ...plugin('retained'), vendor: 'Existing Vendor' }
+  const added = { ...plugin('added'), vendor: 'New Vendor' }
+  env.props.session.pluginChain = [removed]
+  const projectBefore = JSON.stringify(env.props.session)
+  env.set('directories', ['/plugins'])
+  env.controls.report = { plugins: [removed, retained], failures: [], scanned: 2, cached: 0 }
+  await env.trigger('scan')
+  env.set('selectedPluginId', JSON.stringify([removed.id, removed.path]))
+  env.controls.report = { plugins: [retained, added], failures: [], scanned: 1, cached: 1 }
+  await env.call('scan')
+  await flush()
+  assert.deepEqual(Array.from(env.read('descriptors'), plugin => plugin.id), ['retained', 'added'])
+  assert.deepEqual(Array.from(env.read('catalogGroups'), group => group.label), ['Existing Vendor', 'New Vendor'])
+  assert.equal(env.read('selectedPluginId'), null)
+  assert.equal(env.read('scanReport').cached, 1)
+  assert.equal(JSON.stringify(env.props.session), projectBefore)
+  assert.equal(env.writes.length, 0)
+  const scans = env.calls.filter(call => call.command === 'plugin_host_scan_report')
+  assert.equal(scans.length, 2)
+  assert.ok(scans.every(call => call.args.force === false))
 })
 
 test('source changes discard an in-flight catalog and removing the last source keeps existing effects', async t => {
@@ -406,7 +499,7 @@ test('a scan finishing after the manager closes keeps its result for reopening',
   assert.equal(env.calls.some(call => call.kind === 'editor' || call.kind === 'capture'), false)
 })
 
-test('a project object replacement closes the manager and discards a late scan for the old project', async t => {
+test('a project replacement preserves the library while discarding a late scan for the old project', async t => {
   const env = environment(t)
   env.controls.scanGate = deferred()
   env.call('openManager', 'b')
@@ -425,8 +518,8 @@ test('a project object replacement closes the manager and discards a late scan f
   assert.equal(env.read('relocatingSlotId'), null)
   env.controls.scanGate.resolve()
   await scanning
-  assert.equal(env.read('descriptors').length, 0)
-  assert.equal(env.read('scanReport'), null)
+  assert.equal(env.read('descriptors').length, 1)
+  assert.equal(env.read('scanReport').plugins.length, 1)
   assert.deepEqual(JSON.parse(JSON.stringify(env.read('directories'))), ['/plugins'])
 })
 
@@ -520,7 +613,7 @@ test('controlled scanning starts progress observation before discovery and busy 
   assert.equal(commands[1].command, 'plugin_host_scan_report')
   assert.equal(commands[0].args.scanId, commands[1].args.scanId)
   assert.equal(commands[1].args.force, true)
-  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('busy'), false)
   assert.equal(env.read('scanStatus').elapsedMs, 3400)
   assert.equal(env.read('scanStatus').completed, 2)
   assert.equal(env.buttonDisabled('skipScanPlugin'), false)
@@ -615,7 +708,7 @@ test('a closed manager keeps its controlled scan and library selection state unt
   env.call('closeManager')
   await env.tick()
   assert.equal(env.read('managerOpen'), false)
-  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('busy'), false)
   assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_scan').length, 0)
   assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_status').length, 2)
   env.controls.scanGate.resolve()
@@ -661,7 +754,7 @@ test('late status, skip and scan replies cannot clear or overwrite a newer proje
   await oldRequest
   await skipping
   await flush()
-  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('busy'), false)
   assert.equal(env.read('scanning'), true)
   assert.equal(env.read('scanStatus').scanId, newId)
   assert.equal(env.read('scanStatus').currentPath, '/new.vst3')
@@ -754,7 +847,7 @@ test('null and terminal scan status cleanly gate controls without completing the
   assert.equal(env.calls.filter(call => call.command === 'plugin_host_skip_scan').length, 0)
   env.controls.scanStatus = ({ scanId }) => ({ ...activeScanStatus(scanId), phase: 'finished', currentPath: null, canSkip: false })
   await env.tick()
-  assert.equal(env.read('busy'), true)
+  assert.equal(env.read('busy'), false)
   assert.equal(env.timers.size, 0)
   assert.equal(env.buttonDisabled('stopScan'), true)
   env.controls.scanGate.resolve()
@@ -852,4 +945,106 @@ test('viewport resize dismisses menus and disposal releases the resize listener'
   env.dispose()
   assert.equal(env.windowListeners.size, 0)
   assert.equal(env.writes.length, 0)
+})
+
+test('remount restores a large disk catalog without starting a plugin scan or touching the project', async t => {
+  const plugins = Array.from({ length: 400 }, (_, i) => ({ ...plugin(`cached-${i}`), name: `Effect ${i}`, vendor: `Vendor ${i % 20}` }))
+  const report = { plugins, failures: [], scanned: 0, cached: 400, hasCache: true }
+  const first = environment(t)
+  first.preferences.set('pymss-plugin-library-directories-v1', JSON.stringify(['/plugins']))
+  first.controls.cacheReport = report
+  await first.mounts[0]()
+  assert.equal(first.read('descriptors').length, 400)
+  assert.equal(first.calls.some(call => call.command === 'plugin_host_scan_report'), false)
+  first.dispose()
+  const reopened = environment(t)
+  reopened.preferences.set('pymss-plugin-library-directories-v1', JSON.stringify(['/plugins']))
+  reopened.controls.cacheReport = report
+  await reopened.mounts[0]()
+  assert.equal(reopened.read('descriptors').length, 400)
+  assert.equal(reopened.read('catalogGroups').length, 20)
+  reopened.set('librarySearch', 'Effect 123')
+  assert.equal(reopened.read('pluginOptions').length, 1)
+  assert.equal(reopened.calls.filter(call => call.command === 'plugin_host_cached_scan_report').length, 1)
+  assert.equal(reopened.calls.some(call => call.command === 'plugin_host_scan_report'), false)
+  assert.equal(reopened.writes.length, 0)
+})
+
+test('late cache reads cannot overwrite a newer scan, different source or disposed editor', async t => {
+  for (const action of ['scan', 'source', 'dispose']) {
+    const env = environment(t)
+    env.preferences.set('pymss-plugin-library-directories-v1', JSON.stringify(['/first']))
+    env.controls.cacheGate = deferred()
+    env.controls.cacheReport = { ...env.controls.cacheReport, plugins: [plugin('stale')], hasCache: true }
+    const mounting = env.mounts[0]()
+    await flush()
+    if (action === 'scan') await env.call('scan')
+    else if (action === 'source') {
+      env.controls.cacheReport = { ...env.controls.cacheReport, plugins: [plugin('current')] }
+      env.controls.cacheGate.resolve()
+      env.controls.cacheGate = null
+      env.set('directories', ['/second'])
+    } else env.dispose()
+    env.controls.cacheGate?.resolve()
+    await mounting
+    await flush()
+    assert.equal(env.read('descriptors').some(plugin => plugin.id === 'stale'), false)
+    if (action === 'scan') assert.equal(env.read('descriptors')[0].id, 'vst3:library')
+    if (action === 'source') assert.equal(env.read('descriptors')[0].id, 'current')
+  }
+})
+
+test('cached effects remain searchable and addable while incremental refresh waits', async t => {
+  const env = environment(t)
+  env.set('directories', ['/plugins'])
+  env.set('descriptors', env.controls.report.plugins)
+  env.controls.scanGate = deferred()
+  const scanning = env.call('scan')
+  await flush()
+  assert.equal(env.read('scanning'), true)
+  assert.equal(env.read('busy'), false)
+  env.set('librarySearch', 'library')
+  env.set('selectedPluginId', JSON.stringify(['vst3:library', '/library.vst3']))
+  env.releaseCapture()
+  await env.call('addPlugin')
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.calls.filter(call => call.command === 'plugin_host_scan_report')[0].args.force, false)
+  env.controls.scanGate.resolve()
+  await scanning
+})
+
+test('stopping a refresh restores unvisited cached entries and clears feedback on project changes', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst3'], catalogCache: true })
+  env.set('directories', ['/plugins'])
+  const plugins = [plugin('a'), plugin('b')]
+  env.set('descriptors', plugins)
+  env.controls.report = { plugins: [plugins[0]], failures: [], scanned: 0, cached: 1, cancelled: true }
+  env.controls.cacheReport = { plugins, failures: [], scanned: 0, cached: 2, hasCache: true }
+  await env.call('scan')
+  assert.deepEqual(Array.from(env.read('descriptors'), plugin => plugin.id), ['a', 'b'])
+  env.set('feedback', 'old project feedback')
+  env.props.session = { ...env.props.session, id: 'new-project' }
+  await flush()
+  assert.equal(env.read('feedback'), '')
+  assert.equal(env.read('descriptors').length, 2)
+})
+
+test('an empty committed cache after cancelled refresh removes previously deleted entries', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst3'], catalogCache: true })
+  env.set('directories', ['/plugins'])
+  env.set('descriptors', [plugin('removed')])
+  env.controls.report = { plugins: [], failures: [], scanned: 0, cached: 0, cancelled: true }
+  await env.call('scan')
+  assert.equal(env.read('descriptors').length, 0)
+})
+
+test('restoring cancelled scan cache preserves source access errors that are absent from package entries', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst3'], catalogCache: true })
+  env.set('directories', ['/offline-source'])
+  env.controls.report = { plugins: [], failures: [{ path: '/offline-source', message: 'Access denied' }], scanned: 0, cached: 0, cancelled: true }
+  await env.call('scan')
+  assert.equal(env.read('scanReport').failures[0].message, 'Access denied')
 })

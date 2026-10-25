@@ -3,7 +3,7 @@ import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
-export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean }
+export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean; catalogCache?: boolean; defaultDirectories?: string[] }
 export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean; category?: string; subCategories?: string[]; rawCategory?: number | null; componentType?: number; componentSubtype?: number; componentManufacturer?: number }
 export type PluginParameter = { id: string; name: string; min: number; max: number; default: number; unit: string; taper: string; choices: string[] }
 export type PluginParameters = Partial<PluginHostStatus> & { params: PluginParameter[]; values: Record<string, number> }

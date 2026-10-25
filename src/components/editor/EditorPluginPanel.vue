@@ -20,6 +20,7 @@ const playback = useEditorPlaybackStore()
 const capabilities = ref<PluginHostCapabilities | null>(null)
 const busy = ref(false)
 const scanning = ref(false)
+const catalogLoading = ref(false)
 const scanStatus = ref<PluginScanStatus | null>(null)
 const scanBlacklist = ref<PluginScanBlacklistEntry[]>([])
 const scanActionPending = ref<'skip' | 'cancel' | null>(null)
@@ -48,8 +49,10 @@ const directoryDraft = ref('')
 const directories = ref<string[]>([])
 const opened = ref<string[]>([])
 const parameterSlotId = ref<string | null>(null)
-// Only restore sources explicitly selected through the current workflow.
+// A stored empty list is an explicit choice; seed standard paths only for new preferences.
 const STORAGE_KEY = 'pymss-plugin-library-directories-v1'
+let libraryReady = false
+let catalogRequest = 0
 let scanGeneration = 0
 let disposed = false
 let scanSequence = 0
@@ -62,6 +65,8 @@ const scanPhaseLabel = computed(() => t(scanStatus.value?.phase === 'scanning' ?
   : scanStatus.value?.phase === 'finished' ? 'editor.plugins.scanPhaseFinished'
   : scanStatus.value?.phase === 'cancelled' ? 'editor.plugins.scanPhaseCancelled' : 'editor.plugins.scanPhaseCollecting'))
 const canChooseAudioUnits = computed(() => capabilities.value?.platform === 'macos' && capabilities.value.formats.includes('au'))
+const defaultDirectories = computed(() => capabilities.value?.enabled ? capabilities.value.defaultDirectories || [] : [])
+const hasMissingDefaultDirectories = computed(() => defaultDirectories.value.some(path => !directories.value.includes(path)))
 const targetOptions = computed(() => [
   { label: t('editor.plugins.masterOutput'), value: 'master' },
   ...props.session.tracks.map(track => ({ label: track.name, value: `track:${track.id}` })),
@@ -134,7 +139,7 @@ const stopObservingSession = observePluginSession(host => {
 })
 onScopeDispose(stopObservingSession)
 watch(() => props.selectedTrackId, id => { target.value = id === null ? 'master' : `track:${id}` }, { immediate: true })
-watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; dialogPending.value = false; dialogOperationError = false; invalidateCatalog(); relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId === null ? 'master' : `track:${props.selectedTrackId}` })
+watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; feedback.value = ''; scanFeedback.value = ''; dialogPending.value = false; dialogOperationError = false; cancelActiveScan(); scanGeneration++; selectedPluginId.value = null; relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId === null ? 'master' : `track:${props.selectedTrackId}` })
 watch(targetOptions, options => { if (!options.some(option => option.value === target.value)) target.value = 'master' })
 watch(target, value => {
   reloadConfirmOpen.value = false; targetMenuOpen.value = false; relocatingSlotId.value = null; selectedPluginId.value = null; parameterSlotId.value = null; feedback.value = ''
@@ -142,23 +147,29 @@ watch(target, value => {
   if (trackId !== props.selectedTrackId) emit('selectTarget', trackId)
 })
 watch(() => chain.value.map(slot => slot.id), ids => { if (!ids.includes(parameterSlotId.value || '')) parameterSlotId.value = null })
-watch(directories, invalidateCatalog, { deep: true, flush: 'sync' })
+watch(directories, () => { invalidateCatalog(); if (libraryReady) void restoreCatalog() }, { deep: true, flush: 'sync' })
 watch(pluginOptions, options => { if (!options.some(option => option.value === selectedPluginId.value && !option.disabled)) selectedPluginId.value = null })
 onMounted(async () => {
   window.addEventListener('resize', dismissManagerPopovers)
   capabilities.value = await pluginHostCapabilities()
+  if (disposed) return
+  let stored: unknown
   try {
-    const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
-    if (Array.isArray(stored)) directories.value = [...new Set(stored.filter((path): path is string => typeof path === 'string' && Boolean(path.trim()) && (path !== 'au:system' || canChooseAudioUnits.value)))]
-  } catch { /* An invalid preference must not prevent opening the inspector. */ }
-  if (capabilities.value?.scanControl) await refreshBlacklist()
+    stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
+  } catch { /* Restore standard locations when the preference cannot be read. */ }
+  const sources = Array.isArray(stored) ? stored : defaultDirectories.value
+  directories.value = [...new Set(sources.filter((path): path is string => typeof path === 'string' && Boolean(path.trim()) && (path !== 'au:system' || canChooseAudioUnits.value)))]
+  libraryReady = true
+  await Promise.all([restoreCatalog(), capabilities.value?.scanControl ? refreshBlacklist() : Promise.resolve()])
 })
-onScopeDispose(() => window.removeEventListener('resize', dismissManagerPopovers))
-onScopeDispose(() => { disposed = true; cancelActiveScan(); scanGeneration++; blacklistGeneration++ })
+onScopeDispose(() => { window.removeEventListener('resize', dismissManagerPopovers) })
+onScopeDispose(() => { disposed = true; cancelActiveScan(); scanGeneration++; catalogRequest++; blacklistGeneration++ })
 
 function invalidateCatalog() {
   cancelActiveScan()
   scanGeneration++
+  catalogRequest++
+  catalogLoading.value = false
   error.value = ''
   scanReport.value = null
   descriptors.value = []
@@ -167,6 +178,22 @@ function invalidateCatalog() {
   feedback.value = ''
   scanFeedback.value = ''
 }
+async function restoreCatalog() {
+  if (disposed || scanning.value || !capabilities.value?.catalogCache || !directories.value.length) return
+  const request = ++catalogRequest
+  catalogLoading.value = true
+  try {
+    const report = await invoke<PluginScanReport & { hasCache: boolean }>('plugin_host_cached_scan_report', { paths: [...directories.value] })
+    if (disposed || request !== catalogRequest) return
+    descriptors.value = report.plugins
+    scanReport.value = report.hasCache ? report : null
+  } catch (cause) {
+    if (!disposed && request === catalogRequest) error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    if (request === catalogRequest) catalogLoading.value = false
+  }
+}
+
 function directoryLabel(path: string) {
   return path === 'au:system' ? t('editor.plugins.systemAudioUnits') : path.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || path
 }
@@ -248,6 +275,11 @@ function saveDirectories() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(directories.value)) }
   catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
 }
+function addDefaultDirectories() {
+  if (busy.value) return
+  directories.value = [...new Set([...directories.value, ...defaultDirectories.value])]
+  saveDirectories()
+}
 function addDirectory() {
   const path = directoryDraft.value.trim()
   if (!path) return
@@ -289,7 +321,6 @@ function cancelActiveScan() {
   if (!scan) return
   clearScanPoll(scan)
   activeScan = null
-  busy.value = false
   scanning.value = false
   scanStatus.value = null
   scanActionPending.value = null
@@ -370,11 +401,12 @@ async function removeBlacklistedPlugin(path: string) {
   })
 }
 async function scan(force = false) {
-  if (busy.value || disposed || !directories.value.length) return
+  if (busy.value || scanning.value || disposed || !directories.value.length) return
+  catalogRequest++
+  catalogLoading.value = false
   const current: ActiveScan = { id: `plugin_scan_${Date.now().toString(36)}_${++scanSequence}_${crypto.randomUUID()}`,
     generation: ++scanGeneration, project: props.session, controlled: capabilities.value?.scanControl === true, timer: null }
   activeScan = current
-  busy.value = true
   scanning.value = true
   scanStatus.value = null
   scanActionPending.value = null
@@ -384,8 +416,23 @@ async function scan(force = false) {
   // Start observation before invoking the long-running scan; control commands use independent IPC calls.
   if (current.controlled) void pollScanStatus(current)
   try {
-    const report = await invoke<PluginScanReport>('plugin_host_scan_report', { paths: [...directories.value], force,
+    let report = await invoke<PluginScanReport>('plugin_host_scan_report', { paths: [...directories.value], force,
       ...(current.controlled ? { scanId: current.id } : {}) })
+    if (!isCurrentScan(current)) return
+    if (report.cancelled) {
+      const replaced = new Set([...report.plugins, ...report.failures, ...(report.blacklisted || [])].map(item => item.path))
+      const retained = descriptors.value.filter(plugin => !replaced.has(plugin.path)
+        && !(replaced.has('au:system') && pluginDescriptorFormat(plugin) === 'au'))
+      report = { ...report, plugins: [...retained, ...report.plugins] }
+      if (capabilities.value?.catalogCache) {
+        try {
+          const cached = await invoke<PluginScanReport>('plugin_host_cached_scan_report', { paths: [...directories.value] })
+          if (!isCurrentScan(current)) return
+          const failures = [...new Map([...cached.failures, ...report.failures].map(failure => [failure.path, failure])).values()]
+          report = { ...report, plugins: cached.plugins, failures }
+        } catch { /* Keep unvisited entries when the committed cache snapshot is temporarily unavailable. */ }
+      }
+    }
     if (!isCurrentScan(current)) return
     scanReport.value = report
     if (report.cancelled) scanFeedback.value = ''
@@ -401,7 +448,6 @@ async function scan(force = false) {
     if (activeScan === current) {
       clearScanPoll(current)
       activeScan = null
-      busy.value = false
       scanning.value = false
       scanActionPending.value = null
       scanStatus.value = null
@@ -570,6 +616,7 @@ async function toggleEditor(slotId: string) {
                             <n-button size="tiny" quaternary :disabled="busy" :aria-label="t('editor.plugins.removeDirectory')" @click="removeDirectory(index)"><template #icon><n-icon :component="CloseOutline" /></template></n-button>
                           </div>
                         </div>
+                        <n-button v-if="hasMissingDefaultDirectories" size="small" text :disabled="busy" @click="addDefaultDirectories">{{ t('editor.plugins.addDefaultDirectories') }}</n-button>
                         <n-button v-if="canChooseAudioUnits && !directories.includes('au:system')" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
                       </div>
                       <details v-if="capabilities.scanControl" class="plugin-manager__blacklist">
@@ -590,7 +637,7 @@ async function toggleEditor(slotId: string) {
                     </div>
                   </section>
                 </n-popover>
-                <n-button v-if="directories.length" size="tiny" quaternary :loading="scanning" :disabled="busy" :title="t('editor.plugins.scan')" :aria-label="t('editor.plugins.scan')" @click="scan()"><template #icon><n-icon :component="RefreshOutline" /></template></n-button>
+                <n-button v-if="directories.length" size="tiny" quaternary :loading="scanning" :disabled="busy || scanning" :title="t('editor.plugins.scan')" :aria-label="t('editor.plugins.scan')" @click="scan()"><template #icon><n-icon :component="RefreshOutline" /></template></n-button>
               </div>
             </div>
             <div v-if="scanning && capabilities.scanControl" class="plugin-manager__scan-progress" :aria-label="t('editor.plugins.scanProgress')">
@@ -619,7 +666,7 @@ async function toggleEditor(slotId: string) {
                 <n-radio-button value="format">{{ t('editor.plugins.groupFormat') }}</n-radio-button>
               </n-radio-group>
             </div>
-            <div class="plugin-manager__catalog" :aria-label="t('editor.plugins.selectPlugin')" :aria-busy="busy">
+            <div class="plugin-manager__catalog" :aria-label="t('editor.plugins.selectPlugin')" :aria-busy="scanning || catalogLoading">
               <section v-for="group in catalogGroups" :key="group.key" class="plugin-manager__group" :aria-label="group.label">
               <div class="plugin-manager__group-heading"><strong>{{ group.label }}</strong><span>{{ group.plugins.length }}</span></div>
               <button v-for="option in group.plugins" :key="option.value" type="button" class="plugin-manager__plugin" :class="{ 'plugin-manager__plugin--selected': selectedPluginId === option.value }" :disabled="busy || option.disabled" :aria-pressed="selectedPluginId === option.value" :aria-label="option.label" :title="option.label" @click="selectedPluginId = option.value">
@@ -629,7 +676,7 @@ async function toggleEditor(slotId: string) {
               </section>
               <div v-if="!pluginOptions.length" class="plugin-manager__empty plugin-manager__empty--library">
                 <n-icon :component="SearchOutline" :size="26" />
-                <strong>{{ scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
+                <strong>{{ catalogLoading ? t('editor.plugins.restoringCatalog') : scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
                 <p>{{ !directories.length ? t('editor.plugins.supportedFormats', { formats: capabilities.formats.map(format => format.toUpperCase()).join(' / ') }) : librarySearch.trim() ? t('editor.plugins.adjustSearch') : t('editor.plugins.checkLocations') }}</p>
                 <n-button v-if="!directories.length" size="small" secondary :disabled="busy" :title="t('editor.plugins.chooseDirectoryHint')" @click="browseDirectory"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('editor.plugins.chooseDirectory') }}</n-button>
                 <n-button v-if="!directories.length && canChooseAudioUnits" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>

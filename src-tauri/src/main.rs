@@ -116,6 +116,7 @@ fn main() {
             commands::plugin_host::plugin_host_capabilities,
             commands::plugin_host::plugin_host_scan,
             commands::plugin_host::plugin_host_scan_report,
+            commands::plugin_host::plugin_host_cached_scan_report,
             commands::plugin_host::plugin_host_scan_status,
             commands::plugin_host::plugin_host_skip_scan,
             commands::plugin_host::plugin_host_cancel_scan,
