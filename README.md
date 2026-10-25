@@ -21,6 +21,10 @@
   ·
   <a href="https://github.com/pymss-project/pymss-studio/releases">Download</a>
   ·
+  <a href="https://github.com/pymss-project/pymss-studio/discussions">Community</a>
+  ·
+  <a href="https://github.com/pymss-project/pymss-studio/discussions/88">Start here</a>
+  ·
   <a href="https://github.com/pymss-project/pymss">pymss core</a>
 </p>
 
@@ -76,10 +80,10 @@ Choose a version on [GitHub Releases](https://github.com/pymss-project/pymss-stu
 | Windows x64, supported AMD GPU | `windows-x64-rocm` | Check the selected release's GPU and driver requirements; ROCm has a narrower support range. |
 | Windows x64, smaller initial download | `windows-x64-online` | Includes the bootstrap runtime; install the required inference environment after first launch. |
 | macOS 14+, Apple Silicon | `macos-arm64-mlx` | Uses MLX. Download the DMG and drag the application into `/Applications`. |
-| Linux | Build from source | The current release workflow does not produce Linux installers; see development prerequisites below. |
+| Linux x64 | `linux-x64-appimage` | The release workflow builds an AppImage; check the selected release's Assets for availability. |
 | Intel Mac | No dedicated release package | The existing MLX package targets Apple Silicon; source builds still require checking inference dependency compatibility. |
 
-Release packages include Python, so end users do not need to install system Python separately. The macOS DMG includes the fixed Python, PyTorch, MLX, and bundled core packages; first launch does not download another Python environment. Open **Settings → Runtime** to inspect the active runtime and update its core. Installing, switching, reinstalling, or deleting an entire environment in the application is available only on Windows.
+Release packages include Python, so end users do not need to install system Python separately. The macOS DMG includes the fixed Python, PyTorch, MLX, and bundled core packages; first launch does not download another Python environment. Open **Settings → Runtime** to inspect the active runtime and update its core. Installing, switching, reinstalling, or deleting an entire environment in the application is available on Windows and Linux.
 
 ### File types
 
@@ -224,7 +228,7 @@ cd pymss-studio
 pnpm install --frozen-lockfile
 ```
 
-For a first full desktop development session on Windows, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. The commands below prepare only the bootstrap interpreter. On macOS and Linux, prepare a compatible inference runtime separately or reuse a prepared bundled runtime; in-app installation of an entire environment is unavailable. Download model weights separately in the model library.
+For a first full desktop development session on Windows, prepare bootstrap Python, then install and activate an inference environment through onboarding or **Settings → Runtime**. Initial installation needs network access, and download size depends on the backend. The commands below prepare only the bootstrap interpreter. On Linux, install an inference environment through onboarding or **Settings → Runtime**. On macOS, prepare a compatible inference runtime separately or reuse a prepared bundled runtime. Download model weights separately in the model library.
 
 Windows PowerShell:
 
