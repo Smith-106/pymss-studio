@@ -1118,6 +1118,15 @@
       "addSelected": "添加效果器",
       "closeParameters": "收起参数",
       "dialogPending": "插件正在等待对话框操作。请切换到插件窗口，完成或取消授权、文件选择等操作后继续；当前会话已保留。",
+      "resizeLibrary": "调整插件库宽度",
+      "resizeParameters": "调整参数区高度",
+      "resizeWindow": {
+        "nw": "从左上角调整窗口大小",
+        "ne": "从右上角调整窗口大小",
+        "sw": "从左下角调整窗口大小",
+        "se": "从右下角调整窗口大小"
+      },
+      "resizeHint": "拖动调整大小，双击恢复默认尺寸。",
       "managerTitle": "插件管理",
       "chainTitle": "效果器链",
       "chainCount": "{count} 个插件",

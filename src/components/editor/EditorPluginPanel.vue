@@ -5,6 +5,8 @@ import { useI18n } from 'vue-i18n'
 import { AddOutline, ArrowDownOutline, ArrowUpOutline, CloseOutline, FolderOpenOutline, OpenOutline, OptionsOutline, RefreshOutline, SearchOutline, TrashOutline } from '@vicons/ionicons5'
 import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
+import { usePluginManagerLayout } from '@/composables/usePluginManagerLayout'
+import { usePluginManagerWindow } from '@/composables/usePluginManagerWindow'
 import type { EditorSession } from '@/types/editor'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
 import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
@@ -70,6 +72,15 @@ const chain = computed(() => targetTrackId.value === null
   ? props.session.pluginChain || []
   : props.session.tracks.find(track => track.id === targetTrackId.value)?.pluginChain || [])
 const parameterSlot = computed(() => chain.value.find(slot => slot.id === parameterSlotId.value))
+const { managerBody, managerChain, managerStyle, libraryWidth, libraryMin, libraryMax,
+  parameterHeight, parameterMin, parameterMax, resizing, stacked, startResize, resizeWithKeyboard, resetSize,
+} = usePluginManagerLayout(managerOpen, computed(() => Boolean(parameterSlot.value)))
+const resizeCorners = ['nw', 'ne', 'sw', 'se'] as const
+const resizeCornerLabels = computed(() => ({
+  nw: t('editor.plugins.resizeWindow.nw'), ne: t('editor.plugins.resizeWindow.ne'),
+  sw: t('editor.plugins.resizeWindow.sw'), se: t('editor.plugins.resizeWindow.se'),
+}))
+const { windowStyle, resizingWindow, startWindowResize, resizeWindowWithKeyboard, resetWindowSize } = usePluginManagerWindow(managerOpen, managerCard)
 const descriptorKey = (plugin: PluginDescriptor) => JSON.stringify([plugin.id, plugin.path])
 const relocatingSlot = computed(() => chain.value.find(slot => slot.id === relocatingSlotId.value))
 const operationError = computed(() => error.value || editor.pluginStateError || playback.error)
@@ -134,7 +145,7 @@ watch(() => chain.value.map(slot => slot.id), ids => { if (!ids.includes(paramet
 watch(directories, invalidateCatalog, { deep: true, flush: 'sync' })
 watch(pluginOptions, options => { if (!options.some(option => option.value === selectedPluginId.value && !option.disabled)) selectedPluginId.value = null })
 onMounted(async () => {
-  window.addEventListener('resize', recenterManager)
+  window.addEventListener('resize', dismissManagerPopovers)
   capabilities.value = await pluginHostCapabilities()
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
@@ -142,7 +153,7 @@ onMounted(async () => {
   } catch { /* An invalid preference must not prevent opening the inspector. */ }
   if (capabilities.value?.scanControl) await refreshBlacklist()
 })
-onScopeDispose(() => window.removeEventListener('resize', recenterManager))
+onScopeDispose(() => window.removeEventListener('resize', dismissManagerPopovers))
 onScopeDispose(() => { disposed = true; cancelActiveScan(); scanGeneration++; blacklistGeneration++ })
 
 function invalidateCatalog() {
@@ -172,13 +183,23 @@ function focusManager() {
   const element = managerCard.value?.$el
   if (managerOpen.value && element && !element.contains(document.activeElement)) element.focus({ preventScroll: true })
 }
-function recenterManager() {
-  const element = managerCard.value?.$el
-  if (!managerOpen.value || !element) return
-  element.style.top = ''
-  element.style.left = ''
+function dismissManagerPopovers() {
+  sourcesOpen.value = false
+  targetMenuOpen.value = false
+  reloadConfirmOpen.value = false
+}
+function managerResizeControl(event: Event) {
+  const control = (event.target as Element | null)?.closest<HTMLElement>('[data-plugin-resize]')?.dataset.pluginResize
+  return control === 'window' || control === 'library' || control === 'parameters' ? control : undefined
+}
+function onManagerPointerCapture(event: PointerEvent) {
+  if (event.button === 0 && managerResizeControl(event)) dismissManagerPopovers()
 }
 function onManagerKeyCapture(event: KeyboardEvent) {
+  const control = managerResizeControl(event)
+  const resizeKeys = control === 'window' ? ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']
+    : control === 'library' ? ['ArrowLeft', 'ArrowRight', 'Home', 'End'] : ['ArrowUp', 'ArrowDown', 'Home', 'End']
+  if (control && !event.defaultPrevented && resizeKeys.includes(event.key)) dismissManagerPopovers()
   if (event.key !== 'Escape' || event.defaultPrevented) return
   if (!targetMenuOpen.value && !reloadConfirmOpen.value && !sourcesOpen.value) return
   if (sourcesOpen.value) void nextTick(() => sourceButton.value?.$el.focus({ preventScroll: true }))
@@ -508,10 +529,10 @@ async function toggleEditor(slotId: string) {
     :show-mask="false" :mask-closable="false" :trap-focus="false" :block-scroll="false"
     :auto-focus="false" :close-on-esc="false" transform-origin="center" @after-enter="focusManager">
     <template #default="{ draggableClass }">
-      <n-card ref="managerCard" class="plugin-manager n-modal" :header-class="draggableClass" content-class="plugin-manager__content" footer-class="plugin-manager__error" :bordered="false" closable tabindex="-1"
+      <n-card ref="managerCard" class="plugin-manager n-modal" :class="{ 'plugin-manager--resizing-library': resizing === 'library', 'plugin-manager--resizing-parameters': resizing === 'parameters', 'plugin-manager--resizing-nwse': resizingWindow === 'nw' || resizingWindow === 'se', 'plugin-manager--resizing-nesw': resizingWindow === 'ne' || resizingWindow === 'sw' }" :style="[managerStyle, windowStyle]" :header-class="draggableClass" content-class="plugin-manager__content" footer-class="plugin-manager__error" :bordered="false" closable tabindex="-1"
         role="dialog" :aria-modal="false" :aria-label="t('editor.plugins.managerTitle')"
         @close="closeManager" @keydown.capture="onManagerKeyCapture" @keydown.stop="onManagerKeydown"
-        @pointerdown.stop @click.stop @dblclick.stop @contextmenu.stop @wheel.stop>
+        @pointerdown.capture="onManagerPointerCapture" @pointerdown.stop @click.stop @dblclick.stop @contextmenu.stop @wheel.stop>
         <template #header>
           <div class="plugin-manager__heading">
             <strong>{{ t('editor.plugins.managerTitle') }}</strong>
@@ -523,7 +544,10 @@ async function toggleEditor(slotId: string) {
           </div>
         </template>
         <template #header-extra><span class="plugin-manager__badge">{{ t('editor.plugins.experimental') }}</span></template>
-        <div class="plugin-manager__body" :aria-busy="busy">
+        <button v-for="corner in resizeCorners" :key="corner" type="button" data-plugin-resize="window" class="plugin-manager__corner" :class="`plugin-manager__corner--${corner}`"
+          :aria-label="resizeCornerLabels[corner]" :title="t('editor.plugins.resizeHint')"
+          @pointerdown.stop="startWindowResize(corner, $event)" @mousedown.stop @keydown="resizeWindowWithKeyboard(corner, $event)" @dblclick.stop="resetWindowSize" />
+        <div ref="managerBody" class="plugin-manager__body" :aria-busy="busy">
           <section class="plugin-manager__library" :class="{ 'plugin-manager__library--scanning': scanning }" :aria-label="t('editor.plugins.library')">
             <div class="plugin-manager__section-heading">
               <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count" :title="t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: scanReport.plugins.length })">{{ descriptors.length }}</span></div>
@@ -618,7 +642,11 @@ async function toggleEditor(slotId: string) {
             </div>
           </section>
 
-          <section class="plugin-manager__chain" :aria-label="t('editor.plugins.chainTitle')">
+          <div v-if="!stacked" data-plugin-resize="library" class="plugin-manager__resize-separator plugin-manager__resize-separator--library" role="separator" tabindex="0"
+            aria-orientation="vertical" :aria-label="t('editor.plugins.resizeLibrary')" :aria-description="t('editor.plugins.resizeHint')" :title="t('editor.plugins.resizeHint')"
+            :aria-valuenow="libraryWidth" :aria-valuemin="libraryMin" :aria-valuemax="libraryMax"
+            @pointerdown.stop="startResize('library', $event)" @mousedown.stop @keydown="resizeWithKeyboard('library', $event)" @dblclick.stop="resetSize('library')" />
+          <section ref="managerChain" class="plugin-manager__chain" :class="{ 'plugin-manager__chain--parameters': parameterSlot }" :aria-label="t('editor.plugins.chainTitle')">
             <div class="plugin-manager__section-heading"><strong>{{ t('editor.plugins.chainTitle') }}</strong><span class="plugin-manager__editing-hint" :title="t('editor.plugins.editingHint')">{{ t('editor.plugins.editingHint') }}</span></div>
             <p v-if="feedback" class="plugin-manager__feedback" :title="feedback" role="status">{{ feedback }}</p>
             <div v-if="!chain.length" class="plugin-manager__empty">
@@ -647,6 +675,10 @@ async function toggleEditor(slotId: string) {
               <p v-if="unavailablePlugins.some(item => item.slotId === slot.id)" class="plugin-panel__warning">{{ t('editor.plugins.unavailableBypassed') }} {{ unavailablePlugins.find(item => item.slotId === slot.id)?.message }}</p>
             </div>
             </div>
+            <div v-if="parameterSlot" data-plugin-resize="parameters" class="plugin-manager__resize-separator plugin-manager__resize-separator--parameters" role="separator" tabindex="0"
+              aria-orientation="horizontal" :aria-label="t('editor.plugins.resizeParameters')" :aria-description="t('editor.plugins.resizeHint')" :title="t('editor.plugins.resizeHint')"
+              :aria-valuenow="parameterHeight" :aria-valuemin="parameterMin" :aria-valuemax="parameterMax"
+              @pointerdown.stop="startResize('parameters', $event)" @mousedown.stop @keydown="resizeWithKeyboard('parameters', $event)" @dblclick.stop="resetSize('parameters')" />
             <section v-if="parameterSlot" id="plugin-parameter-dock" class="plugin-manager__parameter-dock" :aria-label="t('editor.plugins.parameters')">
               <div class="plugin-manager__parameter-heading"><strong>{{ t('editor.plugins.parameters') }} · {{ parameterSlot.name || parameterSlot.pluginId }}</strong><n-button size="tiny" quaternary :aria-label="t('editor.plugins.closeParameters')" @click="parameterSlotId = null"><template #icon><n-icon :component="CloseOutline" /></template></n-button></div>
               <EditorPluginParameters :key="parameterSlot.id" :session="session" :slot-id="parameterSlot.id" :disabled="busy || unavailablePlugins.some(item => item.slotId === parameterSlot?.id)" />
@@ -703,18 +735,36 @@ async function toggleEditor(slotId: string) {
   --plugin-manager-top: 96px;
   --plugin-manager-bottom: 20px;
   --plugin-manager-inset: 24px;
-  width: min(1440px, calc(100vw - var(--plugin-manager-inset) * 2));
-  height: min(860px, calc(100dvh - var(--plugin-manager-top) - var(--plugin-manager-bottom)));
-  max-height: calc(100dvh - var(--plugin-manager-top) - var(--plugin-manager-bottom));
+  width: var(--plugin-manager-width, min(1440px, calc(100vw - var(--plugin-manager-inset) * 2)));
+  height: var(--plugin-manager-height, min(860px, calc(100dvh - var(--plugin-manager-top) - var(--plugin-manager-bottom))));
+  max-width: 100vw;
+  max-height: 100dvh;
   margin: var(--plugin-manager-top) auto var(--plugin-manager-bottom);
   align-self: flex-start;
   min-width: 0;
   border: 1px solid var(--outline-strong);
   box-shadow: var(--shadow-soft);
 }
-.plugin-manager :deep(.n-card-header) { padding: 13px 16px; border-bottom: 1px solid var(--outline); }
-.plugin-manager :deep(.plugin-manager__content) { display: flex; flex-direction: column; padding: 0; min-height: 0; overflow: hidden; }
-.plugin-manager :deep(.plugin-manager__error) { padding: 12px 20px; max-height: 25dvh; overflow: auto; border-top: 1px solid var(--outline); }
+/* Floating menus mount inside the card; its content and footer own clipping. */
+.plugin-manager.n-modal { overflow: visible; }
+.plugin-manager :deep(.n-card-header) { padding: 13px 16px; border-bottom: 1px solid var(--outline); border-top-left-radius: inherit; border-top-right-radius: inherit; }
+.plugin-manager :deep(.plugin-manager__content) { display: flex; flex-direction: column; padding: 0; min-height: 0; overflow: hidden; border-bottom-left-radius: inherit; border-bottom-right-radius: inherit; }
+.plugin-manager :deep(.plugin-manager__content:has(+ .plugin-manager__error)) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.plugin-manager :deep(.plugin-manager__error) { padding: 12px 20px; max-height: min(25dvh, calc(var(--plugin-manager-height, 860px) * 0.25)); overflow: auto; border-top: 1px solid var(--outline); border-bottom-left-radius: inherit; border-bottom-right-radius: inherit; }
+.plugin-manager__corner { position: absolute; z-index: 2; width: 16px; height: 16px; padding: 0; border: 0; background: transparent; touch-action: none; }
+.plugin-manager__corner::after { content: ''; position: absolute; inset: 4px; border-color: var(--outline-strong); border-style: solid; border-width: 0; }
+.plugin-manager__corner:hover::after, .plugin-manager__corner:focus-visible::after { border-color: var(--primary); }
+.plugin-manager__corner:focus-visible { outline: 2px solid var(--primary); outline-offset: -3px; }
+.plugin-manager__corner--nw { top: 0; left: 0; cursor: nwse-resize; }
+.plugin-manager__corner--ne { top: 0; right: 0; cursor: nesw-resize; }
+.plugin-manager__corner--sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.plugin-manager__corner--se { bottom: 0; right: 0; cursor: nwse-resize; }
+.plugin-manager__corner--nw::after { border-top-width: 1px; border-left-width: 1px; border-top-left-radius: 5px; }
+.plugin-manager__corner--ne::after { border-top-width: 1px; border-right-width: 1px; border-top-right-radius: 5px; }
+.plugin-manager__corner--sw::after { border-bottom-width: 1px; border-left-width: 1px; border-bottom-left-radius: 5px; }
+.plugin-manager__corner--se::after { border-bottom-width: 1px; border-right-width: 1px; border-bottom-right-radius: 5px; }
+.plugin-manager--resizing-nwse, .plugin-manager--resizing-nwse * { cursor: nwse-resize !important; user-select: none !important; }
+.plugin-manager--resizing-nesw, .plugin-manager--resizing-nesw * { cursor: nesw-resize !important; user-select: none !important; }
 .plugin-manager__heading { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; min-width: 0; }
 .plugin-manager__heading > strong { flex-shrink: 0; font-size: 16px; font-weight: 600; }
 .plugin-manager__target { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -722,7 +772,8 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__target > .n-select { width: clamp(140px, 18vw, 240px); max-width: 32vw; }
 .plugin-manager__library-actions { display: flex; align-items: center; gap: 2px; }
 .plugin-manager__source-count { margin-left: 5px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
-.plugin-manager__source-manager { display: flex; flex-direction: column; width: min(380px, calc(100vw - 48px)); max-height: min(420px, calc(100dvh - 180px)); color: var(--on-surface); background: var(--surface-1); border: 1px solid var(--outline-strong); border-radius: 6px; box-shadow: var(--shadow-soft); }
+/* Leave enough room for the popover to fit above or below its trigger. */
+.plugin-manager__source-manager { display: flex; flex-direction: column; width: min(380px, calc(100vw - 48px)); max-height: min(420px, calc(50dvh - 32px)); color: var(--on-surface); background: var(--surface-1); border: 1px solid var(--outline-strong); border-radius: 6px; box-shadow: var(--shadow-soft); }
 .plugin-manager__source-manager > .plugin-manager__source-toolbar { flex-shrink: 0; padding: 10px 12px; border-bottom: 1px solid var(--outline); }
 .plugin-manager__source-content { display: grid; gap: 14px; min-height: 0; padding: 12px; overflow: auto; }
 .plugin-manager__scan-details { color: var(--on-surface-muted); font-size: 11px; }
@@ -732,14 +783,27 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__scan-feedback { flex-shrink: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface-muted); font-size: 11px; }
 .plugin-manager__scan-warning { align-self: flex-start; }
 .plugin-manager__editing-hint { max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.plugin-manager__parameter-dock { display: flex; flex-direction: column; flex: 0 1 clamp(210px, 32dvh, 360px); min-height: 0; max-height: 55%; padding-top: 10px; border-top: 1px solid var(--outline-strong); }
+.plugin-manager__parameter-dock { display: flex; flex-direction: column; flex: 0 0 var(--plugin-parameter-height, clamp(210px, 32dvh, 360px)); min-height: 150px; overflow: auto; }
 .plugin-manager__parameter-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-shrink: 0; margin-bottom: 8px; }
 .plugin-manager__parameter-heading > strong { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 500; }
 .plugin-manager__parameter-dock > .plugin-parameters { flex: 1; min-height: 0; }
 .plugin-manager__parameter-dock :deep(.plugin-parameters) { max-height: none; }
 .plugin-manager__chain-count { flex-shrink: 0; font-size: 11px; color: var(--on-surface-muted); font-variant-numeric: tabular-nums; }
 .plugin-manager__badge { padding: 3px 7px; border-radius: 4px; background: var(--surface-2); font-size: 11px; color: var(--on-surface-muted); }
-.plugin-manager__body { display: grid; grid-template-columns: clamp(260px, 30%, 380px) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+.plugin-manager__body { display: grid; grid-template-columns: var(--plugin-library-width, clamp(260px, 30%, 380px)) 8px minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+.plugin-manager__resize-separator { position: relative; align-self: stretch; flex-shrink: 0; touch-action: none; user-select: none; background: transparent; transition: background 120ms; }
+.plugin-manager__resize-separator::after { content: ''; position: absolute; background: var(--outline); }
+.plugin-manager__resize-separator--library { width: 8px; cursor: col-resize; }
+.plugin-manager__resize-separator--library::after { top: 0; bottom: 0; left: 3px; width: 1px; }
+.plugin-manager__resize-separator--parameters { height: 8px; flex-basis: 8px; cursor: row-resize; }
+.plugin-manager__resize-separator--parameters::after { left: 0; right: 0; top: 3px; height: 1px; }
+.plugin-manager__resize-separator:hover { background: var(--primary-softer); }
+.plugin-manager__resize-separator:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; background: var(--primary-softer); }
+.plugin-manager__resize-separator:hover::after, .plugin-manager__resize-separator:focus-visible::after { background: var(--primary); }
+.plugin-manager--resizing-library, .plugin-manager--resizing-library * { cursor: col-resize !important; user-select: none !important; }
+.plugin-manager--resizing-parameters, .plugin-manager--resizing-parameters * { cursor: row-resize !important; user-select: none !important; }
+.plugin-manager--resizing-library .plugin-manager__resize-separator--library,
+.plugin-manager--resizing-parameters .plugin-manager__resize-separator--parameters { background: var(--primary-soft); }
 .plugin-manager__chain, .plugin-manager__library { display: flex; flex-direction: column; align-items: stretch; gap: 9px; min-width: 0; min-height: 0; padding: 12px 14px; overflow: hidden; }
 .plugin-manager__scan-progress { display: grid; flex-shrink: 0; gap: 6px; padding: 10px; border: 1px solid var(--outline); border-radius: 6px; background: var(--surface-2); }
 .plugin-manager__scan-progress-heading { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; }
@@ -757,7 +821,9 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__blacklist-list { display: grid; gap: 9px; }
 .plugin-manager__blacklist-entry { display: flex; gap: 8px; align-items: center; }
 .plugin-manager__blacklist-entry > span { flex: 1; }
-.plugin-manager__chain { background: var(--surface-1); border-left: 1px solid var(--outline); }
+.plugin-manager__chain { background: var(--surface-1); }
+.plugin-manager__chain--parameters { overflow-y: auto; }
+.plugin-manager__chain--parameters > .plugin-manager__slots { min-height: 96px; }
 .plugin-manager__feedback { flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; padding: 6px 8px; border-radius: 5px; background: var(--primary-softer); color: var(--primary-strong); font-size: 12px; line-height: 1.6; }
 .plugin-manager__section-heading, .plugin-manager__slot-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .plugin-manager__section-heading { justify-content: space-between; min-height: 28px; flex-shrink: 0; }
@@ -837,9 +903,8 @@ async function toggleEditor(slotId: string) {
 @media (max-height: 640px) {
   .plugin-manager { --plugin-manager-top: 80px; --plugin-manager-bottom: 16px; }
   .plugin-manager :deep(.n-card-header) { padding-block: 9px; }
-  .plugin-manager :deep(.plugin-manager__error) { padding: 8px 12px; max-height: 28dvh; }
+  .plugin-manager :deep(.plugin-manager__error) { padding: 8px 12px; }
   .plugin-manager__chain, .plugin-manager__library { gap: 6px; padding: 8px 10px; }
-  .plugin-manager__source-manager { max-height: calc(100dvh - 140px); }
   .plugin-manager__selection > span { font-size: 10px; }
   .plugin-panel__slot { padding: 8px; }
 }
@@ -856,5 +921,5 @@ async function toggleEditor(slotId: string) {
   .plugin-manager__library--scanning > .plugin-manager__catalog,
   .plugin-manager__library--scanning > .plugin-manager__library-footer { display: none; }
 }
-@media (prefers-reduced-motion: reduce) { .plugin-manager__plugin { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .plugin-manager__plugin, .plugin-manager__resize-separator { transition: none; } }
 </style>

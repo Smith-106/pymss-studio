@@ -1118,6 +1118,15 @@
       "addSelected": "Add effect",
       "closeParameters": "Close parameters",
       "dialogPending": "The plugin is waiting for a dialog. Switch to its window and complete or cancel authorization or file selection to continue. The current session has been retained.",
+      "resizeLibrary": "Resize the plugin library",
+      "resizeParameters": "Resize the parameter panel",
+      "resizeWindow": {
+        "nw": "Resize window from top left",
+        "ne": "Resize window from top right",
+        "sw": "Resize window from bottom left",
+        "se": "Resize window from bottom right"
+      },
+      "resizeHint": "Drag to resize. Double-click to restore the default size.",
       "managerTitle": "Plugin manager",
       "chainTitle": "Effect chain",
       "chainCount": "{count} plugins",

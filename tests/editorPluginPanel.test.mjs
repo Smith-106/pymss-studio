@@ -19,7 +19,7 @@ const plugin = id => ({ id, format: 'vst3', pluginId: id, name: id, path: `/${id
 function environment(t, { scanControl = false } = {}) {
   const capture = deferred()
   const props = reactive({ session: { id: 'project', tracks: [], pluginChain: ['a', 'b', 'c'].map(plugin) }, selectedTrackId: null })
-  const writes = [], calls = [], emitted = [], mounts = [], disposals = [], timers = new Map()
+  const writes = [], calls = [], emitted = [], mounts = [], disposals = [], timers = new Map(), windowListeners = new Map()
   let timerSequence = 0, stopped = false
   const preferences = new Map()
   const controls = { scanControl, scanStatus: null, statusGate: null, skipGate: null, skipResult: true, cancelResult: true, blacklist: [], blacklistGate: null, directory: null, scanGate: null, editorGate: null, captureGate: capture, report: {
@@ -28,6 +28,8 @@ function environment(t, { scanControl = false } = {}) {
   } }
   const context = vm.createContext({
     PluginHostDialogPendingError: class PluginHostDialogPendingError extends Error {},
+    usePluginManagerLayout: () => ({}),
+    usePluginManagerWindow: () => ({}),
     defineEmits: () => (event, trackId) => emitted.push({ event, trackId }),
     computed, ref, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
     useEditorStore: () => ({
@@ -73,7 +75,7 @@ function environment(t, { scanControl = false } = {}) {
     pluginHostCapabilities: async () => ({ enabled: true, platform: 'windows', formats: ['vst3'], nativeEditor: true, scanControl: controls.scanControl }),
     crypto: { randomUUID: () => 'added-slot' },
     localStorage: { getItem: key => preferences.get(key) ?? null, setItem: (key, value) => preferences.set(key, value) },
-    window: { addEventListener() {}, removeEventListener() {} },
+    window: { addEventListener: (name, callback) => windowListeners.set(name, callback), removeEventListener: name => windowListeners.delete(name) },
     setTimeout: callback => { timers.set(++timerSequence, callback); return timerSequence },
     clearTimeout: id => timers.delete(id),
     clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
@@ -98,7 +100,7 @@ function environment(t, { scanControl = false } = {}) {
     }).outputText
     return vm.runInContext(eventCode, context)(true)
   }
-  return { props, writes, calls, emitted, controls, preferences, mounts, timers, dispose, read, set, call, trigger, releaseCapture: capture.resolve,
+  return { props, writes, calls, emitted, controls, preferences, mounts, timers, windowListeners, dispose, read, set, call, trigger, releaseCapture: capture.resolve,
     async tick() { const pending = [...timers.values()]; timers.clear(); pending.forEach(callback => callback()); await flush() },
     evaluate: expression => vm.runInContext(expression, context),
     buttonDisabled(key) {
@@ -802,4 +804,52 @@ test('source management consumes Escape before the modeless workbench and never 
   assert.equal(env.read('scanning'), true)
   env.controls.scanGate.resolve()
   await scanning
+})
+
+test('primary pointer resizing dismisses transient menus without changing the project', t => {
+  const env = environment(t)
+  env.call('openManager')
+  const menus = ['sourcesOpen', 'targetMenuOpen', 'reloadConfirmOpen']
+  for (const control of ['window', 'library', 'parameters']) {
+    menus.forEach(name => env.set(name, true))
+    env.call('onManagerPointerCapture', { button: 0, target: { closest: () => ({ dataset: { pluginResize: control } }) } })
+    menus.forEach(name => assert.equal(env.read(name), false))
+    assert.equal(env.read('managerOpen'), true)
+  }
+  menus.forEach(name => env.set(name, true))
+  env.call('onManagerPointerCapture', { button: 2, target: { closest: () => ({ dataset: { pluginResize: 'window' } }) } })
+  env.call('onManagerPointerCapture', { button: 0, target: { closest: () => null } })
+  menus.forEach(name => assert.equal(env.read(name), true))
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('only supported resize keys dismiss menus before the child geometry handler', t => {
+  const env = environment(t)
+  const menus = ['sourcesOpen', 'targetMenuOpen', 'reloadConfirmOpen']
+  for (const [control, key, prevented, dismiss] of [
+    ['window', 'ArrowUp', false, true], ['library', 'Home', false, true], ['parameters', 'End', false, true],
+    ['window', 'Home', false, false], ['library', 'ArrowUp', false, false], ['parameters', 'ArrowRight', false, false],
+    ['window', 'Tab', false, false], ['window', 'ArrowUp', true, false],
+  ]) {
+    menus.forEach(name => env.set(name, true))
+    env.call('onManagerKeyCapture', { key, defaultPrevented: prevented, target: { closest: () => ({ dataset: { pluginResize: control } }) } })
+    menus.forEach(name => assert.equal(env.read(name), !dismiss))
+  }
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('viewport resize dismisses menus and disposal releases the resize listener', async t => {
+  const env = environment(t)
+  for (const mount of env.mounts) await mount()
+  env.call('openManager')
+  const menus = ['sourcesOpen', 'targetMenuOpen', 'reloadConfirmOpen']
+  menus.forEach(name => env.set(name, true))
+  env.windowListeners.get('resize')()
+  menus.forEach(name => assert.equal(env.read(name), false))
+  assert.equal(env.read('managerOpen'), true)
+  env.dispose()
+  assert.equal(env.windowListeners.size, 0)
+  assert.equal(env.writes.length, 0)
 })
