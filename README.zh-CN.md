@@ -21,6 +21,10 @@
   ·
   <a href="https://github.com/pymss-project/pymss-studio/releases">下载安装</a>
   ·
+  <a href="https://github.com/pymss-project/pymss-studio/discussions">社区讨论</a>
+  ·
+  <a href="https://github.com/pymss-project/pymss-studio/discussions/88">新用户指南</a>
+  ·
   <a href="https://github.com/pymss-project/pymss">pymss 核心项目</a>
 </p>
 
@@ -76,10 +80,10 @@ Pymss Studio 将 [pymss](https://github.com/pymss-project/pymss) 音乐源分离
 | Windows x64，受支持的 AMD 显卡 | `windows-x64-rocm` | ROCm 支持范围更具体，请核对所选版本的显卡及驱动要求。 |
 | Windows x64，希望减小首次下载体积 | `windows-x64-online` | 包含基础运行时，首次启动后安装需要的推理环境。 |
 | macOS 14+，Apple Silicon | `macos-arm64-mlx` | 使用 MLX，下载 `.dmg` 后将应用拖入 `/Applications`。 |
-| Linux | 源码构建 | 当前发布工作流未生成 Linux 安装包；开发与构建依赖见下文。 |
+| Linux x64 | `linux-x64-appimage` | 发布流程提供 AppImage 构建；请以对应发行页的 Assets 为准。 |
 | Intel Mac | 暂无专用发布包 | 现有 MLX 包面向 Apple Silicon；自行构建时仍需核验推理依赖的兼容性。 |
 
-发布包包含 Python，普通用户无需单独安装系统 Python。macOS DMG 已包含固定的 Python、PyTorch、MLX 和出厂核心，首次启动无需重新下载整套 Python 环境。可在 **设置 → 运行环境** 中查看当前环境并更新内核；应用内安装、切换、重装或删除整套环境仅适用于 Windows。
+发布包包含 Python，普通用户无需单独安装系统 Python。macOS DMG 已包含固定的 Python、PyTorch、MLX 和出厂核心，首次启动无需重新下载整套 Python 环境。可在 **设置 → 运行环境** 中查看当前环境并更新内核；应用内安装、切换、重装或删除整套环境适用于 Windows 和 Linux。
 
 ### 选择文件类型
 
@@ -224,7 +228,7 @@ cd pymss-studio
 pnpm install --frozen-lockfile
 ```
 
-Windows 首次进行完整桌面调试时，先准备基础 Python，再通过启动引导或“设置 → 运行环境”安装、激活推理环境。首次安装需要联网，下载量取决于后端。以下命令仅准备引导解释器；macOS 和 Linux 需另行准备兼容的推理环境，或复用已准备的内置运行时，当前不支持在应用内安装整套环境。模型权重在模型库另行下载。
+Windows 首次进行完整桌面调试时，先准备基础 Python，再通过启动引导或“设置 → 运行环境”安装、激活推理环境。首次安装需要联网，下载量取决于后端。以下命令仅准备引导解释器。Linux 可通过启动引导或“设置 → 运行环境”安装推理环境；macOS 需另行准备兼容的推理环境，或复用已准备的内置运行时。模型权重在模型库另行下载。
 
 Windows PowerShell：
 
