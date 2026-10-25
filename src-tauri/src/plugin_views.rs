@@ -369,6 +369,26 @@ mod tests {
     }
 
     #[test]
+    fn managed_update_sdk_takes_priority_over_legacy_resources() {
+        let guard = tempdir::TempDirGuard::new();
+        let managed = guard.path.join("python/plugin-sdk");
+        let legacy = guard.path.join("resources/plugin-sdk");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(managed.join("pymss-sdk.js"), "current sdk").unwrap();
+        fs::write(legacy.join("pymss-sdk.js"), "old sdk").unwrap();
+        fs::write(legacy.join("pymss-sdk.css"), "bundled css").unwrap();
+        assert_eq!(
+            read_sdk_asset(&guard.path, "pymss-sdk.js").body(),
+            b"current sdk"
+        );
+        assert_eq!(
+            read_sdk_asset(&guard.path, "pymss-sdk.css").body(),
+            b"bundled css"
+        );
+    }
+
+    #[test]
     fn switches_the_plugins_root_between_runtimes() {
         let first = tempdir::TempDirGuard::new();
         let second = tempdir::TempDirGuard::new();
@@ -400,7 +420,13 @@ mod tests {
 fn sdk_asset_path(resource_dir: &Path, name: &str) -> Option<PathBuf> {
     match name {
         "pymss-sdk.css" | "pymss-sdk.js" => {
-            Some(resource_dir.join("resources").join("plugin-sdk").join(name))
+            // Windows managed updates already replace the python directory.
+            let managed = resource_dir.join("python").join("plugin-sdk").join(name);
+            Some(if managed.is_file() {
+                managed
+            } else {
+                resource_dir.join("resources").join("plugin-sdk").join(name)
+            })
         }
         _ => None,
     }

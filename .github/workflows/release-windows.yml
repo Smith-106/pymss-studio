@@ -111,6 +111,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           @"
           Pymss Studio $version Windows x64 CUDA
@@ -308,6 +309,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
            ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           @"
           Pymss Studio $version Windows x64 CPU
@@ -473,6 +475,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           @"
           Pymss Studio ${{ steps.meta.outputs.version }} Windows x64 Online
           This package installs the selected CPU, CUDA, or ROCm environment on first start.
@@ -628,6 +631,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           if (Test-Path "$stage\python-runtime\runtime-envs\rocm\Scripts\offload-arch.exe") { throw "Staged ROCm offload-arch launcher still embeds the build Python path" }
           $rocmSdkPackage = Get-ChildItem "$stage\python-runtime\runtime-envs\rocm\Lib\site-packages" -Directory -Filter "_rocm_sdk_core*" |

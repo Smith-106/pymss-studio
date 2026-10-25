@@ -82,6 +82,7 @@ jobs:
                   'bundleMediaFramework': True,
               }},
           }}
+          config['bundle']['resources'][str(resources / 'plugin-sdk')] = 'resources/plugin-sdk'
           Path('src-tauri/tauri.bundle.resources.json').write_text(json.dumps(config))
           PY
           mkdir -p "$RUNNER_TEMP/pymss-linux-build"

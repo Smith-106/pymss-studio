@@ -127,6 +127,7 @@ jobs:
                       str((root / "src-tauri" / "resources" / "python").resolve()): "python",
                       str((root / "src-tauri" / "resources" / "python-runtime").resolve()): "python-runtime",
                       str((root / "src-tauri" / "resources" / "bin").resolve()): "bin",
+                      str((root / "src-tauri" / "resources" / "plugin-sdk").resolve()): "resources/plugin-sdk",
                   }
               }
           }))
@@ -168,6 +169,8 @@ jobs:
           RESOURCE_ROOT="$RES"
           if [ ! -f "$RESOURCE_ROOT/python-runtime/runtime-envs/active-runtime.json" ]; then RESOURCE_ROOT="$RES/resources"; fi
           test -f "$RES/python/worker.py" || test -f "$RES/resources/python/worker.py"
+          test -s "$RES/resources/plugin-sdk/pymss-sdk.js"
+          test -s "$RES/resources/plugin-sdk/pymss-sdk.css"
           test -d "$RESOURCE_ROOT/python-runtime"
           test -f "$RESOURCE_ROOT/python-runtime/runtime-envs/active-runtime.json"
           test -x "$RES/bin/ffmpeg" || test -x "$RES/resources/bin/ffmpeg"
