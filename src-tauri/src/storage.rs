@@ -297,6 +297,14 @@ pub(crate) fn write_json_file(path: &Path, data: &Value) -> AppResult<()> {
 }
 
 fn write_json_file_locked(path: &Path, data: &Value) -> AppResult<()> {
+    write_json_file_with_replace(path, data, replace_file)
+}
+
+fn write_json_file_with_replace(
+    path: &Path,
+    data: &Value,
+    replace: impl FnOnce(&Path, &Path) -> AppResult<()>,
+) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -319,8 +327,20 @@ fn write_json_file_locked(path: &Path, data: &Value) -> AppResult<()> {
         file.write_all(&content)?;
         file.sync_all()?;
         drop(file);
-        replace_file(&temporary, path)
+        replace(&temporary, path)
     })();
+    #[cfg(windows)]
+    if let Err(AppError::Io(error)) = &result {
+        // ReplaceFileW can remove/rename the old file before reporting these errors.
+        // The complete, synced replacement is then the only copy of the latest save.
+        if matches!(error.raw_os_error(), Some(1176 | 1177)) {
+            return Err(AppError::Worker(format!(
+                "Failed to save {}: {error}. Recovery file retained at {}",
+                path.display(),
+                temporary.display(),
+            )));
+        }
+    }
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
@@ -582,7 +602,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> AppResult<()> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    for attempt in 0..4 {
+    retry_file_replacement(|| {
         let replaced = unsafe {
             ReplaceFileW(
                 destination.as_ptr(),
@@ -594,14 +614,28 @@ fn replace_file(temporary: &Path, destination: &Path) -> AppResult<()> {
             )
         };
         if replaced != 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        let error = std::io::Error::last_os_error();
-        // Antivirus/indexer scans and a just-released WebView handle can briefly hold the
-        // destination. Keep the temp file intact and retry only those transient Win32 errors.
-        let retryable = matches!(error.raw_os_error(), Some(5 | 32 | 33));
-        if !retryable || attempt == 3 {
-            return Err(error.into());
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn retry_file_replacement(mut replace: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    for attempt in 0..6 {
+        match replace() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // 1175 (ERROR_UNABLE_TO_REMOVE_REPLACED) leaves both names intact, so it
+                // is safe to retry just like sharing violations. Never retry 1176/1177:
+                // those indicate a partially completed replacement.
+                let retryable = matches!(error.raw_os_error(), Some(5 | 32 | 33 | 1175));
+                if !retryable || attempt == 5 {
+                    return Err(error);
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(40 * (attempt + 1) as u64));
     }
@@ -1012,6 +1046,138 @@ mod tests {
         assert_eq!(stored, json!({ "value": 2 }));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_save_retries_unable_to_remove_replaced_without_touching_the_old_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = br#"{"revision":1}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut attempts = 0;
+        super::write_json_file_with_replace(&path, &json!({ "revision": 2 }), |temp, dest| {
+            super::retry_file_replacement(|| {
+                attempts += 1;
+                assert_eq!(std::fs::read(dest).unwrap(), old);
+                let pending: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(temp).unwrap()).unwrap();
+                assert_eq!(pending, json!({ "revision": 2 }));
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(1175))
+                } else {
+                    std::fs::rename(temp, dest)
+                }
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, json!({ "revision": 2 }));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_replacement_failure_is_bounded_and_keeps_the_previous_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = br#"{"revision":1}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut attempts = 0;
+        let error = super::write_json_file_with_replace(&path, &json!({ "revision": 2 }), |_, _| {
+            super::retry_file_replacement(|| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(1175))
+            })?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 6);
+        assert!(matches!(error,
+            crate::error::AppError::Io(error) if error.raw_os_error() == Some(1175)));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_replacements_are_not_retried_and_keep_a_complete_recovery_file() {
+        for code in [1176, 1177] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("project.json");
+            std::fs::write(&path, br#"{"revision":1}"#).unwrap();
+            let mut recovery = PathBuf::new();
+            let mut attempts = 0;
+            let error = super::write_json_file_with_replace(
+                &path,
+                &json!({ "revision": 2 }),
+                |temp, dest| {
+                    recovery = temp.to_path_buf();
+                    super::retry_file_replacement(|| {
+                        attempts += 1;
+                        if code == 1176 {
+                            std::fs::remove_file(dest)?;
+                        } else {
+                            std::fs::rename(dest, root.path().join("original.json"))?;
+                        }
+                        Err(std::io::Error::from_raw_os_error(code))
+                    })?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(!path.exists());
+            assert!(error.to_string().contains(&recovery.display().to_string()));
+            let pending: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(recovery).unwrap()).unwrap();
+            assert_eq!(pending, json!({ "revision": 2 }));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_transient_file_errors_fail_without_retrying() {
+        for code in [2, 87, 112] {
+            let mut attempts = 0;
+            let error = super::retry_file_replacement(|| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(code))
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_save_succeeds_after_a_windows_reader_releases_its_handle() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        write_json_file(&path, &json!({ "revision": 1 })).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(reader);
+        });
+        let result = write_json_file(&path, &json!({ "revision": 2 }));
+        release.join().unwrap();
+        result.unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, json!({ "revision": 2 }));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]
