@@ -5,7 +5,7 @@ import vm from 'node:vm'
 import ts from 'typescript'
 import { compileTemplate, parse } from 'vue/compiler-sfc'
 import { computed, effectScope, nextTick, proxyRefs, reactive, ref, watch } from 'vue'
-import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
+import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginFavoriteKey, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 const component = readFileSync(new URL('../src/components/editor/EditorPluginPanel.vue', import.meta.url), 'utf8')
 const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
@@ -83,7 +83,7 @@ function environment(t, { scanControl = false } = {}) {
     window: { addEventListener: (name, callback) => windowListeners.set(name, callback), removeEventListener: name => windowListeners.delete(name) },
     setTimeout: callback => { timers.set(++timerSequence, callback); return timerSequence },
     clearTimeout: id => timers.delete(id),
-    clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
+    clonePluginChain, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginFavoriteKey, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor,
   })
   const scope = effectScope()
   scope.run(() => vm.runInContext(code, context))
@@ -145,6 +145,123 @@ test('catalog searches names, vendors and formats and clears a hidden or unsuppo
   assert.equal(env.writes.length, 0)
 })
 
+test('one VST2/VST3 library row defaults to the supported VST3 descriptor when adding an effect', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst2', 'vst3'] })
+  env.set('descriptors', [
+    { id: 'vst2:serum', name: 'SerumFX', vendor: 'Xfer', format: 'vst2', path: '/SerumFX.dll' },
+    { id: 'vst3:serum', name: 'SerumFX', vendor: 'Xfer', format: 'vst3', path: '/SerumFX.vst3' },
+  ])
+  const options = env.read('pluginOptions')
+  assert.equal(options.length, 1)
+  assert.equal(options[0].formatLabel, 'VST3 / VST2')
+  assert.equal(env.read('catalogGroups')[0].plugins.length, 1)
+  env.call('selectCatalogPlugin', options[0])
+  assert.equal(env.read('selectedDescriptor').format, 'vst3')
+  assert.equal(env.read('selectedFormatOptions').length, 2)
+  env.releaseCapture()
+  await env.call('addPlugin')
+  const added = env.writes[0].chain.at(-1)
+  assert.equal(added.format, 'vst3')
+  assert.equal(added.pluginId, 'vst3:serum')
+  assert.equal(added.path, '/SerumFX.vst3')
+})
+
+test('a merged row permits explicit VST2 selection and searching either format retains one result', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst2', 'vst3'] })
+  env.set('descriptors', [
+    { id: 'vst2:gain', name: 'Gain', vendor: 'Maker', format: 'vst2', path: '/Gain.dll' },
+    { id: 'vst3:gain', name: 'Gain', vendor: 'Maker', format: 'vst3', path: '/Gain.vst3' },
+  ])
+  env.call('selectCatalogPlugin', env.read('pluginOptions')[0])
+  const legacyKey = JSON.stringify(['vst2:gain', '/Gain.dll'])
+  env.call('selectPluginFormat', legacyKey)
+  await flush()
+  env.call('selectCatalogPlugin', env.read('pluginOptions')[0])
+  assert.equal(env.read('selectedPluginId'), legacyKey)
+  assert.equal(env.call('isCatalogPluginSelected', env.read('pluginOptions')[0]), true)
+  for (const query of ['VST2', 'VST3']) {
+    env.set('librarySearch', query)
+    await flush()
+    assert.equal(env.read('pluginOptions').length, 1)
+    assert.equal(env.read('selectedPluginId'), legacyKey)
+  }
+  env.releaseCapture()
+  await env.call('addPlugin')
+  const added = env.writes[0].chain.at(-1)
+  assert.equal(added.format, 'vst2')
+  assert.equal(added.pluginId, 'vst2:gain')
+  assert.equal(added.path, '/Gain.dll')
+})
+
+test('merged rows fall back to a supported format and relocation never changes a saved format', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst2'] })
+  const legacy = { id: 'vst2:gain', classId: 'legacy', name: 'Gain', vendor: 'Maker', format: 'vst2', path: '/Gain.dll', isInstrument: false }
+  env.set('descriptors', [legacy, { ...legacy, id: 'vst3:gain', classId: 'modern', format: 'vst3', path: '/Gain.vst3' }])
+  env.call('selectCatalogPlugin', env.read('pluginOptions')[0])
+  assert.equal(env.read('selectedDescriptor').format, 'vst2')
+  env.call('selectPluginFormat', JSON.stringify(['vst3:gain', '/Gain.vst3']))
+  assert.equal(env.read('selectedDescriptor').format, 'vst2')
+  env.props.session.pluginChain = [{ ...legacy, pluginId: legacy.id, id: 'saved', state: 'sha256:legacy', bypassed: true }]
+  env.call('beginRelocation', 'saved')
+  const options = env.read('pluginOptions')
+  assert.equal(options.length, 1)
+  assert.equal(options[0].variants.length, 1)
+  assert.equal(options[0].plugin.format, 'vst2')
+  assert.equal(env.props.session.pluginChain[0].state, 'sha256:legacy')
+  assert.equal(env.writes.length, 0)
+})
+
+test('double-click activation adds once while capture is pending and respects the selected format', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst2', 'vst3'] })
+  env.set('descriptors', [
+    { id: 'vst2:gain', name: 'Gain', vendor: 'Maker', format: 'vst2', path: '/Gain.dll' },
+    { id: 'vst3:gain', name: 'Gain', vendor: 'Maker', format: 'vst3', path: '/Gain.vst3' },
+  ])
+  const option = env.read('pluginOptions')[0]
+  env.call('selectCatalogPlugin', option)
+  assert.equal(env.writes.length, 0, 'a single click only selects the effect')
+  env.call('selectPluginFormat', JSON.stringify(['vst2:gain', '/Gain.dll']))
+  const adding = env.call('activateCatalogPlugin', option)
+  await env.call('activateCatalogPlugin', option)
+  await flush()
+  assert.equal(env.calls.filter(call => call.kind === 'capture').length, 1)
+  env.releaseCapture()
+  await adding
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.writes[0].chain.at(-1).format, 'vst2')
+  assert.equal(env.writes[0].chain.at(-1).path, '/Gain.dll')
+})
+
+test('double-clicking an unsupported library effect cannot start a capture or edit the chain', async t => {
+  const env = environment(t)
+  env.set('descriptors', [{ id: 'instrument', name: 'Synth', vendor: 'Maker', path: '/Synth.vst3', isInstrument: true }])
+  await env.call('activateCatalogPlugin', env.read('pluginOptions')[0])
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.writes.length, 0)
+  assert.equal(env.read('selectedPluginId'), null)
+})
+
+test('double-click during relocation updates the saved instance without adding another plugin', async t => {
+  const env = environment(t)
+  env.props.session.pluginChain = [{ id: 'saved', pluginId: 'effect', format: 'vst3', name: 'Effect',
+    path: '/old.vst3', bypassed: true, state: 'sha256:preserved', vendorMetadata: { keep: true } }]
+  env.set('descriptors', [{ id: 'effect', classId: 'effect', format: 'vst3', name: 'Effect',
+    vendor: 'Maker', path: '/new.vst3', isInstrument: false }])
+  env.call('beginRelocation', 'saved')
+  env.releaseCapture()
+  await env.call('activateCatalogPlugin', env.read('pluginOptions')[0])
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.writes[0].chain.length, 1)
+  assert.equal(env.writes[0].chain[0].id, 'saved')
+  assert.equal(env.writes[0].chain[0].path, '/new.vst3')
+  assert.equal(env.writes[0].chain[0].state, 'sha256:preserved')
+  assert.equal(env.writes[0].chain[0].vendorMetadata.keep, true)
+})
+
 test('vendor grouping merges casing and whitespace, sorts names and keeps unknown vendors last', async t => {
   const env = environment(t)
   const plugins = [
@@ -164,6 +281,70 @@ test('vendor grouping merges casing and whitespace, sorts names and keeps unknow
   assert.equal(env.read('catalogGroups').length, 1)
   assert.equal(env.read('catalogGroups')[0].label, 'VST3')
   assert.equal(env.writes.length, 0)
+})
+
+test('catalog groups start collapsed and toggling never changes the selected effect or project', t => {
+  const env = environment(t)
+  env.set('descriptors', [
+    { id: 'gain', name: 'Gain', vendor: 'Audio Tools', path: '/gain.vst3' },
+    { id: 'eq', name: 'EQ', vendor: 'Audio Tools', path: '/eq.vst3' },
+    { id: 'echo', name: 'Echo', vendor: 'Room Audio', path: '/echo.vst3' },
+  ])
+  const keys = Array.from(env.read('catalogGroups'), group => group.key)
+  assert.ok(keys.every(key => env.call('isCatalogGroupExpanded', key) === false))
+  env.set('selectedPluginId', JSON.stringify(['gain', '/gain.vst3']))
+  env.call('toggleCatalogGroup', keys[0])
+  assert.equal(env.call('isCatalogGroupExpanded', keys[0]), true)
+  assert.equal(env.call('isCatalogGroupExpanded', keys[1]), false)
+  env.call('toggleCatalogGroup', keys[0])
+  assert.equal(env.call('isCatalogGroupExpanded', keys[0]), false)
+  assert.equal(env.read('selectedPluginId'), JSON.stringify(['gain', '/gain.vst3']))
+  assert.equal(env.calls.length, 0)
+  assert.equal(env.writes.length, 0)
+})
+
+test('search expands matches, permits temporary collapsing and restores browsing state when cleared', async t => {
+  const env = environment(t)
+  env.set('descriptors', [
+    { id: 'gain', name: 'Gain', vendor: 'Audio Tools', path: '/gain.vst3' },
+    { id: 'echo', name: 'Echo', vendor: 'Room Audio', path: '/echo.vst3' },
+  ])
+  const [first, second] = Array.from(env.read('catalogGroups'), group => group.key)
+  env.call('toggleCatalogGroup', first)
+  env.set('librarySearch', 'VST3')
+  await flush()
+  assert.equal(env.call('isCatalogGroupExpanded', first), true)
+  assert.equal(env.call('isCatalogGroupExpanded', second), true)
+  env.call('toggleCatalogGroup', second)
+  assert.equal(env.call('isCatalogGroupExpanded', second), false)
+  env.set('librarySearch', 'Echo')
+  await flush()
+  assert.equal(env.read('catalogGroups').length, 1)
+  assert.equal(env.call('isCatalogGroupExpanded', second), true)
+  env.set('librarySearch', '  ')
+  await flush()
+  assert.equal(env.call('isCatalogGroupExpanded', first), true)
+  assert.equal(env.call('isCatalogGroupExpanded', second), false)
+  assert.equal(env.calls.length, 0)
+})
+
+test('vendor, category and format grouping retain independent expansion choices', t => {
+  const env = environment(t)
+  env.set('descriptors', [{ id: 'gain', name: 'Gain', vendor: 'Maker', path: '/gain.vst3', category: 'Eq' }])
+  const vendorKey = env.read('catalogGroups')[0].key
+  env.call('toggleCatalogGroup', vendorKey)
+  env.set('catalogGroupBy', 'category')
+  const categoryKey = env.read('catalogGroups')[0].key
+  assert.equal(env.call('isCatalogGroupExpanded', categoryKey), false)
+  env.call('toggleCatalogGroup', categoryKey)
+  env.set('catalogGroupBy', 'format')
+  const formatKey = env.read('catalogGroups')[0].key
+  assert.equal(env.call('isCatalogGroupExpanded', formatKey), false)
+  env.set('catalogGroupBy', 'vendor')
+  assert.equal(env.call('isCatalogGroupExpanded', vendorKey), true)
+  env.set('catalogGroupBy', 'category')
+  assert.equal(env.call('isCatalogGroupExpanded', categoryKey), true)
+  assert.equal(env.calls.length, 0)
 })
 
 test('effect groups and category search use reported metadata and never infer types from names', async t => {
@@ -1047,4 +1228,64 @@ test('restoring cancelled scan cache preserves source access errors that are abs
   env.controls.report = { plugins: [], failures: [{ path: '/offline-source', message: 'Access denied' }], scanned: 0, cached: 0, cancelled: true }
   await env.call('scan')
   assert.equal(env.read('scanReport').failures[0].message, 'Access denied')
+})
+
+test('favorites persist by plugin identity, survive relocation and share one merged VST2/VST3 row', async t => {
+  const env = environment(t)
+  env.set('capabilities', { enabled: true, formats: ['vst2', 'vst3'] })
+  const plugins = [
+    { ...plugin('gain2'), id: 'vst2:gain', name: 'Gain', vendor: 'Maker', format: 'vst2', path: '/Gain.dll' },
+    { ...plugin('gain3'), id: 'vst3:gain', name: 'Gain', vendor: 'Maker', format: 'vst3', path: '/Gain.vst3' },
+  ]
+  env.set('descriptors', plugins)
+  const row = env.read('catalogOptions')[0]
+  env.call('toggleFavorite', row)
+  assert.equal(env.call('isFavorite', row), true)
+  const stored = env.preferences.get('pymss-plugin-favorites-v1')
+  assert.equal(JSON.parse(stored).length, 2)
+  assert.equal(env.writes.length, 0)
+  assert.equal(env.calls.length, 0)
+  env.set('catalogGroupBy', 'favorites')
+  assert.equal(env.read('pluginOptions').length, 1)
+  assert.equal(env.read('pluginOptions')[0].plugin.format, 'vst3')
+  env.set('librarySearch', 'missing')
+  assert.equal(env.read('pluginOptions').length, 0)
+  env.set('librarySearch', '')
+  env.dispose()
+  const reopened = environment(t)
+  reopened.preferences.set('pymss-plugin-favorites-v1', stored)
+  await reopened.mounts[0]()
+  reopened.set('capabilities', { enabled: true, formats: ['vst2', 'vst3'] })
+  reopened.set('descriptors', plugins.map(plugin => ({ ...plugin, path: '/moved/' + plugin.id })))
+  reopened.set('catalogGroupBy', 'favorites')
+  assert.equal(reopened.read('pluginOptions').length, 1)
+  reopened.call('toggleFavorite', reopened.read('catalogOptions')[0])
+  assert.equal(reopened.read('pluginOptions').length, 0)
+})
+
+test('favorite edits merge the latest persisted set before a delayed storage notification', async t => {
+  const env = environment(t)
+  await env.mounts[0]()
+  const a = pluginFavoriteKey(plugin('a')), b = pluginFavoriteKey(plugin('b'))
+  env.set('descriptors', [plugin('a'), plugin('b')])
+  env.preferences.set('pymss-plugin-favorites-v1', JSON.stringify([a]))
+  env.call('toggleFavorite', env.read('catalogOptions')[1])
+  assert.deepEqual(JSON.parse(env.preferences.get('pymss-plugin-favorites-v1')), [a, b])
+  env.preferences.set('pymss-plugin-favorites-v1', JSON.stringify([b]))
+  env.windowListeners.get('storage')({ key: 'pymss-plugin-favorites-v1' })
+  assert.equal(env.call('isFavorite', env.read('catalogOptions')[0]), false)
+  assert.equal(env.call('isFavorite', env.read('catalogOptions')[1]), true)
+  env.dispose()
+  assert.equal(env.windowListeners.size, 0)
+})
+
+test('failed favorite persistence retains the displayed state and does not touch project history', t => {
+  const env = environment(t)
+  env.set('descriptors', [plugin('a')])
+  env.evaluate("localStorage.setItem = () => { throw new Error('Storage unavailable') }")
+  env.call('toggleFavorite', env.read('catalogOptions')[0])
+  assert.equal(env.call('isFavorite', env.read('catalogOptions')[0]), false)
+  assert.match(env.read('error'), /Storage unavailable/)
+  assert.equal(env.writes.length, 0)
+  assert.equal(env.calls.length, 0)
 })

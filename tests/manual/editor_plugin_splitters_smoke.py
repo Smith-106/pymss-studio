@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright
+from plugin_catalog_helpers import expand_catalog_groups
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--url', default='http://127.0.0.1:1439')
@@ -230,6 +231,7 @@ with sync_playwright() as playwright:
 
             page.evaluate("__pickedDirectory='C:/Audio/VST3'")
             panel.get_by_role('button', name='选择插件目录', exact=True).click()
+            expand_catalog_groups(panel)
             expect(panel.locator('.plugin-manager__plugin')).to_have_count(3)
             panel.locator('.plugin-manager__plugin').filter(has_text='Precision Gain').click()
             panel.locator('.plugin-manager__add-button').click()

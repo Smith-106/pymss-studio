@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 from playwright.sync_api import expect, sync_playwright
+from plugin_catalog_helpers import expand_catalog_groups
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--url', default='http://127.0.0.1:1422')
@@ -163,7 +164,28 @@ with sync_playwright() as playwright:
         expect(panel.locator('.plugin-manager__source-manager')).not_to_be_visible()
         page.wait_for_function("__vstCalls.some(c=>c.command==='plugin_host_scan_report')")
         assert page.evaluate("__vstCalls.find(c=>c.command==='plugin_host_scan_report').args.paths")==[directory]
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(2)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        first_group=panel.locator('.plugin-manager__group-heading').first
+        first_group.focus()
+        page.keyboard.press('Space')
+        expect(first_group).to_have_attribute('aria-expanded','true')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(2)
+        page.keyboard.press('Enter')
+        expect(first_group).to_have_attribute('aria-expanded','false')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        catalog_search=panel.get_by_placeholder('搜索名称、厂商、类型或格式',exact=True)
+        catalog_search.fill('Stereo Echo')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_attribute('aria-expanded','true')
+        catalog_search.fill('')
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(2)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        assert page.evaluate("__vstCalls.filter(c=>c.args?.request?.op==='play').length")==0
+        page.screenshot(path=str(args.output_dir/'plugin-catalog-collapsed.png'))
+        expand_catalog_groups(panel)
         expect(panel.locator('.plugin-manager__plugin')).to_have_count(3)
+        results.append({'scenario':'collapsed-catalog-keyboard-toggle-search-expansion-and-restore','passed':True})
         results.append({'scenario':'empty-sources-ignore-legacy-paths-cancel-picker-and-identify-after-selection','passed':True})
         loop=page.get_by_role('button',name='循环播放',exact=True)
         previous_loop=loop.get_attribute('aria-pressed')
@@ -208,6 +230,7 @@ with sync_playwright() as playwright:
         panel.get_by_text('效果类型',exact=True).click()
         expect(panel.get_by_role('radio',name='效果类型',exact=True)).to_be_checked()
         expect(panel.locator('.plugin-manager__group-heading strong')).to_have_count(3)
+        expand_catalog_groups(panel)
         assert sorted(panel.locator('.plugin-manager__group-heading strong').all_text_contents())==sorted(['均衡与滤波','延迟','乐器'])
         expect(panel.locator('.plugin-manager__plugin').filter(has_text='Precision Gain')).to_have_attribute('aria-pressed','true')
         search.fill('均衡')
@@ -232,12 +255,12 @@ with sync_playwright() as playwright:
         expect(panel.locator('.plugin-manager__plugin').filter(has_text='Keyboard Instrument')).to_be_disabled()
         search.fill('')
         catalog_item=panel.locator('.plugin-manager__plugin').filter(has_text='Stereo Echo')
-        catalog_item.press('Space')
+        catalog_item.press('Enter')
         expect(catalog_item).to_have_attribute('aria-pressed','true')
         assert page.evaluate("__vstCalls.filter(c=>c.args?.request?.op==='play').length")==0
         results.append({'scenario':'searchable-catalog-and-keyboard-selection','passed':True})
         choose_plugin('Precision Gain')
-        panel.locator('.plugin-manager__add-button').click()
+        panel.locator('.plugin-manager__plugin').filter(has_text='Precision Gain').dblclick()
         expect(panel.locator('.plugin-panel__slot')).to_have_count(1)
         page.wait_for_function("__editor.session.tracks[0].pluginChain.length===1")
         expect(panel.locator('.plugin-manager__feedback')).to_contain_text('已将“Precision Gain”添加到“人声”')
@@ -395,6 +418,8 @@ with sync_playwright() as playwright:
           {id:'gain',name:'Gain',vendor:'Vendor',path:'/first/gain.vst3',format:'vst3'},
           {id:'gain',name:'Gain',vendor:'Vendor',path:'/second/gain.vst3',format:'vst3'}];""")
         panel.get_by_role('button',name='识别插件',exact=True).click()
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(1)
+        expand_catalog_groups(panel)
         expect(panel.locator('.plugin-manager__plugin')).to_have_count(6)
         for variant in ['AUv2','AUv3','VST2 Shell']:
             expect(panel.locator('.plugin-manager__catalog .plugin-manager__format').filter(has_text=variant).first).to_be_visible()
@@ -402,15 +427,83 @@ with sync_playwright() as playwright:
         for identity in ['vst2:one','vst2:two','/first/gain.vst3','/second/gain.vst3']:
             expect(identities.filter(has_text=identity)).to_be_visible()
         results.append({'scenario':'visible-au-shell-and-duplicate-plugin-identities','passed':True})
+        page.evaluate("""__catalogOverride=[
+          {id:'vst2:serum',name:'SerumFX',vendor:'Xfer Records',path:'C:/VST2/SerumFX.dll',format:'vst2',isInstrument:false},
+          {id:'vst3:serum',name:'SerumFX',vendor:'Xfer Records',path:'C:/VST3/SerumFX.vst3',format:'vst3',isInstrument:false}]""")
+        panel.get_by_role('button',name='识别插件',exact=True).click()
+        expect(panel.locator('.plugin-manager__group-heading strong')).to_have_text(['Xfer Records'])
+        expand_catalog_groups(panel)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
+        expect(panel.locator('.plugin-manager__library-count')).to_have_text('1')
+        row=panel.locator('.plugin-manager__plugin')
+        expect(panel.locator('.plugin-manager__plugin-row .plugin-manager__format')).to_have_text('VST3 / VST2')
+        row.click()
+        format_picker=panel.locator('.plugin-manager__format-choice .n-select')
+        expect(format_picker).to_contain_text('VST3')
+        page.screenshot(path=str(args.output_dir/'plugin-merged-formats-default-vst3.png'))
+        count_before_double_click=page.evaluate('__editor.session.pluginChain.length')
+        row.dblclick()
+        page.wait_for_function("__editor.session.pluginChain.at(-1)?.pluginId==='vst3:serum'")
+        assert page.evaluate('__editor.session.pluginChain.length')==count_before_double_click+1
+        assert page.evaluate('__editor.session.pluginChain.at(-1).format')=='vst3'
+        assert page.evaluate('__editor.session.pluginChain.at(-1).path')=='C:/VST3/SerumFX.vst3'
+        format_picker.click()
+        page.locator('.n-base-select-option:visible').filter(has_text='VST2').click()
+        expect(format_picker).to_contain_text('VST2')
+        expect(row).to_have_attribute('aria-pressed','true')
+        count_before_double_click=page.evaluate('__editor.session.pluginChain.length')
+        row.dblclick()
+        page.wait_for_function("__editor.session.pluginChain.at(-1)?.pluginId==='vst2:serum'")
+        assert page.evaluate('__editor.session.pluginChain.length')==count_before_double_click+1
+        assert page.evaluate('__editor.session.pluginChain.at(-1).format')=='vst2'
+        assert page.evaluate('__editor.session.pluginChain.at(-1).path')=='C:/VST2/SerumFX.dll'
+        page.screenshot(path=str(args.output_dir/'plugin-merged-formats-explicit-vst2.png'))
+        results.append({'scenario':'double-click-adds-once-using-default-vst3-or-explicit-vst2','passed':True})
+        page.evaluate("""__catalogOverride=Array.from({length:600},(_,index)=>({
+          id:`catalog-${index}`,name:`Catalog Effect ${String(index+1).padStart(4,'0')}`,
+          vendor:`Vendor ${index%40+1}`,path:`C:/VST3/Catalog${index}.vst3`,format:'vst3',
+          isInstrument:false,category:'Reverb',subCategories:['Fx','Reverb']}))""")
+        panel.get_by_role('button',name='识别插件',exact=True).click()
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(40)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        search.fill('Catalog Effect 0599')
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(1)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
+        expect(panel.locator('.plugin-manager__plugin')).to_contain_text('Catalog Effect 0599')
+        search.fill('')
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(40)
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        panel.locator('.plugin-manager__group-heading').first.click()
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(15)
+        page.screenshot(path=str(args.output_dir/'plugin-catalog-large-library.png'))
+        results.append({'scenario':'600-effects-in-40-collapsed-groups-search-and-render-only-open-group','passed':True})
+        panel.locator('.plugin-manager__plugin').filter(has_text='Catalog Effect 0001').click()
+        expect(panel.locator('.plugin-manager__add-button')).to_be_enabled()
+        project_before_refresh=page.evaluate('JSON.stringify(__editor.session)')
+        page.evaluate("""__catalogOverride=__catalogOverride.filter(plugin=>!['catalog-0','catalog-598'].includes(plugin.id)).concat([
+          {id:'new-install',name:'Newly Installed Effect',vendor:'New Vendor',path:'C:/VST3/New.vst3',format:'vst3',isInstrument:false}])""")
+        panel.get_by_role('button',name='识别插件',exact=True).click()
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(41)
+        expect(panel.locator('.plugin-manager__add-button')).to_be_disabled()
+        assert page.evaluate('JSON.stringify(__editor.session)')==project_before_refresh
+        assert page.evaluate("__vstCalls.filter(call=>call.command==='plugin_host_scan_report').at(-1).args.force") is False
+        search.fill('Catalog Effect 0001')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
+        search.fill('Newly Installed Effect')
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(1)
+        search.fill('')
+        results.append({'scenario':'refresh-removes-old-library-entries-adds-new-plugins-and-retains-project-inserts','passed':True})
+        visible_cached_rows = panel.locator('.plugin-manager__plugin').count()
         page.evaluate('__scanDelay=1000')
         panel.get_by_role('button',name='识别插件',exact=True).click()
         page.evaluate("() => {__editor.session={...__editor.session,id:'next-project',pluginChain:[],tracks:[],sources:[]}}")
         expect(panel).not_to_be_visible()
         sidebar.get_by_role('button',name='音频插件',exact=True).click()
         expect(panel.locator('.plugin-manager__body')).to_have_attribute('aria-busy','false')
-        expect(panel.locator('.plugin-manager__plugin')).to_have_count(0)
-        expect(panel.locator('.plugin-manager__add-button')).to_have_count(0)
-        results.append({'scenario':'late-scan-cannot-populate-another-project','passed':True})
+        expect(panel.locator('.plugin-manager__plugin')).to_have_count(visible_cached_rows)
+        expect(panel.locator('.plugin-manager__add-button')).to_be_disabled()
+        expect(panel.locator('.plugin-manager__group-heading')).to_have_count(41)
+        results.append({'scenario':'project-switch-retains-library-and-discards-late-scan','passed':True})
         assert not errors,errors
         results.append({'scenario':'scan-add-reorder-bypass-remove-native-editor-master-loading-error-recovery','pageErrors':errors})
         context.close()

@@ -2,13 +2,13 @@
 import { computed, nextTick, onMounted, onScopeDispose, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
-import { AddOutline, ArrowDownOutline, ArrowUpOutline, CloseOutline, FolderOpenOutline, OpenOutline, OptionsOutline, RefreshOutline, SearchOutline, TrashOutline } from '@vicons/ionicons5'
+import { AddOutline, ArrowDownOutline, ArrowUpOutline, ChevronForwardOutline, CloseOutline, FolderOpenOutline, OpenOutline, OptionsOutline, RefreshOutline, SearchOutline, Star, StarOutline, TrashOutline } from '@vicons/ionicons5'
 import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import { usePluginManagerLayout } from '@/composables/usePluginManagerLayout'
 import { usePluginManagerWindow } from '@/composables/usePluginManagerWindow'
 import type { EditorSession } from '@/types/editor'
-import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
+import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginFavoriteKey, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
 import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
@@ -34,7 +34,10 @@ const targetMenuOpen = ref(false)
 const sourcesOpen = ref(false)
 const sourceButton = ref<{ $el: HTMLElement } | null>(null)
 const librarySearch = ref('')
-const catalogGroupBy = ref<'vendor' | 'category' | 'format'>('vendor')
+const catalogGroupBy = ref<'vendor' | 'category' | 'format' | 'favorites'>('vendor')
+const favorites = ref(new Set<string>())
+const expandedCatalogGroups = ref(new Set<string>())
+const collapsedSearchGroups = ref(new Set<string>())
 const feedback = ref('')
 const error = ref('')
 const dialogPending = ref(false)
@@ -51,6 +54,7 @@ const opened = ref<string[]>([])
 const parameterSlotId = ref<string | null>(null)
 // A stored empty list is an explicit choice; seed standard paths only for new preferences.
 const STORAGE_KEY = 'pymss-plugin-library-directories-v1'
+const FAVORITES_KEY = 'pymss-plugin-favorites-v1'
 let libraryReady = false
 let catalogRequest = 0
 let scanGeneration = 0
@@ -100,28 +104,40 @@ const categoryLabels = computed(() => ({
   offline: t('editor.plugins.categories.offline'), generator: t('editor.plugins.categories.generator'),
   tools: t('editor.plugins.categories.tools'), other: t('editor.plugins.categories.other'),
 }))
-const pluginOptions = computed(() => {
+const catalogOptions = computed(() => {
   const plugins = descriptors.value.filter(plugin => !relocatingSlot.value || pluginSlotMatchesDescriptor(relocatingSlot.value, plugin))
   const labels = pluginDescriptorLabels(plugins, Boolean(relocatingSlot.value))
-  const query = librarySearch.value.trim().toLocaleLowerCase()
-  return plugins.map((plugin, index) => {
-    const variant = pluginDescriptorVariant(plugin)
-    const category = pluginDescriptorCategory(plugin)
-    const baseLabel = `${plugin.name} · ${variant}${plugin.vendor ? ` · ${plugin.vendor}` : ''}`
-    return { label: labels[index], value: descriptorKey(plugin), plugin, variant, category,
-      detail: labels[index].startsWith(`${baseLabel} · `) ? labels[index].slice(baseLabel.length + 3) : '',
-      disabled: plugin.isInstrument === true || !capabilities.value?.formats.includes(pluginDescriptorFormat(plugin)) }
+  const descriptorLabels = new Map(plugins.map((plugin, index) => [plugin, labels[index]]))
+  return pluginDescriptorFamilies(plugins).map(family => {
+    const variants = family.map(plugin => {
+      const variant = pluginDescriptorVariant(plugin)
+      const category = pluginDescriptorCategory(plugin)
+      const label = descriptorLabels.get(plugin)!
+      const baseLabel = `${plugin.name} · ${variant}${plugin.vendor ? ` · ${plugin.vendor}` : ''}`
+      return { label, value: descriptorKey(plugin), plugin, variant, category,
+        detail: label.startsWith(`${baseLabel} · `) ? label.slice(baseLabel.length + 3) : '',
+        disabled: plugin.isInstrument === true || !capabilities.value?.formats.includes(pluginDescriptorFormat(plugin)) }
+    })
+    const preferred = variants.find(variant => !variant.disabled) || variants[0]!
+    const formatLabel = variants.map(variant => variant.variant).join(' / ')
+    return { ...preferred, variants, formatLabel,
+      label: variants.length > 1 ? `${preferred.plugin.name} · ${formatLabel} · ${preferred.plugin.vendor}` : preferred.label }
   })
-    .filter(option => !query || `${option.label} ${pluginDescriptorFormat(option.plugin)} ${option.category} ${categoryLabels.value[option.category]} ${option.plugin.subCategories?.join(' ') || ''}`.toLocaleLowerCase().includes(query))
+})
+const pluginOptions = computed(() => {
+  const query = librarySearch.value.trim().toLocaleLowerCase()
+  return catalogOptions.value.filter(option => (catalogGroupBy.value !== 'favorites' || isFavorite(option))
+    && (!query || option.variants.some(variant =>
+      `${variant.label} ${pluginDescriptorFormat(variant.plugin)} ${variant.category} ${categoryLabels.value[variant.category]} ${variant.plugin.subCategories?.join(' ') || ''}`.toLocaleLowerCase().includes(query))))
 })
 const catalogGroups = computed(() => {
   const groups = new Map<string, { key: string; label: string; unknown: boolean; plugins: typeof pluginOptions.value }>()
   const collator = new Intl.Collator(locale.value, { numeric: true, sensitivity: 'base' })
   for (const option of pluginOptions.value) {
     const vendor = option.plugin.vendor?.trim() || ''
-    const key = catalogGroupBy.value === 'vendor' ? `vendor:${vendor.toLowerCase()}`
+    const key = catalogGroupBy.value === 'favorites' ? 'favorites' : catalogGroupBy.value === 'vendor' ? `vendor:${vendor.toLowerCase()}`
       : catalogGroupBy.value === 'category' ? `category:${option.category}` : `format:${option.variant}`
-    const label = catalogGroupBy.value === 'vendor' ? vendor || t('editor.plugins.unknownVendor')
+    const label = catalogGroupBy.value === 'favorites' ? t('editor.plugins.favorites') : catalogGroupBy.value === 'vendor' ? vendor || t('editor.plugins.unknownVendor')
       : catalogGroupBy.value === 'category' ? categoryLabels.value[option.category] : option.variant
     const unknown = catalogGroupBy.value === 'vendor' ? !vendor : catalogGroupBy.value === 'category' && option.category === 'other'
     if (!groups.has(key)) groups.set(key, { key, label, unknown, plugins: [] })
@@ -130,7 +146,61 @@ const catalogGroups = computed(() => {
   for (const group of groups.values()) group.plugins.sort((a, b) => collator.compare(a.plugin.name, b.plugin.name) || collator.compare(a.variant, b.variant) || collator.compare(a.plugin.path, b.plugin.path))
   return [...groups.values()].sort((a, b) => Number(a.unknown) - Number(b.unknown) || collator.compare(a.label, b.label))
 })
+function isFavorite(option: (typeof catalogOptions.value)[number]) {
+  return option.variants.some(variant => favorites.value.has(pluginFavoriteKey(variant.plugin)))
+}
+function readFavorites() {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(FAVORITES_KEY) || '[]')
+    return new Set(Array.isArray(stored)
+      ? stored.filter((key): key is string => typeof key === 'string' && key.length <= 1024).slice(0, 4096) : [])
+  } catch { return new Set<string>() }
+}
+function restoreFavorites() { favorites.value = readFavorites() }
+function onFavoritesStorage(event: StorageEvent) {
+  if (event.key === FAVORITES_KEY || event.key === null) restoreFavorites()
+}
+function toggleFavorite(option: (typeof catalogOptions.value)[number]) {
+  const next = readFavorites()
+  const remove = isFavorite(option)
+  for (const variant of option.variants) {
+    const key = pluginFavoriteKey(variant.plugin)
+    if (remove) next.delete(key)
+    else next.add(key)
+  }
+  try {
+    localStorage.setItem(FAVORITES_KEY, JSON.stringify([...next]))
+    favorites.value = next
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+function isCatalogGroupExpanded(key: string) {
+  return librarySearch.value.trim() ? !collapsedSearchGroups.value.has(key) : expandedCatalogGroups.value.has(key)
+}
+function toggleCatalogGroup(key: string) {
+  const groups = librarySearch.value.trim() ? collapsedSearchGroups.value : expandedCatalogGroups.value
+  if (groups.has(key)) groups.delete(key)
+  else groups.add(key)
+}
+watch(librarySearch, () => collapsedSearchGroups.value.clear())
 const selectedDescriptor = computed(() => descriptors.value.find(plugin => descriptorKey(plugin) === selectedPluginId.value))
+const selectedFormatOptions = computed(() => pluginOptions.value.find(option => isCatalogPluginSelected(option))?.variants.map(variant => ({
+  label: variant.variant, value: variant.value, disabled: variant.disabled,
+})) || [])
+function isCatalogPluginSelected(option: (typeof catalogOptions.value)[number]) {
+  return option.variants.some(variant => variant.value === selectedPluginId.value)
+}
+function selectCatalogPlugin(option: (typeof catalogOptions.value)[number]) {
+  if (!isCatalogPluginSelected(option)) selectedPluginId.value = option.value
+}
+function selectPluginFormat(value: string) {
+  if (!busy.value && selectedFormatOptions.value.some(option => option.value === value && !option.disabled)) selectedPluginId.value = value
+}
+async function activateCatalogPlugin(option: (typeof catalogOptions.value)[number]) {
+  if (busy.value || option.disabled) return
+  selectCatalogPlugin(option)
+  if (relocatingSlot.value) await relocatePlugin()
+  else await addPlugin()
+}
 const stopObservingSession = observePluginSession(host => {
   dialogPending.value = host?.project === props.session && Boolean(host.interactionRequired)
   if (!dialogPending.value && dialogOperationError) { error.value = ''; dialogOperationError = false }
@@ -148,9 +218,11 @@ watch(target, value => {
 })
 watch(() => chain.value.map(slot => slot.id), ids => { if (!ids.includes(parameterSlotId.value || '')) parameterSlotId.value = null })
 watch(directories, () => { invalidateCatalog(); if (libraryReady) void restoreCatalog() }, { deep: true, flush: 'sync' })
-watch(pluginOptions, options => { if (!options.some(option => option.value === selectedPluginId.value && !option.disabled)) selectedPluginId.value = null })
+watch(pluginOptions, options => { if (!options.some(option => option.variants.some(variant => variant.value === selectedPluginId.value && !variant.disabled))) selectedPluginId.value = null })
 onMounted(async () => {
   window.addEventListener('resize', dismissManagerPopovers)
+  window.addEventListener('storage', onFavoritesStorage)
+  restoreFavorites()
   capabilities.value = await pluginHostCapabilities()
   if (disposed) return
   let stored: unknown
@@ -162,7 +234,7 @@ onMounted(async () => {
   libraryReady = true
   await Promise.all([restoreCatalog(), capabilities.value?.scanControl ? refreshBlacklist() : Promise.resolve()])
 })
-onScopeDispose(() => { window.removeEventListener('resize', dismissManagerPopovers) })
+onScopeDispose(() => { window.removeEventListener('resize', dismissManagerPopovers); window.removeEventListener('storage', onFavoritesStorage) })
 onScopeDispose(() => { disposed = true; cancelActiveScan(); scanGeneration++; catalogRequest++; blacklistGeneration++ })
 
 function invalidateCatalog() {
@@ -596,7 +668,7 @@ async function toggleEditor(slotId: string) {
         <div ref="managerBody" class="plugin-manager__body" :aria-busy="busy">
           <section class="plugin-manager__library" :class="{ 'plugin-manager__library--scanning': scanning }" :aria-label="t('editor.plugins.library')">
             <div class="plugin-manager__section-heading">
-              <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count" :title="t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: scanReport.plugins.length })">{{ descriptors.length }}</span></div>
+              <div><strong>{{ t('editor.plugins.library') }}</strong><span v-if="scanReport" class="plugin-manager__library-count" :title="t('editor.plugins.scanSummary', { scanned: scanReport.scanned, cached: scanReport.cached, found: catalogOptions.length })">{{ catalogOptions.length }}</span></div>
               <div class="plugin-manager__library-actions">
                 <n-popover v-model:show="sourcesOpen" trigger="click" placement="bottom-start" :show-arrow="false" :to="managerCard?.$el" raw>
                   <template #trigger><n-button ref="sourceButton" size="tiny" quaternary :aria-expanded="sourcesOpen" :aria-label="t('editor.plugins.manageSources')"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('editor.plugins.sources') }}<span v-if="directories.length" class="plugin-manager__source-count">{{ directories.length }}</span></n-button></template>
@@ -650,8 +722,6 @@ async function toggleEditor(slotId: string) {
               <details class="plugin-manager__scan-details">
                 <summary>{{ t('editor.plugins.scanDetails') }}</summary>
                 <p v-if="scanStatus?.currentPath" class="plugin-panel__hint">{{ scanStatus.currentPath }}</p>
-                <p class="plugin-panel__hint">{{ t('editor.plugins.scanTimeoutHint') }}</p>
-                <p class="plugin-panel__hint">{{ t(scanStatus?.currentPath === 'au:system' ? 'editor.plugins.scanAudioUnitsHint' : 'editor.plugins.scanPackageHint') }}</p>
               </details>
             </div>
             <p v-if="scanFeedback" class="plugin-manager__scan-feedback" :title="scanFeedback" role="status">{{ scanFeedback }}</p>
@@ -664,26 +734,43 @@ async function toggleEditor(slotId: string) {
                 <n-radio-button value="vendor">{{ t('editor.plugins.groupVendor') }}</n-radio-button>
                 <n-radio-button value="category">{{ t('editor.plugins.groupCategory') }}</n-radio-button>
                 <n-radio-button value="format">{{ t('editor.plugins.groupFormat') }}</n-radio-button>
+                <n-radio-button value="favorites">{{ t('editor.plugins.favorites') }}</n-radio-button>
               </n-radio-group>
             </div>
             <div class="plugin-manager__catalog" :aria-label="t('editor.plugins.selectPlugin')" :aria-busy="scanning || catalogLoading">
               <section v-for="group in catalogGroups" :key="group.key" class="plugin-manager__group" :aria-label="group.label">
-              <div class="plugin-manager__group-heading"><strong>{{ group.label }}</strong><span>{{ group.plugins.length }}</span></div>
-              <button v-for="option in group.plugins" :key="option.value" type="button" class="plugin-manager__plugin" :class="{ 'plugin-manager__plugin--selected': selectedPluginId === option.value }" :disabled="busy || option.disabled" :aria-pressed="selectedPluginId === option.value" :aria-label="option.label" :title="option.label" @click="selectedPluginId = option.value">
-                <span class="plugin-manager__plugin-info"><strong>{{ option.plugin.name }}</strong><small>{{ catalogGroupBy === 'vendor' ? categoryLabels[option.category] : option.plugin.vendor || t('editor.plugins.unknownVendor') }}<template v-if="option.disabled"> · {{ t('editor.plugins.unsupportedPlugin') }}</template></small><small v-if="option.detail" class="plugin-manager__plugin-identity">{{ option.detail }}</small></span>
-                <span class="plugin-manager__format">{{ option.variant }}</span>
+              <button v-if="catalogGroupBy !== 'favorites'" type="button" class="plugin-manager__group-heading" :aria-expanded="isCatalogGroupExpanded(group.key)" :title="group.label" @click="toggleCatalogGroup(group.key)" @keydown.space.stop @keydown.enter.stop>
+                <n-icon class="plugin-manager__group-chevron" :component="ChevronForwardOutline" :size="12" aria-hidden="true" /><strong>{{ group.label }}</strong><span>{{ group.plugins.length }}</span>
               </button>
+              <div v-if="catalogGroupBy === 'favorites' || isCatalogGroupExpanded(group.key)" class="plugin-manager__group-plugins" :class="{ 'plugin-manager__group-plugins--favorites': catalogGroupBy === 'favorites' }">
+              <div v-for="option in group.plugins" :key="option.value" class="plugin-manager__plugin-row" :class="{ 'plugin-manager__plugin-row--selected': isCatalogPluginSelected(option) }">
+              <button type="button" class="plugin-manager__plugin" data-editor-transport :class="{ 'plugin-manager__plugin--selected': isCatalogPluginSelected(option) }" :disabled="busy || option.disabled" :aria-pressed="isCatalogPluginSelected(option)" :aria-label="option.label" :title="option.label" @click="selectCatalogPlugin(option)" @dblclick.stop="activateCatalogPlugin(option)">
+                <span class="plugin-manager__plugin-info"><strong>{{ option.plugin.name }}</strong><small>{{ catalogGroupBy === 'vendor' ? categoryLabels[option.category] : option.plugin.vendor || t('editor.plugins.unknownVendor') }}<template v-if="option.disabled"> · {{ t('editor.plugins.unsupportedPlugin') }}</template></small><small v-if="option.detail" class="plugin-manager__plugin-identity">{{ option.detail }}</small></span>
+              </button>
+              <button type="button" class="plugin-manager__favorite" :class="{ 'plugin-manager__favorite--active': isFavorite(option) }"
+                :aria-pressed="isFavorite(option)" :title="t(isFavorite(option) ? 'editor.plugins.removeFavorite' : 'editor.plugins.addFavorite')"
+                :aria-label="t(isFavorite(option) ? 'editor.plugins.removeFavoriteNamed' : 'editor.plugins.addFavoriteNamed', { name: option.plugin.name })"
+                @click.stop="toggleFavorite(option)" @dblclick.stop @keydown.space.stop @keydown.enter.stop>
+                <n-icon :component="isFavorite(option) ? Star : StarOutline" :size="16" aria-hidden="true" />
+              </button>
+              <span class="plugin-manager__format">{{ option.formatLabel }}</span>
+              </div>
+              </div>
               </section>
               <div v-if="!pluginOptions.length" class="plugin-manager__empty plugin-manager__empty--library">
                 <n-icon :component="SearchOutline" :size="26" />
-                <strong>{{ catalogLoading ? t('editor.plugins.restoringCatalog') : scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
-                <p>{{ !directories.length ? t('editor.plugins.supportedFormats', { formats: capabilities.formats.map(format => format.toUpperCase()).join(' / ') }) : librarySearch.trim() ? t('editor.plugins.adjustSearch') : t('editor.plugins.checkLocations') }}</p>
+                <strong>{{ catalogLoading ? t('editor.plugins.restoringCatalog') : scanning ? t('editor.plugins.recognizing') : !directories.length ? t('editor.plugins.noDirectorySelected') : librarySearch.trim() ? t('editor.plugins.noPluginMatches') : catalogGroupBy === 'favorites' ? t('editor.plugins.noFavorites') : scanReport ? t('editor.plugins.noPluginsFound') : t('editor.plugins.scanToDiscover') }}</strong>
+                <p>{{ !directories.length ? t('editor.plugins.supportedFormats', { formats: capabilities.formats.map(format => format.toUpperCase()).join(' / ') }) : librarySearch.trim() ? t('editor.plugins.adjustSearch') : catalogGroupBy === 'favorites' ? t('editor.plugins.favoritesHint') : t('editor.plugins.checkLocations') }}</p>
                 <n-button v-if="!directories.length" size="small" secondary :disabled="busy" :title="t('editor.plugins.chooseDirectoryHint')" @click="browseDirectory"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('editor.plugins.chooseDirectory') }}</n-button>
                 <n-button v-if="!directories.length && canChooseAudioUnits" size="small" text :disabled="busy" @click="chooseAudioUnits">{{ t('editor.plugins.chooseAudioUnits') }}</n-button>
               </div>
             </div>
             <div v-if="scanReport && descriptors.length" class="plugin-manager__library-footer">
               <div class="plugin-manager__selection" :title="selectedDescriptor?.path"><strong>{{ selectedDescriptor?.name || t('editor.plugins.selectPlugin') }}</strong><span>{{ selectedDescriptor?.path || t('editor.plugins.selectionHint') }}</span></div>
+              <div v-if="selectedFormatOptions.length > 1" class="plugin-manager__format-choice">
+                <span>{{ t('editor.plugins.loadFormat') }}</span>
+                <n-select size="small" :value="selectedPluginId" :options="selectedFormatOptions" :disabled="busy" :aria-label="t('editor.plugins.loadFormat')" :to="managerCard?.$el" @update:value="selectPluginFormat" />
+              </div>
               <n-button v-if="relocatingSlot" type="primary" block :disabled="busy || !selectedPluginId" @click="relocatePlugin">{{ t('editor.plugins.applyLocation') }}</n-button>
               <n-button v-else class="plugin-manager__add-button" type="primary" block :aria-label="t('editor.plugins.addPlugin', { name: targetLabel })" :disabled="busy || !selectedPluginId" @click="addPlugin"><template #icon><n-icon :component="AddOutline" /></template>{{ t('editor.plugins.addSelected') }}</n-button>
             </div>
@@ -917,14 +1004,25 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__group-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
 .plugin-manager__group-controls :deep(.n-radio-group) { display: flex; width: 100%; }
 .plugin-manager__group-controls :deep(.n-radio-button) { flex: 1; padding: 0 5px; text-align: center; font-size: 11px; }
-.plugin-manager__group { padding-top: 2px; }
-.plugin-manager__group + .plugin-manager__group { margin-top: 10px; }
-.plugin-manager__group-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 10px 8px; color: var(--on-surface-muted); }
-.plugin-manager__group-heading > strong { min-width: 0; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-manager__group { min-width: 0; }
+.plugin-manager__group + .plugin-manager__group { margin-top: 3px; }
+.plugin-manager__group-heading { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; min-height: 30px; padding: 6px 8px; border: 0; border-radius: 5px; background: transparent; color: var(--on-surface-muted); font: inherit; text-align: left; cursor: pointer; }
+.plugin-manager__group-heading:hover { background: var(--surface-2); color: var(--on-surface); }
+.plugin-manager__group-heading:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.plugin-manager__group-chevron { flex-shrink: 0; transition: transform 120ms; }
+.plugin-manager__group-heading[aria-expanded="true"] > .plugin-manager__group-chevron { transform: rotate(90deg); }
+.plugin-manager__group-heading > strong { min-width: 0; flex: 1; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__group-heading > span { font-size: 10px; font-variant-numeric: tabular-nums; }
-.plugin-manager__plugin { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; margin: 0 0 3px; padding: 8px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; transition: background 120ms, border-color 120ms; }
-.plugin-manager__plugin:hover:not(:disabled) { background: var(--surface-2); }
-.plugin-manager__plugin--selected, .plugin-manager__plugin--selected:hover:not(:disabled) { background: var(--primary-softer); border-color: var(--primary-border); }
+.plugin-manager__group-plugins { min-width: 0; margin: 3px 0 5px 13px; padding-left: 5px; border-left: 1px solid color-mix(in srgb, var(--outline) 50%, transparent); }
+.plugin-manager__plugin-row { display: flex; align-items: center; gap: 4px; min-width: 0; margin-bottom: 3px; padding-right: 8px; border: 1px solid transparent; border-radius: 6px; transition: background 120ms, border-color 120ms; }
+.plugin-manager__plugin-row:hover { background: var(--surface-2); }
+.plugin-manager__plugin-row--selected, .plugin-manager__plugin-row--selected:hover { background: var(--primary-softer); border-color: var(--primary-border); }
+.plugin-manager__plugin { display: flex; flex: 1; align-items: center; min-width: 0; padding: 8px; border: 0; border-radius: 5px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; }
+.plugin-manager__favorite { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; flex: none; border: 0; border-radius: 4px; background: transparent; color: var(--on-surface-muted); cursor: pointer; }
+.plugin-manager__favorite:hover { background: var(--surface-2); color: var(--primary); }
+.plugin-manager__favorite--active { color: var(--primary); }
+.plugin-manager__favorite:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.plugin-manager__group-plugins--favorites { margin-left: 0; padding-left: 0; border-left: 0; }
 .plugin-manager__plugin:disabled { cursor: default; opacity: .5; }
 .plugin-manager__plugin-info { display: grid; gap: 3px; min-width: 0; flex: 1; }
 .plugin-manager__plugin-info > strong { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -937,6 +1035,9 @@ async function toggleEditor(slotId: string) {
 .plugin-manager__selection { display: grid; gap: 3px; min-width: 0; }
 .plugin-manager__selection > strong { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugin-manager__selection > span { font-size: 11px; color: var(--on-surface-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-manager__format-choice { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.plugin-manager__format-choice > span { flex-shrink: 0; color: var(--on-surface-muted); font-size: 11px; }
+.plugin-manager__format-choice :deep(.n-select) { flex: 1; min-width: 0; }
 @container plugin-inserts (max-width: 145px) {
   .plugin-panel__header { gap: 4px; }
   .plugin-insert__tools { padding-left: 0; }

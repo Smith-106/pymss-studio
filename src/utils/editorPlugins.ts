@@ -29,6 +29,11 @@ export function pluginDescriptorFormat(descriptor: PluginDescriptorIdentity) {
   return descriptor.format || (descriptor.id.startsWith('vst2:') ? 'vst2' : pluginAudioUnitVersion(descriptor.id) ? 'au' : 'vst3')
 }
 
+/** Favorites follow plugin identity across relocation; project slots still retain their paths. */
+export function pluginFavoriteKey(descriptor: PluginDescriptorIdentity) {
+  return JSON.stringify([pluginDescriptorFormat(descriptor), descriptor.id])
+}
+
 export function pluginDescriptorVariant(descriptor: PluginDescriptorIdentity) {
   const format = pluginDescriptorFormat(descriptor)
   if (format === 'au') {
@@ -36,6 +41,42 @@ export function pluginDescriptorVariant(descriptor: PluginDescriptorIdentity) {
     return version ? `AUv${version}` : 'AU'
   }
   return format === 'vst2' && descriptor.isShellChild ? 'VST2 Shell' : format.toUpperCase()
+}
+
+/** Group only unambiguous VST2/VST3 pairs for display; their states remain format-specific. */
+export function pluginDescriptorFamilies<T extends PluginDescriptorIdentity & { name: string; vendor?: string; isInstrument?: boolean | null }>(descriptors: readonly T[]): T[][] {
+  const normalize = (value: string) => value.trim().replace(/\s+/g, ' ').toLowerCase()
+  const familyKey = (plugin: T) => {
+    const format = pluginDescriptorFormat(plugin)
+    const vendor = normalize(plugin.vendor || '')
+    const name = normalize(plugin.name)
+    return vendor && name && (format === 'vst2' || format === 'vst3')
+      ? JSON.stringify([vendor, name, plugin.isInstrument === true]) : null
+  }
+  const buckets = new Map<string, T[]>()
+  for (const plugin of descriptors) {
+    const key = familyKey(plugin)
+    if (key) {
+      if (!buckets.has(key)) buckets.set(key, [])
+      buckets.get(key)!.push(plugin)
+    }
+  }
+  const pairs = new Map<string, T[]>()
+  for (const [key, plugins] of buckets) {
+    if (plugins.length === 2 && pluginDescriptorFormat(plugins[0]) !== pluginDescriptorFormat(plugins[1])) {
+      pairs.set(key, pluginDescriptorFormat(plugins[0]) === 'vst3' ? [...plugins] : [plugins[1], plugins[0]])
+    }
+  }
+  const emitted = new Set<string>()
+  const families: T[][] = []
+  for (const plugin of descriptors) {
+    const key = familyKey(plugin)
+    const pair = key && pairs.get(key)
+    if (pair) {
+      if (!emitted.has(key!)) { emitted.add(key!); families.push(pair) }
+    } else families.push([plugin])
+  }
+  return families
 }
 
 export type PluginCatalogCategory = 'eq' | 'dynamics' | 'pitch' | 'reverb' | 'delay' | 'modulation'

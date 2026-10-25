@@ -1,13 +1,52 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { EditorSession } from '../src/types/editor.ts'
-import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorCategory, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
+import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 function project(): EditorSession {
   return { id: 'project', name: 'Project', masterVolume: 0.6, masterPan: -0.4,
     tracks: [], sources: [], createdAt: 1, updatedAt: 1 }
 }
 const slot = { id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false, state: 'sha256:old' }
+
+test('library families merge one matching VST2/VST3 pair and prefer VST3 without rewriting descriptors', () => {
+  const legacy = { id: 'vst2:gain', name: ' SerumFX ', vendor: ' Xfer Records ', path: '/effect.dll' }
+  const modern = { id: 'vst3:gain', name: 'serumfx', vendor: 'xfer  records', path: '/effect.vst3' }
+  const input = [legacy, modern]
+  const families = pluginDescriptorFamilies(input)
+  assert.equal(families.length, 1)
+  assert.deepEqual(families[0], [modern, legacy])
+  assert.equal(families[0][0], modern)
+  assert.deepEqual(input, [legacy, modern])
+})
+
+test('family matching preserves vendor, channel variant and known instrument boundaries', () => {
+  const legacy = { id: 'vst2:gain', name: 'Gain', vendor: 'Maker', path: '/effect.dll' }
+  for (const modern of [
+    { ...legacy, id: 'vst3:gain', vendor: 'Other Maker' },
+    { ...legacy, id: 'vst3:gain', name: 'Gain Stereo' },
+    { ...legacy, id: 'vst3:gain', isInstrument: true },
+  ]) assert.equal(pluginDescriptorFamilies([legacy, modern]).length, 2)
+  assert.equal(pluginDescriptorFamilies([{ ...legacy, vendor: '' }, { ...legacy, id: 'vst3:gain', vendor: '' }]).length, 2)
+})
+
+test('ambiguous same-format installations and same-name shell children remain individual choices', () => {
+  const modern = { id: 'vst3:gain', name: 'Gain', vendor: 'Maker', path: '/effect.vst3' }
+  const legacy = { ...modern, id: 'vst2:gain', path: '/effect.dll' }
+  const duplicate = { ...modern, path: '/other/effect.vst3' }
+  assert.deepEqual(pluginDescriptorFamilies([legacy, modern, duplicate]), [[legacy], [modern], [duplicate]])
+  const first = { ...legacy, id: 'vst2:child-one', isShellChild: true }
+  const second = { ...legacy, id: 'vst2:child-two', isShellChild: true }
+  assert.deepEqual(pluginDescriptorFamilies([first, second, modern]), [[first], [second], [modern]])
+})
+
+test('Audio Units keep separate identities beside a merged VST pair', () => {
+  const modern = { id: 'vst3:gain', name: 'Gain', vendor: 'Maker', path: '/effect.vst3' }
+  const legacy = { ...modern, id: 'vst2:gain', path: '/effect.dll' }
+  const au2 = { ...modern, id: 'au:aufx:gain:test', format: 'au' }
+  const au3 = { ...au2, id: 'au3:aufx:gain:test' }
+  assert.deepEqual(pluginDescriptorFamilies([legacy, au2, modern, au3]), [[modern, legacy], [au2], [au3]])
+})
 
 test('projects without plugins keep version 3 and track/master chains require version 4', () => {
   const session = project()
