@@ -4,10 +4,8 @@
 //! the same frame while it returns `false`, then retry that block. Filesystem and
 //! process I/O happen only when creating a timeline or on decoder worker threads.
 
-use crate::effects::{EffectSettings, TrackEffects};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -28,7 +26,6 @@ const MAX_SOURCES: usize = 4096;
 const MAX_CLIPS: usize = 65_536;
 const MAX_PLUGIN_SLOTS: usize = 1024;
 const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_EFFECT_HISTORY_FRAMES: usize = 128 * 1024 * 1024 / std::mem::size_of::<[f32; 2]>();
 
 fn unity() -> f64 {
     1.0
@@ -106,8 +103,6 @@ pub struct TrackSpec {
     pub fade_in: f64,
     #[serde(default)]
     pub fade_out: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effects: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clips: Option<Vec<ClipSpec>>,
     #[serde(default)]
@@ -187,8 +182,6 @@ impl SessionSpec {
             in_range(track.pan, -1.0, 1.0, "Track pan")?;
             in_range(track.fade_in, 0.0, MAX_DURATION_SECONDS, "Track fade-in")?;
             in_range(track.fade_out, 0.0, MAX_DURATION_SECONDS, "Track fade-out")?;
-            EffectSettings::parse(track.effects.as_ref())
-                .map_err(|error| format!("Track {}: {error}", track.id))?;
             let audible = !track.muted && (!has_solo || track.solo);
             if has_clips(track) {
                 for clip in track.clips.as_ref().expect("non-empty clips") {
@@ -400,7 +393,6 @@ pub struct PreparedMixUpdate {
     spec: SessionSpec,
     tracks: Vec<RuntimeTrack>,
     sample_rate: u32,
-    pub(crate) effects: Vec<Option<TrackEffects>>,
 }
 
 pub struct Timeline {
@@ -547,7 +539,6 @@ fn same_sources(previous: &SessionSpec, next: &SessionSpec) -> bool {
 pub fn prepare_mix_update(
     spec: SessionSpec,
     sample_rate: u32,
-    previous: Option<&SessionSpec>,
 ) -> Result<PreparedMixUpdate, String> {
     spec.validate()?;
     if !(8000..=192_000).contains(&sample_rate) {
@@ -555,46 +546,11 @@ pub fn prepare_mix_update(
     }
     let sources = compile_sources(&spec, sample_rate);
     let tracks = compile_tracks(&spec, &sources, sample_rate);
-    let effects = prepare_track_effects(&spec, previous, sample_rate)?;
     Ok(PreparedMixUpdate {
         spec,
         tracks,
         sample_rate,
-        effects,
     })
-}
-
-pub(crate) fn prepare_track_effects(
-    spec: &SessionSpec,
-    previous: Option<&SessionSpec>,
-    sample_rate: u32,
-) -> Result<Vec<Option<TrackEffects>>, String> {
-    if !(8000..=192_000).contains(&sample_rate) {
-        return Err("Native audio sample rate must be between 8000 and 192000 Hz".into());
-    }
-    let settings = spec
-        .tracks
-        .iter()
-        .map(|track| EffectSettings::parse(track.effects.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    settings.iter().try_fold(0usize, |total, settings| {
-        total
-            .checked_add(settings.history_frames(sample_rate))
-            .filter(|frames| *frames <= MAX_EFFECT_HISTORY_FRAMES)
-            .ok_or("Built-in effect delay buffers exceed the 128 MiB session limit")
-    })?;
-    Ok(settings
-        .into_iter()
-        .enumerate()
-        .map(|(index, settings)| {
-            let unchanged = previous
-                .and_then(|previous| previous.tracks.get(index))
-                .filter(|track| track.id == spec.tracks[index].id)
-                .and_then(|track| EffectSettings::parse(track.effects.as_ref()).ok())
-                == Some(settings);
-            (!unchanged).then(|| TrackEffects::new(settings, sample_rate))
-        })
-        .collect())
 }
 
 impl Timeline {
@@ -1335,7 +1291,7 @@ mod tests {
             .unwrap();
         let mut next = spec;
         next.tracks[0].volume = 0.5;
-        let prepared = prepare_mix_update(next.clone(), 8000, Some(timeline.spec())).unwrap();
+        let prepared = prepare_mix_update(next.clone(), 8000).unwrap();
         timeline.apply_mix_update(prepared).unwrap();
         let mut buses = output(1, 32);
         assert!(timeline.render_dry(0, 32, &mut buses).unwrap());
@@ -1407,11 +1363,8 @@ mod tests {
     }
 
     #[test]
-    fn validation_accepts_built_in_effects_but_blocks_active_offline_or_multichannel_sources() {
+    fn validation_blocks_active_offline_or_multichannel_sources() {
         let (_directory, mut spec) = fixture(1.0);
-        spec.tracks[0].effects = Some(json!({"reverb": 0.1}));
-        assert!(spec.validate().is_ok());
-        spec.tracks[0].effects = None;
         spec.sources[0].missing = true;
         assert!(spec.validate().unwrap_err().contains("offline"));
         spec.tracks[0].muted = true;
@@ -1429,53 +1382,18 @@ mod tests {
     }
 
     #[test]
-    fn effect_preparation_reuses_unchanged_processors_and_rejects_excessive_total_history() {
-        let (_directory, mut spec) = fixture(0.01);
-        spec.tracks[0].effects = Some(json!({"delay":0.8,"delayTime":0.05}));
-        let initial = prepare_track_effects(&spec, None, 48000).unwrap();
-        assert_eq!(initial[0].as_ref().unwrap().tail_samples(), 12000);
-        let mut next = spec.clone();
-        next.tracks[0].volume = 0.4;
-        next.tracks[0].pan = -0.3;
+    fn legacy_built_in_effect_fields_are_ignored() {
+        let (_directory, spec) = fixture(0.01);
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value["tracks"][0]["effects"] = json!({"delay":1.0,"delayTime":1.2,"compressor":7});
+        let legacy: SessionSpec = serde_json::from_value(value).unwrap();
+        assert!(legacy.validate().is_ok());
+        assert!(prepare_mix_update(legacy.clone(), 48000).is_ok());
         assert!(
-            prepare_mix_update(next.clone(), 48000, Some(&spec))
-                .unwrap()
-                .effects[0]
+            serde_json::to_value(&legacy).unwrap()["tracks"][0]
+                .get("effects")
                 .is_none()
         );
-        next.tracks[0].effects = Some(json!({"delay":0.8,"delayTime":0.1}));
-        assert_eq!(
-            prepare_mix_update(next, 48000, Some(&spec))
-                .unwrap()
-                .effects[0]
-                .as_ref()
-                .unwrap()
-                .tail_samples(),
-            24000
-        );
-        spec.tracks[0].effects = Some(json!({"delay":1.0,"delayTime":1.2}));
-        spec.tracks = vec![spec.tracks[0].clone(); MAX_TRACKS];
-        assert!(
-            prepare_track_effects(&spec, None, 192000)
-                .err()
-                .unwrap()
-                .contains("128 MiB")
-        );
-    }
-
-    #[test]
-    fn invalid_effect_values_are_rejected_even_when_the_track_is_muted() {
-        let (_directory, mut spec) = fixture(0.01);
-        spec.tracks[0].muted = true;
-        for settings in [
-            json!({"delayTime":0.0}),
-            json!({"delay":null}),
-            json!({"compressor":1.1}),
-            json!([]),
-        ] {
-            spec.tracks[0].effects = Some(settings);
-            assert!(spec.validate().is_err());
-        }
     }
 
     #[test]
@@ -1699,7 +1617,7 @@ mod tests {
         let mut timeline = cached(spec.clone(), 1.0, 1.0);
         let mut next = spec;
         next.tracks[0].volume = 0.5;
-        let prepared = prepare_mix_update(next.clone(), 8000, None).unwrap();
+        let prepared = prepare_mix_update(next.clone(), 8000).unwrap();
         // Control-thread validation already ran. Rendering must not perform
         // filesystem calls or fail after a file disappears behind cached audio.
         std::fs::remove_file(&next.sources[0].path).unwrap();
@@ -1716,14 +1634,14 @@ mod tests {
         let mut timeline = cached(spec.clone(), 1.0, 1.0);
         let mut next = spec.clone();
         next.sources[0].sample_rate = 16000;
-        let prepared = prepare_mix_update(next, 8000, None).unwrap();
+        let prepared = prepare_mix_update(next, 8000).unwrap();
         assert!(
             timeline
                 .apply_mix_update(prepared)
                 .unwrap_err()
                 .contains("reload")
         );
-        let prepared = prepare_mix_update(spec, 16000, None).unwrap();
+        let prepared = prepare_mix_update(spec, 16000).unwrap();
         assert!(
             timeline
                 .apply_mix_update(prepared)

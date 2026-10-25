@@ -41,8 +41,6 @@ test('master channel uses the actual session mix and cannot emit track or clip e
   assert.equal(env.read('channelVolume'), 0.8)
   assert.equal(env.read('channelPan'), -0.2)
   assert.equal(env.read('selectedClip'), null)
-  env.call('updateTrackEffects', { reverb: 1 })
-  env.call('applyEffectPreset', 'vocal')
   env.call('updateClipTiming', { start: 3 })
   env.call('updateFades', { fadeIn: 1 })
   assert.equal(env.events.length, 0)

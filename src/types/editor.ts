@@ -31,15 +31,6 @@ export type EditorClip = {
   locked: boolean
 }
 
-/** Non-destructive, track-level effects used by the editor preview and export. */
-export type EditorTrackEffects = {
-  reverb: number
-  delay: number
-  delayTime: number
-  clarity: number
-  compressor: number
-}
-
 /** Persist unknown formats and opaque state references so projects remain recoverable. */
 export type EditorPluginSlot = {
   id: string
@@ -67,7 +58,6 @@ export type EditorTrack = {
   fadeIn: number
   fadeOut: number
   pluginChain?: EditorPluginSlot[]
-  effects?: EditorTrackEffects
   type?: 'stem' | 'audio' | 'reference' | 'recording'
   clips?: EditorClip[]
 }

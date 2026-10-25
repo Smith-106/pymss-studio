@@ -147,8 +147,6 @@ fn main() {
             commands::app_cmd::editor_project_exists,
             commands::app_cmd::export_editor_mix,
             commands::app_cmd::start_editor_mix_export,
-            commands::app_cmd::append_editor_export_render_chunk,
-            commands::app_cmd::cleanup_editor_export_render,
             commands::app_cmd::cancel_editor_mix_export,
             commands::app_cmd::start_audio_tool,
             commands::tempo_key::start_tempo_key_analysis,

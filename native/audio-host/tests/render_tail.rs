@@ -414,7 +414,7 @@ fn offline_exports_ignore_monitor_and_restore_preview_mask_after_success_and_err
     let mut host = Host::with_behavior("");
     let project = json!({"id":"monitor-export","name":"Audio",
         "sources":[{"id":"source","path":source,"duration":1.0,"channels":2,"sampleRate":48000}],
-        "tracks":[{"id":"voice","sourceId":"source","muted":false,"volume":0.5,"effects":{"delay":1.0,"delayTime":0.05}},
+        "tracks":[{"id":"voice","sourceId":"source","muted":false,"volume":0.5},
             {"id":"backing","sourceId":"source","muted":false,"volume":0.25}]});
     host.request(json!({"op":"load","project":project,"ffmpeg":ffmpeg.canonicalize().unwrap()}));
     let baseline = directory.path().join("full.wav");
@@ -733,7 +733,7 @@ fn reactivation_applies_parameter_latency_before_track_and_master_export_pdc() {
 }
 
 #[test]
-fn built_in_effects_precede_plugins_and_export_updates_preserve_the_session() {
+fn legacy_effect_fields_are_ignored_and_export_updates_preserve_the_session() {
     let ffmpeg = std::env::var_os("PYMSS_TEST_FFMPEG")
         .map(PathBuf::from)
         .or_else(|| {
@@ -751,7 +751,7 @@ fn built_in_effects_precede_plugins_and_export_updates_preserve_the_session() {
         });
     let Some(ffmpeg) = ffmpeg else {
         eprintln!(
-            "FFmpeg is unavailable; set PYMSS_TEST_FFMPEG to enable native effect export coverage"
+            "FFmpeg is unavailable; set PYMSS_TEST_FFMPEG to enable native plugin export coverage"
         );
         return;
     };
@@ -789,35 +789,23 @@ fn built_in_effects_precede_plugins_and_export_updates_preserve_the_session() {
         .find(|plugin| plugin["isInstrument"] == false)
         .unwrap();
     let slot = |id| json!({"id":id,"format":"vst3","pluginId":descriptor["id"],"name":"Gain","path":bundle,"bypassed":false});
-    let mut project = json!({"id":"effects","name":"Audio","masterVolume":0.5,
+    let mut project = json!({"id":"legacy-effects","name":"Audio","masterVolume":0.5,
         "sources":[{"id":"source","path":source,"duration":1.0,"channels":2,"sampleRate":48000}],
         "tracks":[{"id":"track","sourceId":"source","effects":{"compressor":1.0},"pluginChain":[slot("track-fx")]}],
         "pluginChain":[slot("master-fx")]});
     let mut host = Host::with_behavior("mode-quality,delay");
     let loaded = host.request(json!({"op":"load","project":project,"ffmpeg":ffmpeg}));
-    let rate = loaded["sampleRate"].as_u64().unwrap() as u32;
     let baseline = directory.path().join("baseline.wav");
     host.render(&baseline);
-    let compressed = |sample: f64, amount: f64| {
-        let threshold = 10.0_f64.powf((-36.0 + amount * 14.0) / 20.0);
-        let magnitude = sample.abs();
-        let output = if magnitude > threshold {
-            threshold + (magnitude - threshold) / (1.0 + amount * 7.0)
-        } else {
-            magnitude
-        };
-        output * sample.signum()
-    };
-    let samples: Vec<_> = hound::WavReader::open(baseline)
+    let samples: Vec<_> = hound::WavReader::open(&baseline)
         .unwrap()
         .samples::<f32>()
         .map(Result::unwrap)
         .collect();
     for (channel, input) in [0.8_f32, -0.4_f32].into_iter().enumerate() {
         assert!(
-            (f64::from(samples[200 + channel]) - compressed(f64::from(input), 1.0) * 0.5).abs()
-                < 1e-6,
-            "The built-in compressor must run before the track plugin"
+            (f64::from(samples[200 + channel]) - f64::from(input) * 0.5).abs() < 1e-6,
+            "Removed built-in effects must not alter the plugin path"
         );
     }
 
@@ -825,52 +813,12 @@ fn built_in_effects_precede_plugins_and_export_updates_preserve_the_session() {
         json!({"reverb":0.25,"delay":0.6,"delayTime":0.05,"clarity":0.35,"compressor":0.6});
     let updated = host.request(json!({"op":"update","project":project,"ffmpeg":ffmpeg}));
     assert_eq!(updated["sessionId"], loaded["sessionId"]);
-    let rendered = directory.path().join("effects.wav");
+    let rendered = directory.path().join("updated.wav");
     host.render(&rendered);
-    let mut reader = hound::WavReader::open(rendered).unwrap();
-    let alpha = {
-        let rc = 1.0 / (2.0 * std::f64::consts::PI * (20.0 + 0.35 * 180.0));
-        rc / (rc + 1.0 / f64::from(rate))
-    };
-    let settling = (1e-6_f64.ln() / alpha.ln()).ceil() as u32;
     assert_eq!(
-        reader.duration(),
-        rate + (f64::from(rate) * 0.691).floor() as u32 + settling + 128
+        std::fs::read(&baseline).unwrap(),
+        std::fs::read(rendered).unwrap(),
+        "Legacy effect settings must be ignored by updates"
     );
-    let samples: Vec<_> = reader.samples::<f32>().map(Result::unwrap).collect();
-    let taps = [
-        (0.071, 0.25 * 0.34),
-        (0.113, 0.25 * 0.27),
-        (0.181, 0.25 * 0.21),
-        (0.293, 0.25 * 0.15),
-        (0.457, 0.25 * 0.10),
-        (0.691, 0.25 * 0.06),
-        (0.05, 0.6 * 0.46),
-        (0.10, 0.6 * 0.46_f64.powi(2)),
-        (0.15, 0.6 * 0.46_f64.powi(3)),
-        (0.20, 0.6 * 0.46_f64.powi(4)),
-        (0.25, 0.6 * 0.46_f64.powi(5)),
-    ];
-    for frame in [
-        100,
-        (f64::from(rate) * 0.05).floor() as usize + 100,
-        (f64::from(rate) * 0.071).floor() as usize + 100,
-    ] {
-        for (channel, input) in [0.8_f32, -0.4_f32].into_iter().enumerate() {
-            let dry =
-                |index: usize| compressed(f64::from(input) * alpha.powi(index as i32 + 1), 0.6);
-            let mut expected = dry(frame);
-            for (seconds, gain) in taps {
-                let offset = (f64::from(rate) * seconds).floor() as usize;
-                if frame >= offset {
-                    expected += dry(frame - offset) * gain;
-                }
-            }
-            assert!(
-                (f64::from(samples[frame * 2 + channel]) - expected * 0.5).abs() < 1e-6,
-                "Native effect routing differs at frame {frame}, channel {channel}"
-            );
-        }
-    }
     host.finish();
 }

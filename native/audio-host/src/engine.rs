@@ -537,7 +537,7 @@ impl Session {
     }
 
     pub fn update_mix(&mut self, spec: SessionSpec) -> Result<Value, String> {
-        let prepared = prepare_mix_update(spec.clone(), self.sample_rate, Some(&self.spec))?;
+        let prepared = prepare_mix_update(spec.clone(), self.sample_rate)?;
         let (reply, applied) = bounded(1);
         self.send(Control::Mix(spec.clone(), prepared, reply))?;
         // Admit one prepared update at a time. Large effect histories must not

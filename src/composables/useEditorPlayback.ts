@@ -2,7 +2,6 @@ import { onBeforeUnmount, type Ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
-import { applyEditorTrackEffects } from '@/utils/editorEffects'
 import { clipIsActive, clipMediaTime, clipsForTrack } from '@/utils/editorClips'
 import { createEditorAudioElement, createPreviewChunkReader, EditorTimelinePlayback, type TimelineAudioClip } from '@/utils/editorAudio'
 import type { EditorClip, EditorSource, EditorTrack } from '@/types/editor'
@@ -37,23 +36,12 @@ type ManagedAudio = {
   fallbackUrl?: string | null
   graphEnabled?: boolean
   channelMode?: 'mono' | 'stereo'
-  effectsSignature?: string
-  effectsRoutingSignature?: string
   sourceNode?: AudioNode | null
   gainNode?: GainNode | null
   balanceSplitter?: ChannelSplitterNode | null
   balanceLeftGain?: GainNode | null
   balanceRightGain?: GainNode | null
   balanceMerger?: ChannelMergerNode | null
-  clarityFilter?: BiquadFilterNode | null
-  compressorNode?: DynamicsCompressorNode | null
-  effectDryGain?: GainNode | null
-  reverbNode?: ConvolverNode | null
-  reverbWetGain?: GainNode | null
-  delayNode?: DelayNode | null
-  delayFeedbackGain?: GainNode | null
-  delayWetGain?: GainNode | null
-  effectOutputGain?: GainNode | null
   meterSplitter?: ChannelSplitterNode | null
   meterAnalyserLeft?: AnalyserNode | null
   meterAnalyserRight?: AnalyserNode | null
@@ -208,10 +196,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
     }
   }
 
-  function applyTrackEffects(entry: ManagedAudio, track: EditorTrack) {
-    if (audioContext) applyEditorTrackEffects(entry, track.effects, audioContext)
-  }
-
   function applyMasterAudioSettings() {
     if (!masterInputGain || !masterBalanceLeftGain || !masterBalanceRightGain) return
     setAudioParamValue(masterInputGain.gain, clamp(Number(editor.masterVolume || 0), 0, 2))
@@ -226,7 +210,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
       const stereo = stereoGainForPan(track.pan)
       setAudioParamValue(entry.balanceLeftGain.gain, stereo.left)
       setAudioParamValue(entry.balanceRightGain.gain, stereo.right)
-      applyTrackEffects(entry, track)
       if (entry.audio && entry.audio.volume !== 1) entry.audio.volume = 1
       if (entry.audio?.muted) entry.audio.muted = false
       return
@@ -282,15 +265,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
     entry.balanceLeftGain?.disconnect()
     entry.balanceRightGain?.disconnect()
     entry.balanceMerger?.disconnect()
-    entry.clarityFilter?.disconnect()
-    entry.compressorNode?.disconnect()
-    entry.effectDryGain?.disconnect()
-    entry.reverbNode?.disconnect()
-    entry.reverbWetGain?.disconnect()
-    entry.delayNode?.disconnect()
-    entry.delayFeedbackGain?.disconnect()
-    entry.delayWetGain?.disconnect()
-    entry.effectOutputGain?.disconnect()
     entry.meterSplitter?.disconnect()
     entry.meterAnalyserLeft?.disconnect()
     entry.meterAnalyserRight?.disconnect()
@@ -330,15 +304,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
       entry.balanceLeftGain = ctx.createGain()
       entry.balanceRightGain = ctx.createGain()
       entry.balanceMerger = ctx.createChannelMerger(2)
-      entry.clarityFilter = ctx.createBiquadFilter()
-      entry.compressorNode = ctx.createDynamicsCompressor()
-      entry.effectDryGain = ctx.createGain()
-      entry.reverbNode = ctx.createConvolver()
-      entry.reverbWetGain = ctx.createGain()
-      entry.delayNode = ctx.createDelay(1.2)
-      entry.delayFeedbackGain = ctx.createGain()
-      entry.delayWetGain = ctx.createGain()
-      entry.effectOutputGain = ctx.createGain()
       entry.meterSplitter = ctx.createChannelSplitter(2)
       entry.meterAnalyserLeft = ctx.createAnalyser()
       entry.meterAnalyserRight = ctx.createAnalyser()
@@ -354,16 +319,11 @@ export function useEditorPlayback(options: PlaybackOptions) {
 
       entry.balanceLeftGain.connect(entry.balanceMerger, 0, 0)
       entry.balanceRightGain.connect(entry.balanceMerger, 0, 1)
-      entry.effectDryGain.connect(entry.effectOutputGain)
-      entry.reverbWetGain.connect(entry.effectOutputGain)
-      entry.delayWetGain.connect(entry.effectOutputGain)
-      entry.effectOutputGain.connect(entry.meterSplitter)
+      entry.balanceMerger.connect(entry.meterSplitter)
       entry.meterSplitter.connect(entry.meterAnalyserLeft, 0)
       entry.meterSplitter.connect(entry.meterAnalyserRight, 1)
-      entry.effectOutputGain.connect(masterInputGain)
+      entry.balanceMerger.connect(masterInputGain)
       entry.graphEnabled = true
-      entry.effectsSignature = undefined
-      entry.effectsRoutingSignature = undefined
     } catch {
       entry.graphEnabled = false
       entry.sourceNode = null
@@ -372,15 +332,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
       entry.balanceLeftGain = null
       entry.balanceRightGain = null
       entry.balanceMerger = null
-      entry.clarityFilter = null
-      entry.compressorNode = null
-      entry.effectDryGain = null
-      entry.reverbNode = null
-      entry.reverbWetGain = null
-      entry.delayNode = null
-      entry.delayFeedbackGain = null
-      entry.delayWetGain = null
-      entry.effectOutputGain = null
       entry.meterSplitter = null
       entry.meterAnalyserLeft = null
       entry.meterAnalyserRight = null
@@ -456,11 +407,6 @@ export function useEditorPlayback(options: PlaybackOptions) {
         clip.id,
         track.volume,
         track.pan,
-        track.effects?.reverb ?? 0,
-        track.effects?.delay ?? 0,
-        track.effects?.delayTime ?? 0.24,
-        track.effects?.clarity ?? 0,
-        track.effects?.compressor ?? 0,
         clip.volume,
         clip.fadeIn,
         clip.fadeOut,

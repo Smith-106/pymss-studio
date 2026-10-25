@@ -46,8 +46,7 @@ with sync_playwright() as playwright:
       __editor.session = {
         id:'slider-reset-project',name:'Mix',masterVolume:0.65,masterPan:0.35,
         sources:[],tracks:[{id:'track',sourceId:'',role:'stem',name:'Vocals',
-          volume:0.42,pan:-0.3,muted:false,solo:false,fadeIn:0,fadeOut:0,clips:[],
-          effects:{clarity:0.45,compressor:0.55,reverb:0.35,delay:0.4,delayTime:0.24}}],
+          volume:0.42,pan:-0.3,muted:false,solo:false,fadeIn:0,fadeOut:0,clips:[]}],
         createdAt:1,updatedAt:1
       };
       __editor.selectTrack('track');
@@ -61,9 +60,8 @@ with sync_playwright() as playwright:
         toggle.click()
     inspector = page.locator(".editor-inspector")
     inspector.wait_for(state="visible")
-    inspector.locator(".inspector-group--effects > summary").click()
     sliders = inspector.locator(".editor-parameter-slider")
-    expect(sliders).to_have_count(6)
+    expect(sliders).to_have_count(2)
     results = []
 
     def value(expression):
@@ -90,8 +88,7 @@ with sync_playwright() as playwright:
         results.append(label)
         print(f"Default reset and undo verified: {label}", flush=True)
 
-    cases = [("volume", 1), ("pan", 0), ("effects.clarity", 0),
-             ("effects.compressor", 0), ("effects.reverb", 0), ("effects.delay", 0)]
+    cases = [("volume", 1), ("pan", 0)]
     for index, (field, default) in enumerate(cases):
         check_reset(sliders.nth(index), f"__editor.session.tracks[0].{field}", default, field)
 

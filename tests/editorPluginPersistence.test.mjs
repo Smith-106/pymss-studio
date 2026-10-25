@@ -14,10 +14,8 @@ const environments=[]
 const hostCapabilities={enabled:true,formats:['vst3','vst2','au']}
 const flush=async()=>{for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve))}
 function deferred(){let resolve;const promise=new Promise(done=>{resolve=done});return{promise,resolve}}
-function environment(t,{builtinEffects}={}){
+function environment(t){
   t.mock.timers.enable({apis:['setTimeout','Date'],now:100000})
-  if(builtinEffects===undefined)delete hostCapabilities.builtinEffects
-  else hostCapabilities.builtinEffects=builtinEffects
   const callbacks=new Map(), listeners=new Map();let callbackId=0
   const calls=[], controls={projectId:'project',revision:0,sessionId:'native-1',states:{slot:'sha256:initial'},snapshotError:false,statusError:false,updateError:false,partialSnapshot:false,omittedSlots:[],unavailablePlugins:[],openEditors:[],snapshotGate:null,parameterGate:null,parameterValues:{gain:0.5}}
   const status=()=>({projectId:controls.projectId,sessionId:controls.sessionId,stateRevision:controls.revision,openEditors:[...controls.openEditors],unavailablePlugins:[...controls.unavailablePlugins],position:0,playing:false,duration:2})
@@ -634,22 +632,6 @@ test('cancelling plugin export during capture never starts an offline render',as
  assert.equal(env.calls.filter(call=>call.command==='start_editor_mix_export').length,0)
 })
 
-test('plugin export revalidates built-in effects added during capture',async t=>{
- const env=environment(t)
- await host.ensurePluginSession(env.editor.session)
- await env.tick(900)
- env.controls.snapshotGate=deferred()
- env.calls.length=0
- const exporting=env.editor.exportMix({format:'wav'})
- await flush()
- env.editor.session.tracks.push({id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,effects:{reverb:0.2}})
- env.controls.snapshotGate.resolve()
- try{
-  await assert.rejects(exporting,/effects|效果/)
-  assert.equal(env.calls.filter(call=>call.command==='plugin_host_render').length,0)
- }finally{env.editor.session.tracks=[]}
-})
-
 test('saving AUv2 and AUv3 with identical component codes preserves separate states and variant metadata',async t=>{
  const env=environment(t)
  env.editor.session.pluginChain=[
@@ -738,57 +720,16 @@ test('queued parameter writes allow opaque state captured by the same controller
  assert.equal(env.editor.session.pluginChain[0].state,'sha256:captured-live')
 })
 
-const builtinTrack=effects=>({id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,effects})
-const builtinSettings={reverb:0.2,delay:0.3,delayTime:0.4,clarity:0.5,compressor:0.6}
-
-test('a capable host receives all built-in effects for plugin playback and subsequent updates',async t=>{
- const env=environment(t,{builtinEffects:true})
- env.editor.session.tracks=[builtinTrack({...builtinSettings})]
+test('legacy track effects are dropped on load and never reach the plugin host',async t=>{
+ const env=environment(t)
+ env.controls.persisted={...JSON.parse(JSON.stringify(env.editor.session)),version:4,
+  tracks:[{id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,
+   effects:{reverb:0.2,delay:0.3,delayTime:0.4,clarity:0.5,compressor:0.6}}]}
+ await env.editor.loadProject('project')
+ assert.equal(env.editor.session.tracks.length,1)
+ assert.equal('effects' in env.editor.session.tracks[0],false)
  await host.ensurePluginSession(env.editor.session)
- await host.pluginHostRequest({op:'play',projectId:'project',position:0})
  const load=env.calls.find(call=>call.args?.request?.op==='load').args.request
- assert.deepEqual(load.project.tracks[0].effects,builtinSettings)
- assert.ok(env.calls.some(call=>call.args?.request?.op==='play'))
- env.editor.session.tracks[0].effects={...builtinSettings,delayTime:0.7,compressor:0.25}
- await host.ensurePluginSession(env.editor.session)
- const update=env.calls.findLast(call=>call.args?.request?.op==='update').args.request
- assert.deepEqual(update.project.tracks[0].effects,env.editor.session.tracks[0].effects)
-})
-
-for(const builtinEffects of [undefined,false]){
- test(`a host with ${builtinEffects===undefined?'missing':'disabled'} built-in effects capability keeps rejecting plugin effects`,async t=>{
-  const env=environment(t,{builtinEffects})
-  env.editor.session.tracks=[builtinTrack({...builtinSettings})]
-  try{
-   await assert.rejects(host.ensurePluginSession(env.editor.session),/built-in effects|内置效果/)
-   assert.equal(env.calls.filter(call=>call.args?.request?.op==='load').length,0)
-   await assert.rejects(env.editor.exportMix(),/built-in effects|内置效果/)
-   assert.equal(env.calls.filter(call=>call.command==='plugin_host_render').length,0)
-  }finally{env.editor.session.tracks=[]}
- })
-}
-
-test('plugin export freezes built-in effects changed during capture and encodes a neutral track',async t=>{
- const env=environment(t,{builtinEffects:true})
- env.editor.session.tracks=[builtinTrack({...builtinSettings,reverb:0.1})]
- await host.ensurePluginSession(env.editor.session)
- await env.tick(900)
- env.controls.snapshotGate=deferred()
- const exporting=env.editor.exportMix({format:'wav'})
- await flush()
- env.editor.session.tracks=[builtinTrack({...builtinSettings})]
- env.editor.setMasterVolume(0.35)
- env.controls.snapshotGate.resolve()
- await exporting
- const rendered=env.calls.find(call=>call.command==='plugin_host_render').args.project
- assert.equal(rendered.masterVolume,0.35)
- assert.deepEqual(rendered.tracks[0].effects,builtinSettings)
- const encoded=env.calls.find(call=>call.command==='start_editor_mix_export').args.payload.project
- assert.equal(encoded.masterVolume,1)
- assert.equal(encoded.masterPan,0)
- assert.equal(encoded.tracks.length,1)
- assert.equal(encoded.tracks[0].effects,undefined)
- assert.equal(encoded.tracks[0].volume,1)
- assert.equal(encoded.assets[0].path,'C:/native-render.wav')
- assert.equal(env.calls.filter(call=>call.command==='cleanup_editor_export_render').length,0)
+ assert.equal(load.project.tracks.length,1)
+ assert.equal('effects' in load.project.tracks[0],false)
 })

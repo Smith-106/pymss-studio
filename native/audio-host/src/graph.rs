@@ -1,6 +1,5 @@
-use crate::effects::{EffectSettings, TrackEffects};
 use crate::plugins::HostedPlugin;
-use crate::timeline::{SessionSpec, Timeline, monitor_mask, prepare_track_effects};
+use crate::timeline::{SessionSpec, Timeline, monitor_mask};
 use base64::Engine;
 use soundcraft_dsp::{PluginEditor, PluginStateReader, Transport};
 use std::collections::HashMap;
@@ -105,12 +104,7 @@ fn total_latency(values: impl Iterator<Item = usize>) -> usize {
     values.fold(0, usize::saturating_add)
 }
 
-fn tail_length(
-    chains: &[Vec<Slot>],
-    master: &[Slot],
-    effects: &[TrackEffects],
-    spec: &SessionSpec,
-) -> u64 {
+fn tail_length(chains: &[Vec<Slot>], master: &[Slot], spec: &SessionSpec) -> u64 {
     let chain_tail = |chain: &[Slot]| {
         chain
             .iter()
@@ -121,10 +115,9 @@ fn tail_length(
     let solo = spec.tracks.iter().any(|track| track.solo);
     chains
         .iter()
-        .zip(effects)
         .zip(&spec.tracks)
         .filter(|(_, track)| !track.muted && (!solo || track.solo))
-        .map(|((chain, effects), _)| effects.tail_samples().saturating_add(chain_tail(chain)))
+        .map(|(chain, _)| chain_tail(chain))
         .max()
         .unwrap_or(0)
         .saturating_add(chain_tail(master))
@@ -208,7 +201,6 @@ pub(crate) struct Graph {
     timeline: Timeline,
     tracks: Vec<Vec<Vec<f32>>>,
     chains: Vec<Vec<Slot>>,
-    effects: Vec<TrackEffects>,
     suppressed: Vec<bool>,
     master: Vec<Slot>,
     delays: Vec<Delay>,
@@ -333,12 +325,6 @@ impl Graph {
         offline: bool,
     ) -> Result<(Self, HashMap<String, UiSlot>), String> {
         spec.validate()?;
-        let effects = prepare_track_effects(&spec, None, sample_rate)?
-            .into_iter()
-            .map(|effect| {
-                effect.ok_or_else(|| "Track effect configuration is unavailable".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut ui = HashMap::new();
         let mut unavailable_plugins = Vec::new();
         let mut chains = Vec::new();
@@ -368,7 +354,7 @@ impl Graph {
             return Err("Combined plugin latency exceeds the supported limit".into());
         }
         let tail_cap = u64::from(sample_rate) * 30;
-        let tail = tail_length(&chains, &master, &effects, &spec);
+        let tail = tail_length(&chains, &master, &spec);
         let duration = (spec.duration() * f64::from(sample_rate)).round() as u64;
         let delays = track_latencies
             .into_iter()
@@ -395,7 +381,6 @@ impl Graph {
                 timeline,
                 tracks,
                 chains,
-                effects,
                 suppressed,
                 master,
                 delays,
@@ -412,9 +397,6 @@ impl Graph {
 
     pub fn reset(&mut self) {
         self.timeline.clear_pending();
-        for effects in &mut self.effects {
-            effects.reset();
-        }
         for slot in self
             .chains
             .iter_mut()
@@ -451,7 +433,6 @@ impl Graph {
             if self.suppressed[index] == suppressed {
                 continue;
             }
-            self.effects[index].reset();
             self.delays[index].reset();
             for channel in &mut self.tracks[index] {
                 channel.fill(0.0);
@@ -529,7 +510,7 @@ impl Graph {
         }
         self.delays = delays;
         self.latency = combined;
-        let tail = tail_length(&self.chains, &self.master, &self.effects, &self.spec);
+        let tail = tail_length(&self.chains, &self.master, &self.spec);
         let tail_cap = u64::from(self.sample_rate) * 30;
         self.tail = tail.min(tail_cap);
         self.tail_limited = tail > tail_cap;
@@ -540,10 +521,9 @@ impl Graph {
     pub fn update_mix(
         &mut self,
         spec: SessionSpec,
-        mut prepared: crate::timeline::PreparedMixUpdate,
+        prepared: crate::timeline::PreparedMixUpdate,
     ) -> Result<(), String> {
         if spec.tracks.len() != self.tracks.len()
-            || prepared.effects.len() != self.effects.len()
             || spec
                 .tracks
                 .iter()
@@ -552,21 +532,7 @@ impl Graph {
         {
             return Err("Audio graph topology changed".into());
         }
-        for (index, replacement) in prepared.effects.iter().enumerate() {
-            if replacement.is_none()
-                && self.effects[index].settings()
-                    != EffectSettings::parse(spec.tracks[index].effects.as_ref())?
-            {
-                return Err("Track effect settings changed; reload the audio graph".into());
-            }
-        }
-        let effects = std::mem::take(&mut prepared.effects);
         self.timeline.apply_mix_update(prepared)?;
-        for (current, replacement) in self.effects.iter_mut().zip(effects) {
-            if let Some(replacement) = replacement {
-                *current = replacement;
-            }
-        }
         for (slots, track) in self.chains.iter_mut().zip(&spec.tracks) {
             for slot in slots {
                 if let Some(next) = track.plugin_chain.iter().find(|s| s.id == slot.id) {
@@ -581,7 +547,7 @@ impl Graph {
         }
         self.duration = (spec.duration() * f64::from(self.sample_rate)).round() as u64;
         self.spec = spec;
-        let tail = tail_length(&self.chains, &self.master, &self.effects, &self.spec);
+        let tail = tail_length(&self.chains, &self.master, &self.spec);
         let cap = u64::from(self.sample_rate) * 30;
         self.tail = tail.min(cap);
         self.tail_limited = tail > cap;
@@ -651,7 +617,6 @@ impl Graph {
                 io[0][..frames].fill(0.0);
                 io[1][..frames].fill(0.0);
             }
-            self.effects[index].process(io, frames);
             for slot in chain {
                 slot.process(io, frames, &transport)?;
             }
@@ -707,28 +672,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monitor_discards_only_the_suppressed_tracks_effect_history_and_levels() {
+    fn monitor_suppression_survives_mix_updates_and_ignores_legacy_effects() {
+        // Legacy projects may still carry the removed built-in `effects` object;
+        // it must be tolerated and ignored rather than rejected.
         let spec: SessionSpec = serde_json::from_value(serde_json::json!({
             "id":"monitor", "name":"Audio", "sources":[], "tracks":[
                 {"id":"voice", "clips":[], "effects":{"delay":1.0,"delayTime":0.05}},
-                {"id":"backing", "clips":[], "effects":{"delay":1.0,"delayTime":0.05}}
+                {"id":"backing", "clips":[], "effects":{"reverb":0.4}}
             ]
         }))
         .unwrap();
         let (mut graph, _) = Graph::load(spec.clone(), "ffmpeg".into(), 8000).unwrap();
-        for (index, effect) in graph.effects.iter_mut().enumerate() {
-            let mut impulse = vec![vec![0.0; BLOCK]; 2];
-            impulse[0][0] = (index + 1) as f32;
-            impulse[1][0] = -(index as f32 + 1.0);
-            effect.process(&mut impulse, BLOCK);
-        }
+        assert_eq!(graph.tail, 0, "Tracks without plugins contribute no tail");
         let latency = graph.latency;
         graph.set_monitor(&["voice".into()]).unwrap();
         assert_eq!(graph.suppressed_track_ids(), ["voice"]);
         assert!(graph.render(BLOCK as u64, BLOCK, true).unwrap());
         assert_eq!(graph.levels[0], [0.0; 2]);
-        assert!((graph.mix[0][400 - BLOCK] - 0.92).abs() < 1e-6);
-        assert!((graph.mix[1][400 - BLOCK] + 0.92).abs() < 1e-6);
         assert_eq!(graph.latency, latency);
         assert_eq!(
             serde_json::to_value(&graph.spec).unwrap(),
@@ -739,17 +699,12 @@ mod tests {
         let mut next = spec.clone();
         next.master_volume = 0.5;
         let prepared =
-            crate::timeline::prepare_mix_update(next.clone(), 8000, Some(&spec)).unwrap();
+            crate::timeline::prepare_mix_update(next.clone(), 8000).unwrap();
         graph.update_mix(next, prepared).unwrap();
         assert_eq!(graph.suppressed_track_ids(), ["voice"]);
         graph.set_monitor(&[]).unwrap();
+        assert!(graph.suppressed_track_ids().is_empty());
         assert!(graph.render((BLOCK * 2) as u64, BLOCK, true).unwrap());
-        assert!(graph.render((BLOCK * 3) as u64, BLOCK, true).unwrap());
-        assert!(
-            (graph.mix[0][800 - BLOCK * 3] - 0.2116).abs() < 1e-6,
-            "The backing track's second echo must survive both monitor changes"
-        );
-        assert_eq!(graph.levels[0], [0.0; 2]);
     }
 
     #[test]
@@ -819,47 +774,6 @@ mod tests {
         delay.reset();
         delay.process(&mut next, 4);
         assert_eq!(&next[0][..3], &[0., 0., 0.]);
-    }
-
-    #[test]
-    fn mix_updates_retain_existing_effect_history_and_replace_only_changed_settings() {
-        let spec: SessionSpec = serde_json::from_value(serde_json::json!({
-            "id":"effects", "name":"Audio", "sources":[], "tracks":[{
-                "id":"track", "clips":[], "muted":true,
-                "effects":{"delay":1.0,"delayTime":0.05}
-            }]
-        }))
-        .unwrap();
-        let (mut graph, _) = Graph::load(spec.clone(), "ffmpeg".into(), 8000).unwrap();
-        let mut impulse = vec![vec![0.0; BLOCK]; 2];
-        impulse[0][0] = 1.0;
-        impulse[1][0] = -0.5;
-        graph.effects[0].process(&mut impulse, BLOCK);
-        let mut next = spec.clone();
-        next.tracks[0].volume = 0.5;
-        let prepared =
-            crate::timeline::prepare_mix_update(next.clone(), 8000, Some(&spec)).unwrap();
-        graph.update_mix(next.clone(), prepared).unwrap();
-        let mut echo = vec![vec![0.0; BLOCK]; 2];
-        graph.effects[0].process(&mut echo, BLOCK);
-        assert!((echo[0][400 - BLOCK] - 0.46).abs() < 1e-6);
-        assert!((echo[1][400 - BLOCK] + 0.23).abs() < 1e-6);
-        next.tracks[0].effects = Some(serde_json::json!({"delay":1.0,"delayTime":0.1}));
-        let prepared =
-            crate::timeline::prepare_mix_update(next.clone(), 8000, Some(&graph.spec)).unwrap();
-        graph.update_mix(next.clone(), prepared).unwrap();
-        echo.iter_mut().for_each(|channel| channel.fill(0.0));
-        graph.effects[0].process(&mut echo, BLOCK);
-        assert!(echo.iter().flatten().all(|sample| *sample == 0.0));
-        assert_eq!(
-            graph.tail, 0,
-            "A muted track contributes no audible effect tail"
-        );
-        next.tracks[0].muted = false;
-        let prepared =
-            crate::timeline::prepare_mix_update(next.clone(), 8000, Some(&graph.spec)).unwrap();
-        graph.update_mix(next, prepared).unwrap();
-        assert_eq!(graph.tail, 4000);
     }
 
     #[test]

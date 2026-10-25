@@ -59,7 +59,6 @@ function environment({ startGate, cancelAccepted = true, nativeRenderGate } = {}
         }
         if (command === 'plugin_host_cancel_render') { nativeRenderGate?.reject(new Error('Rendering cancelled')); return true }
         if (command === 'plugin_host_cleanup_render') return null
-        if (command === 'cleanup_editor_export_render') return null
         if (command === 'start_editor_mix_export') {
           if (startGate) await startGate.promise
           return { taskId: args.payload.taskId, started: true }
@@ -179,60 +178,21 @@ test('a late cancellation cannot replace an already accepted completion event', 
   assert.equal(env.store.lastError, null)
 })
 
-test('cancelling effect rendering does not start a worker and cleans its private files', async t => {
-  const gate = deferred()
-  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
-  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
-    sampleRate = 48000
-    close() { return gate.promise }
-  } })
-  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
+test('a non-plugin export sends the project snapshot directly to the encoder without render chunks', async () => {
   const env = environment()
-  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: 0, delay: 0, delayTime: .24 }
-  const original = JSON.stringify(env.store.session)
+  env.store.session.masterVolume = 0.8
+  env.store.session.tracks[0].volume = 0.6
   const exporting = env.store.exportMix({ format: 'wav' })
-  const rejected = assert.rejects(exporting, EditorExportCancelledError)
   await flush()
-  assert.equal(await env.store.cancelExport(), true)
-  gate.resolve()
-  await rejected
-  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
-  assert.equal(env.calls.filter(call => call.command === 'cleanup_editor_export_render').length, 1)
-  assert.equal(env.store.exporting, false)
-  assert.equal(env.store.lastError, null)
-  assert.equal(JSON.stringify(env.store.session), original)
-})
-
-test('a renderer failure reports its cause and never falls back to different audio effects', async t => {
-  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
-  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
-    constructor() { throw new Error('Audio renderer unavailable') }
-  } })
-  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
-  const env = environment()
-  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: 0, delay: 0, delayTime: .24 }
-  await assert.rejects(env.store.exportMix(), /Audio renderer unavailable/)
-  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
-  assert.equal(env.calls.filter(call => call.command === 'cleanup_editor_export_render').length, 1)
-  assert.equal(env.store.exporting, false)
-  assert.equal(env.store.lastError, 'Audio renderer unavailable')
-})
-
-test('long effect clips are rejected before native audio allocation or cache writes', async t => {
-  const previous = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
-  Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: class {
-    sampleRate = 48000
-    async close() {}
-  } })
-  t.after(() => previous ? Object.defineProperty(globalThis, 'AudioContext', previous) : Reflect.deleteProperty(globalThis, 'AudioContext'))
-  const env = environment()
-  env.store.session.sources[0].duration = 3600
-  env.store.session.tracks[0].effects = { clarity: 0, compressor: .62, reverb: .35, delay: 0, delayTime: .24 }
-  await assert.rejects(env.store.exportMix(), /memory limit|内存限制/)
-  assert.equal(env.calls.filter(call => call.command === 'editor_preview_chunk').length, 0)
-  assert.equal(env.calls.filter(call => call.command === 'append_editor_export_render_chunk').length, 0)
-  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
-  assert.equal(env.store.exporting, false)
+  const start = env.calls.find(call => call.command === 'start_editor_mix_export')
+  assert.ok(start)
+  assert.equal(start.args.payload.project.masterVolume, 0.8)
+  assert.equal(start.args.payload.project.tracks[0].volume, 0.6)
+  assert.equal(start.args.payload.project.assets[0].path, 'D:/audio.wav')
+  assert.deepEqual(env.calls.map(call => call.command).filter(command => command !== 'plugin_host_capabilities'), ['start_editor_mix_export'])
+  env.dispatch('pymss://worker-event', { type: 'editor_mix_exported', taskId: start.args.payload.taskId,
+    payload: { path: 'D:/mix.wav', format: 'wav', duration: 1, sampleRate: 48000, channels: 2 } })
+  assert.equal((await exporting).path, 'D:/mix.wav')
 })
 
 const pluginSlot = { id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false, state: 'sha256:opaque' }
@@ -272,16 +232,6 @@ test('cancelling native rendering terminates the render without starting the enc
   assert.equal(env.calls.filter(call => call.command === 'plugin_host_cancel_render').length, 1)
   assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
   assert.equal(env.calls.filter(call => call.command === 'plugin_host_cleanup_render').length, 1)
-})
-
-test('plugin projects reject built-in effects without silently encoding dry audio', async () => {
-  const env = environment()
-  env.store.session.pluginChain = [{ ...pluginSlot }]
-  env.store.session.tracks[0].effects = { reverb: 0.2, delay: 0, delayTime: 0.24, clarity: 0, compressor: 0 }
-  await assert.rejects(env.store.exportMix(), /built-in effects|内置效果/)
-  assert.equal(env.calls.filter(call => call.command === 'start_editor_mix_export').length, 0)
-  assert.equal(env.store.exporting, false)
-  assert.ok(env.store.lastError)
 })
 
 test('history and persistence retain independent master and track chains with unknown states', async () => {

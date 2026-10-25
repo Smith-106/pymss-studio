@@ -130,7 +130,6 @@ pub fn plugin_host_capabilities() -> Value {
     json!({
         "enabled": capabilities.enabled, "platform": std::env::consts::OS,
         "formats": formats, "nativeEditorFormats": native_editor_formats,
-        "builtinEffects": capabilities.enabled,
         "recording": capabilities.enabled,
         "nativeEditor": capabilities.native_editor, "experimental": true,
         "labBuild": cfg!(feature = "vst-lab"),

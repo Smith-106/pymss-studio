@@ -4,7 +4,7 @@ import type { InputInst } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { PencilOutline } from '@vicons/ionicons5'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
-import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
+import type { EditorClip, EditorSession, EditorSource } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
 import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
 import EditorPluginPanel from '@/components/editor/EditorPluginPanel.vue'
@@ -30,13 +30,10 @@ const emit = defineEmits<{
   renameTrack: [trackId: string, name: string, commit?: boolean]
   setTrackVolume: [trackId: string, value: number]
   setTrackPan: [trackId: string, value: number]
-  setTrackEffects: [trackId: string, patch: Partial<EditorTrackEffects>]
   beginTrackVolume: []
   commitTrackVolume: []
   beginTrackPan: []
   commitTrackPan: []
-  beginTrackEffects: []
-  commitTrackEffects: []
   setClipFades: [payload: {
     trackId: string
     clipId: string
@@ -77,7 +74,6 @@ const renameDraft = ref('')
 const editingTrackId = ref<string | null>(null)
 const renameInput = ref<InputInst | null>(null)
 const nameButton = ref<HTMLButtonElement | null>(null)
-const effectPreset = ref('custom')
 
 function selectChannel(value: string) {
   if (value === 'master') { emit('selectTrack', null); return }
@@ -123,7 +119,6 @@ watch(
   (track) => {
     editingTrackId.value = null
     renameDraft.value = track?.name || ''
-    effectPreset.value = 'custom'
   },
   { immediate: true },
 )
@@ -191,21 +186,6 @@ const fadeMax = computed(() => selectedClip.value?.duration || props.selectedSou
 const usesTrackFadeLabel = computed(() => (selectedTrack.value?.clips?.length || 0) === 1)
 const fadeInValue = computed(() => selectedClip.value?.fadeIn || 0)
 const fadeOutValue = computed(() => selectedClip.value?.fadeOut || 0)
-const trackEffects = computed<EditorTrackEffects>(() => selectedTrack.value?.effects || {
-  reverb: 0,
-  delay: 0,
-  delayTime: 0.24,
-  clarity: 0,
-  compressor: 0,
-})
-const effectPresetOptions = computed(() => [
-  { label: t('editor.effectPresetCustom'), value: 'custom' },
-  { label: t('editor.effectPresetOriginal'), value: 'original' },
-  { label: t('editor.effectPresetVocal'), value: 'vocal' },
-  { label: t('editor.effectPresetBackground'), value: 'background' },
-  { label: t('editor.effectPresetRecording'), value: 'recording' },
-  { label: t('editor.effectPresetSpace'), value: 'space' },
-])
 const clipOffsetMax = computed(() => Math.max(0, Number(props.selectedSource?.duration || 0) - Number(selectedClip.value?.duration || 0)))
 const clipDurationMax = computed(() => Math.max(0.01, Number(props.selectedSource?.duration || 0) - Number(selectedClip.value?.offset || 0)))
 
@@ -227,31 +207,6 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
   })
 }
 
-function updateTrackEffects(patch: Partial<EditorTrackEffects>) {
-  if (!selectedTrack.value) return
-  effectPreset.value = 'custom'
-  emit('setTrackEffects', selectedTrack.value.id, patch)
-}
-
-function applyEffectPreset(value: string) {
-  if (!selectedTrack.value) return
-  const presets: Record<string, EditorTrackEffects> = {
-    original: { reverb: 0, delay: 0, delayTime: 0.24, clarity: 0, compressor: 0 },
-    vocal: { reverb: 0.12, delay: 0.02, delayTime: 0.18, clarity: 0.45, compressor: 0.5 },
-    background: { reverb: 0.06, delay: 0.08, delayTime: 0.32, clarity: 0.08, compressor: 0.16 },
-    recording: { reverb: 0.04, delay: 0, delayTime: 0.24, clarity: 0.62, compressor: 0.62 },
-    space: { reverb: 0.34, delay: 0.16, delayTime: 0.3, clarity: 0.1, compressor: 0.12 },
-  }
-  const preset = presets[value]
-  if (!preset) {
-    effectPreset.value = 'custom'
-    return
-  }
-  effectPreset.value = value
-  emit('beginTrackEffects')
-  emit('setTrackEffects', selectedTrack.value.id, preset)
-  emit('commitTrackEffects')
-}
 </script>
 
 <template>
@@ -334,123 +289,6 @@ function applyEffectPreset(value: string) {
       </section>
 
       <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" />
-
-      <details v-if="selectedTrack" class="inspector-group inspector-group--effects">
-        <summary class="inspector-group__header">
-          <strong>{{ t('editor.inspectorSectionEffects') }}</strong>
-          <span>{{ t('editor.inspectorEffectsContext') }}</span>
-        </summary>
-
-        <div class="inspector-group__body inspector-group__body--dense">
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.effectPreset') }}</span>
-            <n-select
-              :value="effectPreset"
-              :options="effectPresetOptions"
-              size="small"
-              @update:value="applyEffectPreset"
-            />
-          </label>
-
-          <p class="effect-hint">{{ t('editor.effectPresetHint') }}</p>
-
-          <div class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectClarity') }}</span>
-              <strong>{{ Math.round(trackEffects.clarity * 100) }}%</strong>
-            </div>
-            <EditorParameterSlider
-              :value="trackEffects.clarity"
-              :reset-value="0"
-              :label="t('editor.effectClarity')"
-              :reset-label="t('editor.sliderDefaultOff')"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ clarity: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </div>
-
-          <div class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectCompressor') }}</span>
-              <strong>{{ Math.round(trackEffects.compressor * 100) }}%</strong>
-            </div>
-            <EditorParameterSlider
-              :value="trackEffects.compressor"
-              :reset-value="0"
-              :label="t('editor.effectCompressor')"
-              :reset-label="t('editor.sliderDefaultOff')"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ compressor: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </div>
-
-          <div class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectReverb') }}</span>
-              <strong>{{ Math.round(trackEffects.reverb * 100) }}%</strong>
-            </div>
-            <EditorParameterSlider
-              :value="trackEffects.reverb"
-              :reset-value="0"
-              :label="t('editor.effectReverb')"
-              :reset-label="t('editor.sliderDefaultOff')"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ reverb: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </div>
-
-          <div class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectDelay') }}</span>
-              <strong>{{ Math.round(trackEffects.delay * 100) }}%</strong>
-            </div>
-            <EditorParameterSlider
-              :value="trackEffects.delay"
-              :reset-value="0"
-              :label="t('editor.effectDelay')"
-              :reset-label="t('editor.sliderDefaultOff')"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ delay: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </div>
-
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.effectDelayTime') }}</span>
-            <n-input-number
-              :value="trackEffects.delayTime"
-              :min="0.05"
-              :max="1.2"
-              :step="0.01"
-              size="small"
-              :format="(value: number | null) => `${Number(value || 0).toFixed(2)} s`"
-              :parse="(value: string) => Number.parseFloat(value)"
-              @focus="emit('beginTrackEffects')"
-              @blur="emit('commitTrackEffects')"
-              @update:value="(value: number | null) => updateTrackEffects({ delayTime: numberOrZero(value) })"
-            />
-          </label>
-        </div>
-      </details>
 
       <section v-if="selectedTrack && selectedClip" class="inspector-group inspector-group--clip">
         <div class="inspector-group__header">
@@ -687,11 +525,6 @@ function applyEffectPreset(value: string) {
 .inspector-channel__meter-value { font-size: 10px; line-height: 1.2; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .inspector-channel__meter-value > small { margin-left: 3px; color: var(--on-surface-muted); font-size: 8px; font-weight: 400; }
 
-.inspector-group--effects {
-  border-color: color-mix(in srgb, var(--primary-border) 50%, var(--outline));
-  background: color-mix(in srgb, var(--primary-soft) 10%, var(--surface-1));
-}
-
 .inspector-group--clip {
   background: color-mix(in srgb, var(--surface-2) 20%, var(--surface-1));
 }
@@ -797,17 +630,6 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   color: color-mix(in srgb, var(--on-surface) 68%, var(--on-surface-muted));
   font-size: 11px;
   letter-spacing: 0;
-}
-
-.effect-hint {
-  margin: -2px 0 1px;
-  padding: 6px 7px;
-  border-left: 2px solid color-mix(in srgb, var(--primary) 64%, transparent);
-  border-radius: 0 6px 6px 0;
-  color: var(--on-surface-muted);
-  font-size: 10px;
-  line-height: 1.45;
-  background: color-mix(in srgb, var(--surface-2) 54%, transparent);
 }
 
 .panel-field__split {
@@ -934,13 +756,6 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   --n-border-hover: 1px solid color-mix(in srgb, var(--primary-border) 82%, var(--outline)) !important;
   --n-border-focus: 1px solid color-mix(in srgb, var(--primary) 56%, transparent) !important;
   --n-box-shadow-focus: 0 0 0 2px color-mix(in srgb, var(--primary-soft) 34%, transparent) !important;
-}
-
-.inspector-group--effects :deep(.n-base-selection),
-.inspector-group--effects :deep(.n-input),
-.inspector-group--effects :deep(.n-input-number .n-input) {
-  --n-color: var(--surface-1) !important;
-  --n-border: 1px solid color-mix(in srgb, var(--outline) 62%, transparent) !important;
 }
 
 .editor-inspector :deep(.n-slider-rail),

@@ -1,6 +1,5 @@
 import { defineStore } from 'pinia'
 import { createLogger } from '@/utils/logger'
-import { hasEditorEffects, prepareEditorExportEffects } from '@/utils/editorRender'
 import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
 import { assertPluginProjectSupported, currentPluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession } from '@/utils/pluginHost'
 import { computed, onScopeDispose, ref, watch } from 'vue'
@@ -25,7 +24,6 @@ import type {
   EditorSourceRole,
   EditorClip,
   EditorTrack,
-  EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
 
@@ -39,7 +37,6 @@ export type {
   EditorSource,
   EditorSourceRole,
   EditorTrack,
-  EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
 
@@ -309,20 +306,9 @@ function duplicatedTrackColor(source: EditorSource) {
 function cloneTracks(tracks: EditorTrack[]) {
   return tracks.map((track) => ({
     ...track,
-    effects: track.effects ? { ...track.effects } : undefined,
     pluginChain: clonePluginChain(track.pluginChain),
     clips: track.clips?.map((clip) => ({ ...clip })),
   }))
-}
-
-function normalizeTrackEffects(effects?: Partial<EditorTrackEffects> | null): EditorTrackEffects {
-  return {
-    reverb: clamp(Number(effects?.reverb ?? 0), 0, 1),
-    delay: clamp(Number(effects?.delay ?? 0), 0, 1),
-    delayTime: clamp(Number(effects?.delayTime ?? 0.24), 0.05, 1.2),
-    clarity: clamp(Number(effects?.clarity ?? 0), 0, 1),
-    compressor: clamp(Number(effects?.compressor ?? 0), 0, 1),
-  }
 }
 
 function normalizeSource(source: Partial<EditorSource>): EditorSource {
@@ -470,7 +456,6 @@ function normalizeTrack(
     solo: Boolean(track.solo),
     fadeIn,
     fadeOut,
-    effects: normalizeTrackEffects(track.effects),
     pluginChain: normalizePluginChain(track.pluginChain),
     type: track.type === 'recording' || role === 'recording'
       ? 'recording'
@@ -577,7 +562,6 @@ function trackToExportTrack(track: EditorTrack, source?: EditorSource) {
     pan: track.pan,
     muted: track.muted,
     solo: track.solo,
-    effects: track.effects ? { ...track.effects } : undefined,
     clips,
   }
 }
@@ -1499,7 +1483,6 @@ export const useEditorStore = defineStore('editor', () => {
       solo: false,
       fadeIn: 0,
       fadeOut: 0,
-      effects: normalizeTrackEffects(),
       type: 'reference',
       clips: [normalizeClip({
         id: makeId('clip'),
@@ -1531,7 +1514,6 @@ export const useEditorStore = defineStore('editor', () => {
       solo: false,
       fadeIn: 0,
       fadeOut: 0,
-      effects: normalizeTrackEffects(),
       clips: [],
     }
     session.value.tracks.push(track)
@@ -1777,13 +1759,6 @@ export const useEditorStore = defineStore('editor', () => {
     if (interactionDepth.value === 0) scheduleSave()
   }
 
-  function setTrackEffects(trackId: string, patch: Partial<EditorTrackEffects>) {
-    const track = session.value?.tracks.find((item) => item.id === trackId)
-    if (!track) return
-    track.effects = normalizeTrackEffects({ ...track.effects, ...patch })
-    if (interactionDepth.value === 0) scheduleSave()
-  }
-
   function setClipFades(
     trackId: string,
     clipId: string,
@@ -1969,7 +1944,6 @@ export const useEditorStore = defineStore('editor', () => {
     exportRenderController = renderController
     const pluginRenderRequired = hasEditorPlugins(snapshot)
     let pluginTailLimited = false
-    const renderRequired = !pluginRenderRequired && snapshot.tracks.some(track => hasEditorEffects(track.effects))
     exporting.value = true
     exportCancelling.value = false
     exportCancelRequested = false
@@ -1982,13 +1956,13 @@ export const useEditorStore = defineStore('editor', () => {
         ? await (async () => {
             const hostCapabilities = await pluginHostCapabilities()
             if (!hostCapabilities.enabled) throw new Error(String(i18n.global.t('editor.plugins.unavailable')))
-            assertPluginProjectSupported(exportProject, hostCapabilities.formats || ['vst3'], hostCapabilities.builtinEffects === true)
+            assertPluginProjectSupported(exportProject, hostCapabilities.formats || ['vst3'])
             await capturePluginState(exportProject, true)
             if (exportCancelRequested) throw new EditorExportCancelledError()
             // Capture can wait while the project is edited. Freeze its complete
             // post-capture version instead of mixing fresh plugin states into an older mix.
             snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
-            assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'], hostCapabilities.builtinEffects === true)
+            assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'])
             nativeRenderTaskId = taskId
             exportProgress.value = { phase: 'rendering', completed: 0, total: 100, current: '' }
             try {
@@ -1999,9 +1973,7 @@ export const useEditorStore = defineStore('editor', () => {
               nativeRenderTaskId = null
             }
           })()
-        : await prepareEditorExportEffects(snapshot, taskId, renderController.signal, (ratio, current) => {
-            exportProgress.value = { phase: 'rendering', completed: Math.floor(ratio * 75), total: 100, current }
-          })
+        : { session: snapshot, sourceSampleRate: undefined }
       exportRenderController = null
       if (exportCancelRequested) throw new EditorExportCancelledError()
       const project = prepared.session
@@ -2050,11 +2022,6 @@ export const useEditorStore = defineStore('editor', () => {
       if (pluginRenderRequired) {
         await invoke('plugin_host_cleanup_render', { taskId }).catch(error => {
           studioLog.warn('Failed to clean up plugin render files', error)
-        })
-      }
-      if (renderRequired) {
-        await invoke('cleanup_editor_export_render', { projectId: snapshot.id, taskId }).catch(error => {
-          studioLog.warn('Failed to clean up editor render files', error)
         })
       }
       exporting.value = false
@@ -2197,7 +2164,6 @@ export const useEditorStore = defineStore('editor', () => {
     toggleTrackFlag,
     setTrackVolume,
     setTrackPan,
-    setTrackEffects,
     setClipFades,
     setClipTiming,
     setMasterVolume,

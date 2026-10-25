@@ -94,19 +94,19 @@ test('active formats use host platform capabilities while unsupported bypassed s
   assert.equal(session.pluginChain[2].state, 'opaque:au')
 })
 
-test('built-in effects require an explicit host capability and retain plugin format checks', () => {
+test('project block reasons only check active plugin formats across master and track chains', () => {
   const session = project()
   session.pluginChain = [slot]
   session.tracks = [{ id: 'track', sourceId: 'source', name: 'Track', role: 'stem', volume: 1,
-    pan: 0, muted: false, solo: false, fadeIn: 0, fadeOut: 0,
-    effects: { reverb: 0.2, delay: 0.3, delayTime: 0.4, clarity: 0.5, compressor: 0.6 } }]
-  assert.equal(pluginProjectBlockReason(session), 'effects')
-  assert.equal(pluginProjectBlockReason(session, ['vst3'], false), 'effects')
-  assert.equal(pluginProjectBlockReason(session, ['vst3'], true), null)
-  assert.equal(pluginProjectBlockReason(session, ['vst2'], true), 'format')
-  const rendered = neutralPluginRenderProject(session, { path: 'render.wav', duration: 2, sampleRate: 48000, channels: 2 })
-  assert.equal(rendered.tracks[0].effects, undefined)
-  assert.equal(session.tracks[0].effects?.reverb, 0.2)
+    pan: 0, muted: false, solo: false, fadeIn: 0, fadeOut: 0, pluginChain: [{ ...slot, id: 'track-slot' }],
+    ...{ effects: { reverb: 0.2, delay: 0.3, delayTime: 0.4, clarity: 0.5, compressor: 0.6 } } }]
+  assert.equal(pluginProjectBlockReason(session), null)
+  assert.equal(pluginProjectBlockReason(session, ['vst3']), null)
+  assert.equal(pluginProjectBlockReason(session, ['vst2']), 'format')
+  session.pluginChain[0].bypassed = true
+  assert.equal(pluginProjectBlockReason(session, ['vst2']), 'format')
+  session.tracks[0].pluginChain![0].bypassed = true
+  assert.equal(pluginProjectBlockReason(session, ['vst2']), null)
 })
 
 test('AUv3 and AUv2 identities parse their complete fourcc fields and infer one AU format', () => {
