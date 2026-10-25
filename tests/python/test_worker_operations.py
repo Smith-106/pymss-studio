@@ -162,7 +162,7 @@ class RunOperationTests(unittest.TestCase):
                 result_event = next(e for e in events if e["type"] == "operation_result")
                 audio_out = result_event["payload"]["outputs"]["audio"]
                 self.assertEqual(audio_out["kind"], "audio_file")
-                self.assertEqual(Path(audio_out["path"]).parent, out_dir)
+                self.assertTrue(Path(audio_out["path"]).parent.samefile(out_dir))
 
                 data, srr = sf.read(audio_out["path"], dtype="float32")
                 self.assertEqual(srr, sr)
