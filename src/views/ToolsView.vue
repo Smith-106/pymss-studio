@@ -89,6 +89,9 @@ function applyRequestedTool() {
   }
 }
 function selectTool(tool: AudioToolKey) {
+  // Leaving a plugin view must restore the built-in pane (PR review: switching
+  // back to a built-in tool kept showing the plugin iframe).
+  activePluginTool.value = ''
   if (activeTool.value === tool) return
   if (guide.phase === 'running' && guide.currentStep.tool !== tool) guide.pause()
   activeTool.value = tool
@@ -108,7 +111,7 @@ watch(activeTool, value => { if (restored) { recordActiveToolVisit(); void updat
 </script>
 <template><div class="page tools-page audio-tools-page"><div class="page-header-compact"><div><h1>{{ t('tools.title') }}</h1><p>{{ t('tools.subtitle') }}</p></div></div>
   <n-select :value="activeTool" @update:value="selectTool" class="audio-tools-mobile-select" data-guide="audio-tools" :options="mobileToolOptions" />
-  <div class="audio-tools-workspace"><nav class="audio-tools-nav" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: !activePluginTool && activeTool === tool.id }" @click="activeTool = tool.id"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section><section v-if="pluginToolViews.length"><strong>{{ t('tools.categoryPlugins') }}</strong><button v-for="entry in pluginToolViews" :key="`${entry.pluginName}/${entry.view.id}`" type="button" :class="{ active: activePluginTool === `${entry.pluginName}/${entry.view.id}` }" @click="activePluginTool = `${entry.pluginName}/${entry.view.id}`"><n-icon :component="ExtensionPuzzleOutline" /><span>{{ entry.view.title || entry.view.id }}</span></button></section></nav>
+  <div class="audio-tools-workspace"><nav class="audio-tools-nav" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: !activePluginTool && activeTool === tool.id }" @click="selectTool(tool.id)"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section><section v-if="pluginToolViews.length"><strong>{{ t('tools.categoryPlugins') }}</strong><button v-for="entry in pluginToolViews" :key="`${entry.pluginName}/${entry.view.id}`" type="button" :class="{ active: activePluginTool === `${entry.pluginName}/${entry.view.id}` }" @click="activePluginTool = `${entry.pluginName}/${entry.view.id}`"><n-icon :component="ExtensionPuzzleOutline" /><span>{{ entry.view.title || entry.view.id }}</span></button></section></nav>
     <main class="audio-tools-content">
       <PluginViewHost v-if="activePluginToolView" :key="activePluginTool" :plugin-name="activePluginToolView.pluginName" :view="activePluginToolView.view" />
       <KeepAlive v-if="!activePluginToolView"><component :is="activeDefinition.component" :key="activeDefinition.id" /></KeepAlive>

@@ -145,7 +145,12 @@ onMounted(async () => {
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] })
   try {
     if (!props.view.entryPath && !props.view.entry) throw new Error('view entry not found')
-    src.value = `pymss-plugin://view/${encodeURIComponent(props.pluginName)}/${encodeURIComponent(props.view.id)}/index.html`
+    // WebView2 (Windows) cannot resolve custom schemes inside sandboxed
+    // iframes; Tauri serves registered protocols there as
+    // https://<scheme>.localhost/. Use the platform-appropriate origin.
+    const isWindows = navigator.userAgent.includes('Windows')
+    const base = isWindows ? 'https://pymss-plugin.localhost' : 'pymss-plugin://'
+    src.value = `${base}/view/${encodeURIComponent(props.pluginName)}/${encodeURIComponent(props.view.id)}/index.html`
     status.value = 'loading'
   } catch (failure) {
     status.value = 'error'

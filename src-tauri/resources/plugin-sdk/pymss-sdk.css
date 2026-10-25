@@ -4,8 +4,8 @@
  * even before/without the handshake.
  *
  * Usage (plugin view page):
- *   <link rel="stylesheet" href="pymss-plugin://sdk/pymss-sdk.css">
- *   <script src="pymss-plugin://sdk/pymss-sdk.js"></script>
+ *   <link rel="stylesheet" href="../../../sdk/pymss-sdk.css">
+ *   <script src="../../../sdk/pymss-sdk.js"></script>
  * then compose pages with the .pymss-* classes.
  */
 

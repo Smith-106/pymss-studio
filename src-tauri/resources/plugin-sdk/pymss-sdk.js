@@ -5,8 +5,8 @@
  * shipping on the plugin side.
  *
  * Usage:
- *   <link rel="stylesheet" href="pymss-plugin://sdk/pymss-sdk.css">
- *   <script src="pymss-plugin://sdk/pymss-sdk.js"></script>
+ *   <link rel="stylesheet" href="../../../sdk/pymss-sdk.css">
+ *   <script src="../../../sdk/pymss-sdk.js"></script>
  *   const result = await pymss.call('operations.start', {...})
  */
 (function () {
