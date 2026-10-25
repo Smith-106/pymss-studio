@@ -9,7 +9,9 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
   const playback = useEditorPlaybackStore()
   const required = computed(() => hasEditorPlugins(editor.session))
   let activeProjectId: string | null = null
+  let failedProjectId: string | null = null
   let generation = 0
+  let mixGeneration = 0
   let disposed = false
   let polling = false
   let pollingEnabled = false
@@ -34,6 +36,7 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
       return
     }
     stopPoll()
+    if (!disposed && playback.requestId === id) failedProjectId = editor.session?.id || null
     playback.fail(id, cause instanceof Error ? cause.message : String(cause))
   }
 
@@ -54,10 +57,23 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
     return !disposed && serial === generation && activeProjectId === projectId && editor.session?.id === projectId
   }
 
+  async function ensureLatestProject(project: NonNullable<typeof editor.session>, serial: number) {
+    const signature = pluginProjectSignature(project)
+    try { await ensurePluginSession(project) }
+    catch (cause) {
+      // An edit can repair the chain while the old load is still outstanding.
+      if (disposed || serial !== generation || editor.session !== project
+        || signature === pluginProjectSignature(project) || !hasEditorPlugins(project)) throw cause
+      await ensurePluginSession(project)
+    }
+  }
+
   function applyStatus(result: PluginHostStatus, id: number, projectId: string, serial: number, preservePosition = false) {
     if (disposed || generation !== serial || playback.requestId !== id || editor.session?.id !== projectId) return
     if (result.projectId && result.projectId !== projectId) return
     if (result.error) { fail(id, new Error(result.error)); return }
+    failedProjectId = null
+    playback.clearError()
     const recording = recordingOwnsPosition(projectId)
     if (!recording && !preservePosition) playback.setCurrentTime(result.position)
     playback.setMasterLevel(result.masterLevel || [0, 0])
@@ -78,11 +94,12 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
       const projectId = activeProjectId
       const serial = generation
       const id = playback.requestId
+      const mix = mixGeneration
       try {
         const result = await pluginHostRequest<PluginHostStatus>({ op: 'status', projectId })
-        applyStatus(result, id, projectId, serial)
+        if (mix === mixGeneration && failedProjectId !== projectId) applyStatus(result, id, projectId, serial)
       } catch (cause) {
-        if (serial === generation && projectId === activeProjectId) fail(id, cause)
+        if (serial === generation && projectId === activeProjectId && mix === mixGeneration && failedProjectId !== projectId) fail(id, cause)
       } finally {
         polling = false
         if (pollingEnabled && playback.status !== 'error') schedulePoll()
@@ -97,7 +114,7 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
     stopPoll()
     const id = playback.beginRequest('play', 'starting')
     try {
-      await ensurePluginSession(project)
+      await ensureLatestProject(project, serial)
       if (serial !== generation || editor.session?.id !== project.id || disposed) return false
       activeProjectId = project.id
       if (!await syncMonitor(project.id, serial)) return false
@@ -135,13 +152,21 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
       try {
         let result = await pluginHostRequest<PluginHostStatus>({ op: 'pause', projectId })
         if (reset && serial === generation) result = await pluginHostRequest<PluginHostStatus>({ op: 'seek', projectId, position: 0 })
+        if (!required.value && serial === generation && !disposed && editor.session?.id === projectId) {
+          if (playback.finishPause(id)) playback.clearError()
+          return
+        }
         applyStatus(result, id, projectId, serial, preservePosition)
         if (serial === generation && !disposed && !preservePosition) {
           pollingEnabled = playback.status !== 'error'
           schedulePoll()
         }
       } catch (cause) {
-        if (serial === generation && !disposed) fail(id, cause)
+        if (serial === generation && !disposed) {
+          if (!required.value && editor.session?.id === projectId) {
+            if (playback.finishPause(id)) playback.clearError()
+          } else fail(id, cause)
+        }
       }
     })()
     return true
@@ -157,7 +182,7 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
     playback.setCurrentTime(position)
     void (async () => {
       try {
-        await ensurePluginSession(project)
+        await ensureLatestProject(project, serial)
         if (serial !== generation || disposed || editor.session?.id !== project.id) return
         activeProjectId = project.id
         if (!await syncMonitor(project.id, serial)) return
@@ -173,16 +198,29 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
   }
 
   watch(() => editor.session && pluginProjectSignature(editor.session), async () => {
+    const update = ++mixGeneration
     const project = editor.session
-    if (!project || project.id !== activeProjectId || !hasEditorPlugins(project)) return
+    if (!project || (project.id !== activeProjectId && project.id !== failedProjectId) || !hasEditorPlugins(project)) return
     const serial = generation
+    const id = playback.requestId
+    const current = () => !disposed && update === mixGeneration && serial === generation && editor.session === project && playback.requestId === id
     try {
       await ensurePluginSession(project)
-      await syncMonitor(project.id, serial)
+      if (!current()) return
+      const recovering = failedProjectId === project.id
+      if (recovering) activeProjectId = project.id
+      if (!await syncMonitor(project.id, serial) || !current()) return
+      if (recovering) {
+        const result = await pluginHostRequest<PluginHostStatus>({ op: 'status', projectId: project.id })
+        if (!current()) return
+        applyStatus(result, id, project.id, serial)
+        pollingEnabled = playback.status !== 'error'
+        schedulePoll()
+      }
     } catch (cause) {
-      if (serial === generation && !disposed) {
+      if (current()) {
         void pluginHostRequest({ op: 'pause', projectId: project.id }).catch(() => undefined)
-        fail(playback.requestId, cause)
+        fail(id, cause)
       }
     }
   })
@@ -201,6 +239,7 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
     generation += 1
     stopPoll()
     activeProjectId = null
+    failedProjectId = null
     if (oldProject) void (async () => {
       await editor.releasePluginSession(oldProject).catch(() => undefined)
     })()
@@ -209,6 +248,8 @@ export function useEditorNativePlayback(editor: ReturnType<typeof useEditorStore
     if (!value && previous) {
       pause()
       activeProjectId = null
+      failedProjectId = null
+      playback.clearError()
       const projectId = editor.session?.id
       if (projectId && editor.session) void editor.releasePluginSession(editor.session).catch(() => undefined)
     }

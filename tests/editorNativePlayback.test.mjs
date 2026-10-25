@@ -29,7 +29,13 @@ function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCa
     i18n: { global: { t: key => key } },
     onBeforeUnmount: action => cleanup.push(action),
     setTimeout: action => { timers.set(++timerId, action); return timerId }, clearTimeout: id => timers.delete(id),
-    ensurePluginSession: async project => { calls.push(['ensure', project.id]); if (ensureGate) await ensureGate.promise },
+    ensurePluginSession: async project => {
+      calls.push(['ensure', project.id])
+      const failure = backend.ensureError
+      if (ensureGate) await ensureGate.promise
+      if (backend.ensureGate) await backend.ensureGate.promise
+      if (failure) throw new Error(failure)
+    },
     snapshotPluginStates: async project => { calls.push(['snapshot', project.id]); return false },
     unloadPluginSession: async projectId => { calls.push(['unload', projectId]) },
     pluginHostRequest: async request => {
@@ -37,6 +43,7 @@ function environment(t, { ensureGate, statusGate, pauseGate, monitorGate, hostCa
       if (backend.dialogPending) throw new PluginHostDialogPendingError('Waiting for a plugin dialog')
       if (request.op === 'play') { backend.playing = !backend.playEnds; backend.position = backend.playEnds ? 10 : request.position }
       if (request.op === 'pause') { if (pauseGate) await pauseGate.promise; backend.playing = false }
+      if (request.op === 'pause' && backend.pauseError) throw new Error(backend.pauseError)
       if (request.op === 'seek') backend.position = request.position
       if (request.op === 'monitor' && monitorGate) await monitorGate.promise
       if (request.op === 'status' && statusGate) return statusGate.promise
@@ -63,6 +70,114 @@ test('native transport sends control messages and applies host meters without PC
   assert.equal(env.playback.currentTime, 0)
   assert.ok(env.calls.some(call => call[0] === 'play' && call[2].position === 2))
   assert.ok(env.calls.every(call => !call[2] || !('pcm' in call[2])))
+})
+
+test('removing a failed insert clears its playback error and resumes status polling after recovery', async t => {
+  const env = environment(t)
+  env.editor.session.pluginChain.push({ ...env.editor.session.pluginChain[0], id: 'good' })
+  await env.native.play(2)
+  env.backend.error = 'Bad plugin does not support this channel layout'
+  env.backend.playing = false
+  await env.poll()
+  assert.equal(env.playback.status, 'error')
+  assert.equal(env.timers.size, 0)
+  env.backend.error = undefined
+  env.editor.session.pluginChain.splice(0, 1)
+  await flush()
+  assert.equal(env.playback.error, null)
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.timers.size, 1)
+})
+
+test('a failed initial load recovers after the bad insert is removed while valid inserts remain', async t => {
+  const env = environment(t)
+  env.editor.session.pluginChain.push({ ...env.editor.session.pluginChain[0], id: 'good' })
+  env.backend.ensureError = 'Bad plugin load failed'
+  assert.equal(await env.native.play(1), false)
+  assert.match(env.playback.error, /Bad plugin load failed/)
+  env.backend.ensureError = undefined
+  env.editor.session.pluginChain.splice(0, 1)
+  await flush()
+  assert.equal(env.playback.error, null)
+  assert.equal(env.playback.status, 'paused')
+  assert.equal(env.timers.size, 1)
+})
+
+test('removing the final insert clears the obsolete native playback error', async t => {
+  const env = environment(t)
+  env.backend.ensureError = 'Bad plugin load failed'
+  await env.native.play(1)
+  env.editor.session.pluginChain = []
+  await flush()
+  assert.equal(env.native.required.value, false)
+  assert.equal(env.playback.error, null)
+})
+
+test('a retiring graph cannot restore its old error after the final insert is removed', async t => {
+  for (const pauseError of [undefined, 'Old graph is unavailable']) {
+    const env = environment(t)
+    await env.native.play(1)
+    env.backend.error = 'Bad plugin processing failed'
+    await env.poll()
+    env.backend.pauseError = pauseError
+    env.editor.session.pluginChain = []
+    await flush()
+    assert.equal(env.playback.status, 'paused')
+    assert.equal(env.playback.error, null)
+    assert.equal(env.timers.size, 0)
+  }
+})
+
+test('queued healthy status from a retained graph cannot hide a failed chain update', async t => {
+  const statusGate = deferred()
+  const env = environment(t, { statusGate })
+  await env.native.play(1)
+  const updateGate = deferred()
+  env.backend.ensureGate = updateGate
+  env.backend.ensureError = 'Missing plugin'
+  env.editor.session.pluginChain.push({ ...env.editor.session.pluginChain[0], id: 'bad' })
+  await nextTick()
+  const polling = env.poll()
+  updateGate.resolve()
+  await flush()
+  assert.equal(env.playback.status, 'error')
+  statusGate.resolve({ projectId: 'project', position: 2, playing: true, duration: 10 })
+  await polling
+  assert.equal(env.playback.status, 'error')
+  assert.match(env.playback.error, /Missing plugin/)
+  assert.equal(env.timers.size, 0)
+})
+
+test('a late retiring pause cannot clear a newer Web Audio failure', async t => {
+  for (const pauseError of [undefined, 'Old graph is unavailable']) {
+    const gate = deferred()
+    const env = environment(t, { pauseGate: gate })
+    await env.native.play(1)
+    env.backend.pauseError = pauseError
+    env.editor.session.pluginChain = []
+    await flush()
+    const request = env.playback.beginRequest('play', 'starting')
+    env.playback.fail(request, 'New audio decoder failed')
+    gate.resolve()
+    await flush()
+    assert.equal(env.playback.status, 'error')
+    assert.equal(env.playback.error, 'New audio decoder failed')
+  }
+})
+
+test('an initial load that fails after the chain was repaired retries the current chain once', async t => {
+  const loadGate = deferred()
+  const env = environment(t, { ensureGate: loadGate })
+  env.editor.session.pluginChain.push({ ...env.editor.session.pluginChain[0], id: 'good' })
+  env.backend.ensureError = 'Old bad plugin failed'
+  const playing = env.native.play(1)
+  env.editor.session.pluginChain.splice(0, 1)
+  await flush()
+  env.backend.ensureError = undefined
+  loadGate.resolve()
+  assert.equal(await playing, true)
+  assert.equal(env.playback.error, null)
+  assert.equal(env.calls.filter(call => call[0] === 'ensure').length, 2)
 })
 test('a plugin dialog retains playback polling and recovers without a transport error', async t => {
   const env = environment(t)

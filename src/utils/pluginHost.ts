@@ -3,7 +3,7 @@ import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
-export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean; catalogCache?: boolean; defaultDirectories?: string[] }
+export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean; catalogCache?: boolean; nativeTransport?: boolean; defaultDirectories?: string[] }
 export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean; category?: string; subCategories?: string[]; rawCategory?: number | null; componentType?: number; componentSubtype?: number; componentManufacturer?: number }
 export type PluginParameter = { id: string; name: string; min: number; max: number; default: number; unit: string; taper: string; choices: string[] }
 export type PluginParameters = Partial<PluginHostStatus> & { params: PluginParameter[]; values: Record<string, number> }
@@ -11,18 +11,28 @@ export type PluginScanBlacklistEntry = { path: string; name: string; reason: 'ma
 export type PluginScanStatus = { scanId: string; phase: 'collecting' | 'scanning' | 'finished' | 'cancelled'; currentPath: string | null; currentName: string | null; elapsedMs: number; completed: number; total: number; canSkip: boolean }
 export type PluginScanReport = { plugins: PluginDescriptor[]; failures: { path: string; message: string }[]; scanned: number; cached: number; blacklisted?: PluginScanBlacklistEntry[]; cancelled?: boolean }
 export type UnavailablePlugin = { slotId: string; message: string }
-export type PluginHostStatus = { projectId?: string; sessionId?: string; stateRevision?: number; openEditors?: string[]; unavailablePlugins?: UnavailablePlugin[]; position: number; playing: boolean; duration: number; levels?: Record<string, [number, number]>; masterLevel?: [number, number]; error?: string }
-export type PluginSessionState = { project: EditorSession; sessionId: string; revision: number; dirty: boolean; error: string | null; openEditors: string[]; unavailablePlugins: UnavailablePlugin[]; unavailable: boolean; interactionRequired?: boolean }
+export type PluginHostStatus = { projectId?: string; sessionId?: string; stateRevision?: number; transportOwner?: string; transportRevision?: number; openEditors?: string[]; unavailablePlugins?: UnavailablePlugin[]; position: number; playing: boolean; duration: number; levels?: Record<string, [number, number]>; masterLevel?: [number, number]; error?: string }
+export type PluginSessionState = { project: EditorSession; sessionId: string; revision: number; dirty: boolean; error: string | null; openEditors: string[]; unavailablePlugins: UnavailablePlugin[]; unavailable: boolean; transportOwner?: string; interactionRequired?: boolean }
 export class PluginHostDialogPendingError extends Error {
   constructor() { super(String(i18n.global.t('editor.plugins.dialogPending'))); this.name = 'PluginHostDialogPendingError' }
 }
-type Session = PluginSessionState & { signature: string; capturedRevision: number; lastStatus: number; lastFallback: number }
+type Session = PluginSessionState & { signature: string; capturedRevision: number; lastStatus: number; lastFallback: number; nativeTransport: boolean; transportRevision?: number }
 let loaded: Session | null = null
 let operationQueue: Promise<unknown> = Promise.resolve()
 let capabilities: Promise<PluginHostCapabilities> | null = null
 let monitor: ReturnType<typeof setTimeout> | null = null
 let sessionSequence = 0
 const listeners = new Set<(state: PluginSessionState | null) => void>()
+export type PluginTransportRequest = { project: EditorSession; session: PluginSessionState; sessionId: string; owner: string }
+const transportListeners = new Set<(request: PluginTransportRequest) => void>()
+export function observePluginTransport(listener: (request: PluginTransportRequest) => void) {
+  transportListeners.add(listener)
+  scheduleMonitor()
+  return () => {
+    transportListeners.delete(listener)
+    if (!transportListeners.size && !listeners.size && monitor) { clearTimeout(monitor); monitor = null }
+  }
+}
 const stateIntents = new WeakMap<EditorPluginSlot, { state: string | undefined; token: object }>()
 
 function stateIntent(slot: EditorPluginSlot) {
@@ -44,25 +54,27 @@ export function observePluginSession(listener: (state: PluginSessionState | null
   listeners.add(listener)
   if (loaded) listener(loaded)
   scheduleMonitor()
-  return () => { listeners.delete(listener); if (!listeners.size && monitor) { clearTimeout(monitor); monitor = null } }
+  return () => { listeners.delete(listener); if (!listeners.size && !transportListeners.size && monitor) { clearTimeout(monitor); monitor = null } }
 }
 export function currentPluginSession() { return loaded }
 
-function scheduleMonitor() {
-  if (monitor || !loaded || !listeners.size) return
+function scheduleMonitor(reset = false) {
+  if (reset && monitor) { clearTimeout(monitor); monitor = null }
+  if (monitor || !loaded || (!listeners.size && !transportListeners.size)) return
+  const interval = loaded.openEditors.length && loaded.nativeTransport ? 100 : 1000
   monitor = setTimeout(async () => {
     monitor = null
     const current = loaded
     if (!current || current.unavailable) return
     try {
       // The playback adapter already polls at 100 ms; an idle native editor still needs observation.
-      if (Date.now() - current.lastStatus >= 750) await pluginHostRequest({ op: 'status', projectId: current.project.id })
+      if (Date.now() - current.lastStatus >= (current.openEditors.length && current.nativeTransport ? 75 : 750)) await pluginHostRequest({ op: 'status', projectId: current.project.id })
       if (loaded === current && current.openEditors.length && !current.error && Date.now() - current.lastFallback >= 15000) {
         current.lastFallback = Date.now(); current.dirty = true; publish()
       }
     } catch { /* Playback and persistence expose the retained session error. */ }
     scheduleMonitor()
-  }, 1000)
+  }, interval)
 }
 
 function observeResponse(request: Record<string, unknown>, value: unknown) {
@@ -71,6 +83,21 @@ function observeResponse(request: Record<string, unknown>, value: unknown) {
   const response = value as Partial<PluginHostStatus>
   if (response.projectId && response.projectId !== current.project.id) return
   let changed = false
+  const sessionChanged = typeof response.sessionId === 'string' && response.sessionId !== current.sessionId
+  const revision = response.transportRevision
+  if (typeof response.transportOwner === 'string' && Number.isSafeInteger(revision) && Number(revision) >= 0) {
+    const previous = current.transportRevision
+    const delta = Number(revision) - Number(previous)
+    const sameOwner = current.transportOwner === response.transportOwner
+    current.transportOwner = response.transportOwner
+    current.transportRevision = Number(revision)
+    // Consume before dispatch. The View queues playback outside this RPC, so callbacks
+    // never wait for another request while holding the host operation queue.
+    if (!sessionChanged && sameOwner && previous !== undefined && delta > 0 && delta % 2 === 1) {
+      const request = { project: current.project, session: current, sessionId: current.sessionId, owner: response.transportOwner }
+      for (const listener of transportListeners) listener(request)
+    }
+  }
   if (current.interactionRequired) {
     current.interactionRequired = false; current.error = null; changed = true
   }
@@ -148,7 +175,8 @@ async function ensureNow(project: EditorSession) {
     ...(stateRestoreSlotIds.length ? { stateRestoreSlotIds } : {}) })
   if (op === 'load' || !loaded || loaded.project !== project) {
     loaded = { project, sessionId: response.sessionId || `session-${++sessionSequence}`, revision: response.stateRevision || 0,
-      capturedRevision: -1, dirty: true, error: null, signature, unavailable: false, unavailablePlugins: response.unavailablePlugins || [], openEditors: response.openEditors || [], lastStatus: 0, lastFallback: Date.now() }
+      capturedRevision: -1, dirty: true, error: null, signature, unavailable: false, unavailablePlugins: response.unavailablePlugins || [], openEditors: response.openEditors || [], lastStatus: 0, lastFallback: Date.now(), nativeTransport: hostCapabilities.nativeTransport ?? Number.isSafeInteger(response.transportRevision), transportOwner: response.transportOwner,
+      transportRevision: Number.isSafeInteger(response.transportRevision) && Number(response.transportRevision) >= 0 ? response.transportRevision : undefined }
     publish()
   } else { loaded.signature = signature; loaded.error = null }
   scheduleMonitor()
@@ -230,7 +258,7 @@ export async function openPluginEditor(project: EditorSession, slotId: string, o
     const result = await requestNow<{ open?: boolean }>({ op: 'editor', slotId, open, projectId: project.id })
     if (loaded?.project === project && result.open !== undefined) {
       loaded.openEditors = result.open ? [...new Set([...loaded.openEditors, slotId])] : loaded.openEditors.filter(id => id !== slotId)
-      loaded.dirty = true; publish(); scheduleMonitor()
+      loaded.dirty = true; publish(); scheduleMonitor(true)
     }
     return result
   })

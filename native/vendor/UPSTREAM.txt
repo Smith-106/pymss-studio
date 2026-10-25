@@ -46,6 +46,24 @@ notifications remain pending; failed transitions prevent further processing.
 Application integrations
 are maintained in native/audio-host, not in the upstream FFI implementation.
 
+Windows editor ownership is supplied explicitly by the desktop bridge, including
+reassignment of an already-open VST2/VST3 container. Logical visibility preserves
+the view across owner-driven WM_SHOWWINDOW notifications and their nested explicit
+show/hide calls; user close and explicit hide still retire the view. Hidden-window
+regressions cover cross-process ownership, re-opening, minimization and restoration.
+https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#owned-windows
+https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-showwindow
+
 native/vst2-host is a local effect adapter. Its ABI declarations reference the
 MIT-licensed RustAudio/vst-rs source; the corresponding notice is included in
 native/vst2-host/THIRD-PARTY-LICENSES.txt. No Steinberg SDK headers are distributed.
+
+Native editor transport shortcuts:
+- Host windows record their calling webview label and expose a separate per-owner key counter.
+- Windows captures unmodified non-repeating Space in hosted VST2/VST3 child windows, while
+  standard edit/caret/character-input controls retain keyboard input. Cocoa applies the same
+  policy to hosted VST2/VST3/Audio Unit windows and native AppKit text responders.
+- The existing status protocol forwards intents to the owning frontend transport; no global
+  system hotkeys or asynchronous protocol output are introduced.
+- Linux native transport interception remains disabled: X11 passive grabs cannot reliably
+  distinguish third-party plugin text editors. Native plugin loading remains available.

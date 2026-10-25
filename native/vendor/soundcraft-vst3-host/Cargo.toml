@@ -37,6 +37,14 @@ name = "editor_main_thread"
 harness = false
 
 [[test]]
+name = "editor_window_owner"
+harness = false
+
+[[test]]
+name = "editor_transport_keyboard"
+harness = false
+
+[[test]]
 name = "module_exit"
 harness = false
 

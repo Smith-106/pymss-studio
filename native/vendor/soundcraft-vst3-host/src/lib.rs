@@ -48,6 +48,8 @@ pub mod scan;
 #[allow(unsafe_code)]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+mod editor_transport;
+#[cfg(not(target_arch = "wasm32"))]
 mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
@@ -257,6 +259,11 @@ pub fn with_ui_context<R>(f: impl FnOnce() -> R) -> R {
     api::with_ui_context(f)
 }
 
+/// Sets the app's top-level Windows HWND for subsequently opened plugin windows.
+/// Call on the UI thread; zero clears the owner for standalone hosting.
+#[cfg(windows)]
+pub fn set_editor_owner(owner: usize) -> Result<(), String> { ffi::set_editor_owner(owner) }
+
 /// A native parent window shared by the desktop helper's plugin adapters.
 /// Create, service and close it on the helper UI thread.
 #[cfg(not(target_arch = "wasm32"))]
@@ -269,6 +276,9 @@ impl NativeEditorWindow {
     }
     pub fn parent(&self) -> *mut std::ffi::c_void { self.0.parent() }
     pub fn raw(&self) -> *mut std::ffi::c_void { self.0.raw() }
+    /// Applies the current app HWND when an existing editor is opened from another window.
+    #[cfg(windows)]
+    pub fn update_owner(&self) -> Result<(), String> { self.0.update_owner() }
     pub fn raise(&self) { self.0.raise(); }
     pub fn is_visible(&self) -> bool { self.0.is_visible() }
     pub fn resize(&self, width: f64, height: f64) { self.0.resize(width, height); }
@@ -424,3 +434,14 @@ mod tests {
 pub fn instantiate_descriptor(desc: &Vst3Descriptor) -> Result<Vst3Plugin, Vst3Error> {
     registry::instantiate_descriptor(desc)
 }
+
+/// Associate subsequently opened/raised native windows with their calling editor webview.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_editor_transport_owner(owner: &str) -> Result<(), String> {
+    if !ffi::on_ui_thread() { return Err("Plugin keyboard ownership requires the UI thread".into()); }
+    editor_transport::set_owner(owner)
+}
+
+/// Monotonic transport-key count for one editor webview; it never mutates plugin state.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn editor_transport_revision(owner: &str) -> u64 { editor_transport::revision(owner) }

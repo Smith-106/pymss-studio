@@ -663,6 +663,8 @@ impl Shared {
         let mut state = lock(&self.ui);
         if let Some(window) = state.window.as_ref() {
             if window.is_visible() {
+                #[cfg(windows)]
+                window.update_owner()?;
                 window.raise();
                 return Ok(());
             }

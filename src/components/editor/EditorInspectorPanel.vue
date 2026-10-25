@@ -22,6 +22,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   selectTrack: [trackId: string | null]
+  togglePlayback: []
   setMasterVolume: [value: number]
   setMasterPan: [value: number]
   setMasterLimiter: [patch: Partial<MasterLimiterSettings>]
@@ -326,7 +327,7 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
         </div>
 
         <div class="inspector-strip__inserts">
-          <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" />
+          <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" @toggle-playback="emit('togglePlayback')" />
         </div>
       </section>
 

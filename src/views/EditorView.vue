@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { isTutorialFrame } from '@/features/onboarding/demoContext'
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { FolderOpenOutline, MusicalNotesOutline, OptionsOutline } from '@vicons/ionicons5'
 import { useEditorStore } from '@/stores/editor'
-import { currentPluginSession } from '@/utils/pluginHost'
+import { currentPluginSession, observePluginTransport } from '@/utils/pluginHost'
 import { useTaskStore } from '@/stores/task'
 import { useSettingsStore } from '@/stores/settings'
 import EditorAssetPanel from '@/components/editor/EditorAssetPanel.vue'
@@ -245,6 +245,18 @@ async function togglePlayback() {
   const ok = await toggleTransport()
   if (!ok && playbackError.value) message.error(playbackError.value)
 }
+
+let nativeShortcutDisposed = false
+let nativeShortcutQueue = Promise.resolve()
+const stopNativeShortcuts = observePluginTransport(request => {
+  nativeShortcutQueue = nativeShortcutQueue.then(async () => {
+    const current = currentPluginSession()
+    if (nativeShortcutDisposed || editor.session !== request.project || current !== request.session
+      || current.sessionId !== request.sessionId || current.transportOwner !== request.owner) return
+    await togglePlayback()
+  }).catch(cause => { if (!nativeShortcutDisposed) message.error(String(cause)) })
+})
+onScopeDispose(() => { nativeShortcutDisposed = true; stopNativeShortcuts() })
 
 async function handleRecordingToggle() {
   if (recordingState.value === 'idle' && isImportingExternal.value) {
@@ -623,6 +635,7 @@ watch(
               :last-export-path="editor.lastExport?.path || null"
               :compact="inspectorPanelWidth <= 248"
               @select-track="editor.selectTrack"
+              @toggle-playback="togglePlayback"
               @set-master-volume="setMasterVolume"
               @set-master-pan="setMasterPan"
               @set-master-limiter="editor.setMasterLimiter"

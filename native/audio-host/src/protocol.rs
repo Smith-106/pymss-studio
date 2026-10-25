@@ -7,6 +7,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(windows)]
+fn editor_owner(message: &Value) -> Result<usize, String> {
+    match message.get("editorOwner") {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "The plugin editor's owner reference is invalid".into()),
+    }
+}
+
 fn au_scan_target(path: &Path) -> Result<Option<&str>, String> {
     let Some(id) = path.to_str() else {
         return Ok(None);
@@ -434,10 +445,20 @@ fn host_tick(
                     .and_then(Value::as_f64)
                     .ok_or("Playback position is required")?,
             )?,
-            "editor" => current.editor(
-                message.get("slotId").and_then(Value::as_str).unwrap_or(""),
-                message.get("open").and_then(Value::as_bool).unwrap_or(true),
-            )?,
+            "editor" => {
+                let open = message.get("open").and_then(Value::as_bool).unwrap_or(true);
+                #[cfg(windows)]
+                if open {
+                    soundcraft_vst3_host::set_editor_owner(editor_owner(&message)?)?;
+                }
+                if open {
+                    soundcraft_vst3_host::set_editor_transport_owner(message.get("transportOwner").and_then(Value::as_str).unwrap_or(""))?;
+                }
+                current.editor(
+                    message.get("slotId").and_then(Value::as_str).unwrap_or(""),
+                    open,
+                )?
+            }
             "param" => current.param(
                 message.get("slotId").and_then(Value::as_str).unwrap_or(""),
                 message.get("paramId").and_then(Value::as_str).unwrap_or(""),
@@ -480,7 +501,12 @@ fn host_tick(
         Ok(Some(value))
     })();
     match result {
-        Ok(Some(value)) => respond(id, Ok(value)),
+        Ok(Some(mut value)) => {
+            let owner = message.get("transportOwner").and_then(Value::as_str).unwrap_or("");
+            value["transportOwner"] = json!(owner);
+            value["transportRevision"] = json!(soundcraft_vst3_host::editor_transport_revision(owner));
+            respond(id, Ok(value));
+        }
         Err(error) => respond(id, Err(error)),
         Ok(None) => {}
     }
@@ -563,6 +589,22 @@ pub fn run_cli() -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn editor_owner_references_preserve_standalone_requests_and_reject_invalid_numbers() {
+        assert_eq!(editor_owner(&json!({})).unwrap(), 0);
+        assert_eq!(editor_owner(&json!({"editorOwner": 12345})).unwrap(), 12345);
+        for value in [
+            json!(null),
+            json!(-1),
+            json!(1.5),
+            json!("12345"),
+            json!([]),
+        ] {
+            assert!(editor_owner(&json!({"editorOwner": value})).is_err());
+        }
+    }
 
     #[test]
     fn monitor_request_requires_a_bounded_string_array() {

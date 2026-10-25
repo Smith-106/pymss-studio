@@ -1811,6 +1811,8 @@ impl EditorLink {
         let mut g = self.lock();
         if let Some(w) = &g.window {
             if w.is_visible() {
+                #[cfg(windows)]
+                w.update_owner()?;
                 w.raise();
                 return Ok(());
             }
@@ -2021,6 +2023,9 @@ impl EditorLink {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn set_editor_owner(owner: usize) -> Result<(), String> { window::set_editor_owner(owner) }
+
 /// A shared native parent window for other plugin ABI adapters. Raw handles are only handed
 /// back to the owning ABI; all window operations remain on the helper UI thread.
 pub(crate) struct NativeEditorWindow(Option<window::HostWindow>);
@@ -2045,6 +2050,10 @@ impl NativeEditorWindow {
     }
     pub(crate) fn raw(&self) -> *mut c_void {
         self.0.as_ref().map_or(std::ptr::null_mut(), window::HostWindow::raw)
+    }
+    #[cfg(windows)]
+    pub(crate) fn update_owner(&self) -> Result<(), String> {
+        self.0.as_ref().ok_or("The plugin window is closed")?.update_owner()
     }
     pub(crate) fn raise(&self) {
         if let Some(window) = &self.0 { window.raise(); }
@@ -2113,6 +2122,7 @@ pub(crate) fn pump_ui() {
                 if PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
                     break;
                 }
+                if window::transport_key(&message) { continue; }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -2186,9 +2196,34 @@ mod window {
             ) else {
                 break;
             };
+            if transport_key(&event, mtm) { continue; }
             app.sendEvent(&event);
         }
         app.updateWindows();
+    }
+
+    fn transport_key(event: &objc2_app_kit::NSEvent, mtm: MainThreadMarker) -> bool {
+        use objc2::runtime::{AnyClass, Bool};
+        use objc2::msg_send;
+        use objc2_app_kit::{NSEventType, NSEventModifierFlags};
+        let kind = event.r#type();
+        if kind != NSEventType::KeyDown && kind != NSEventType::KeyUp { return false; }
+        if event.keyCode() != 49 { return false; }
+        if kind == NSEventType::KeyUp { return crate::editor_transport::release(); }
+        if event.isARepeat() { return crate::editor_transport::held(); }
+        if event.modifierFlags().intersects(NSEventModifierFlags::Shift | NSEventModifierFlags::Control
+            | NSEventModifierFlags::Option | NSEventModifierFlags::Command) { return false; }
+        let Some(window) = event.window(mtm) else { return false; };
+        if let Some(responder) = window.firstResponder() {
+            for name in [c"NSTextView", c"NSTextField", c"NSSearchField"] {
+                if let Some(class) = AnyClass::get(name) {
+                    // SAFETY: every AppKit responder implements NSObject's class query.
+                    let editing: Bool = unsafe { msg_send![&*responder, isKindOfClass: class] };
+                    if editing.as_bool() { return false; }
+                }
+            }
+        }
+        crate::editor_transport::request(Retained::as_ptr(&window) as usize)
     }
 
     pub fn shutdown() {
@@ -2238,7 +2273,9 @@ mod window {
             window.setExcludedFromWindowsMenu(true);
             window.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle);
             window.center();
-            Ok(HostWindow { window: Retained::into_raw(window) })
+            let window = Retained::into_raw(window);
+            crate::editor_transport::register(window as usize);
+            Ok(HostWindow { window })
         }
 
         /// The raw window pointer (for the plug frame's resizes).
@@ -2253,6 +2290,7 @@ mod window {
 
         pub fn raise(&self) {
             if let Some(w) = self.get() {
+                crate::editor_transport::register(self.window as usize);
                 w.makeKeyAndOrderFront(None);
             }
         }
@@ -2263,6 +2301,7 @@ mod window {
 
         pub fn close(self) {
             if let Some(w) = self.get() {
+                crate::editor_transport::unregister(self.window as usize);
                 w.orderOut(None);
                 w.close();
             }
@@ -2285,7 +2324,7 @@ mod window {
     }
 }
 
-/// The Windows host window: a top-level window owned by the app's active window (so it stays
+/// The Windows host window: a top-level window owned by the explicit app editor window (so it stays
 /// above it and has no taskbar button) whose client area is the plugin view's `HWND` parent.
 /// Closing it only hides it; the editor link notices in `idle`, detaches the view, then destroys
 /// the window. Messages are dispatched by the app's own event loop on the main thread.
@@ -2293,16 +2332,58 @@ mod window {
 mod window {
     use std::ffi::{c_char, c_void};
     use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE,
-        GetWindowLongPtrW, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_OVERLAPPED, WS_SYSMENU,
+        GetAncestor, GetWindow, GetWindowLongPtrW, GA_ROOT, GW_OWNER, GWLP_HWNDPARENT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, IsWindow, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOZORDER, SWP_NOSIZE, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_SHOWWINDOW, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_OVERLAPPED, WS_SYSMENU,
     };
 
     pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeHWND);
+    static EDITOR_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn transport_key(message: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, VK_SPACE, VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetGUIThreadInfo, GUITHREADINFO, SendMessageW, WM_GETDLGCODE, DLGC_WANTCHARS, WM_KEYDOWN, WM_KEYUP};
+        if message.wParam != VK_SPACE as usize { return false; }
+        if message.message == WM_KEYUP { return crate::editor_transport::release(); }
+        if message.message != WM_KEYDOWN { return false; }
+        if message.lParam & (1 << 30) != 0 { return crate::editor_transport::held(); }
+        // This thread's message pump is the only consumer. Inspect the currently focused
+        // child, not merely the container, so embedded VST2/VST3 views work identically.
+        unsafe {
+            if [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN].iter().any(|key| GetKeyState(*key as i32) < 0) { return false; }
+            let focus = GetFocus();
+            if focus.is_null() || GetAncestor(focus, GA_ROOT) != GetAncestor(message.hwnd, GA_ROOT) { return false; }
+            let mut class = [0u16; 256];
+            let length = GetClassNameW(focus, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+            let class = String::from_utf16_lossy(&class[..length]).to_ascii_lowercase();
+            if class == "edit" || class.starts_with("richedit") || class.contains("textedit") || class == "scintilla" { return false; }
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            if GetGUIThreadInfo(0, &mut info) != 0 && info.hwndCaret == focus { return false; }
+            if SendMessageW(focus, WM_GETDLGCODE, message.wParam, message as *const _ as isize) & DLGC_WANTCHARS as isize != 0 { return false; }
+            crate::editor_transport::request(GetAncestor(focus, GA_ROOT) as usize)
+        }
+    }
+
+    fn validate_owner(owner: usize) -> Result<HWND, String> {
+        let hwnd = owner as HWND;
+        // SAFETY: these APIs validate an HWND value without dereferencing caller memory.
+        if owner != 0 && unsafe { IsWindow(hwnd) == 0 || GetAncestor(hwnd, GA_ROOT) != hwnd } {
+            return Err("The plugin editor's owner window is unavailable".into());
+        }
+        Ok(hwnd)
+    }
+
+    pub fn set_editor_owner(owner: usize) -> Result<(), String> {
+        if !on_main_thread() { return Err("Plugin window ownership requires the main thread".into()); }
+        validate_owner(owner)?;
+        EDITOR_OWNER.store(owner, Ordering::Release);
+        Ok(())
+    }
 
     /// Rust names the process's first thread "main"; the app runs its UI (and message loop) there.
     pub fn on_main_thread() -> bool {
@@ -2314,12 +2395,33 @@ mod window {
     }
 
     const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    const VISIBLE_INTENT: isize = 1;
+    const OWNER_VISIBILITY_CHANGE: isize = 2;
 
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if msg == WM_CLOSE {
             // SAFETY: `hwnd` is the window this procedure was called for.
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                ShowWindow(hwnd, SW_HIDE);
+            }
             return 0;
+        }
+        if msg == WM_SHOWWINDOW {
+            // DefWindowProc handles an owner-driven show/hide by sending a nested explicit
+            // WM_SHOWWINDOW. Keep that nested notification from changing the user's intent.
+            let flags = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+            if lparam != 0 {
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, flags | OWNER_VISIBILITY_CHANGE) };
+                let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                    (current & !OWNER_VISIBILITY_CHANGE) | (flags & OWNER_VISIBILITY_CHANGE)) };
+                return result;
+            }
+            if flags & OWNER_VISIBILITY_CHANGE == 0 {
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, (wparam != 0) as isize) };
+            }
         }
         // SAFETY: default handling of a message for the window it was sent to.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -2385,10 +2487,9 @@ mod window {
             let class = class_name().ok_or_else(|| "cannot register the editor window class".to_string())?;
             let title = wide(title);
             let (ow, oh) = outer_size(STYLE, 0, w, h);
-            // SAFETY: main thread; the active window (or null) of this thread's queue.
-            let owner = unsafe { GetActiveWindow() };
+            let owner = validate_owner(EDITOR_OWNER.load(Ordering::Acquire))?;
             // SAFETY: registered class and NUL-terminated strings that outlive the call; the
-            // owner is null or a window of this thread.
+            // owner is a validated top-level app window, or null for standalone callers.
             let hwnd = unsafe {
                 CreateWindowExW(
                     0,
@@ -2408,6 +2509,7 @@ mod window {
             if hwnd.is_null() {
                 return Err("cannot create the editor window".into());
             }
+            crate::editor_transport::register(hwnd as usize);
             Ok(HostWindow { hwnd })
         }
 
@@ -2421,10 +2523,31 @@ mod window {
             self.live().unwrap_or(std::ptr::null_mut())
         }
 
+        pub fn update_owner(&self) -> Result<(), String> {
+            let hwnd = self.live().ok_or("The plugin window is closed")?;
+            crate::editor_transport::register(hwnd as usize);
+            let owner = validate_owner(EDITOR_OWNER.load(Ordering::Acquire))?;
+            // SAFETY: our live top-level window and a validated owner. A zero previous owner
+            // is a successful return too, so clear and inspect the thread's last error.
+            unsafe {
+                if GetWindow(hwnd, GW_OWNER) != owner {
+                    SetLastError(0);
+                    if SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner as isize) == 0 && GetLastError() != 0 {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                    if SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) == 0 {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                }
+            }
+            Ok(())
+        }
+
         pub fn raise(&self) {
             if let Some(h) = self.live() {
                 // SAFETY: a live window of this thread.
                 unsafe {
+                    SetWindowLongPtrW(h, GWLP_USERDATA, VISIBLE_INTENT);
                     ShowWindow(h, SW_SHOW);
                     SetForegroundWindow(h);
                 }
@@ -2432,13 +2555,15 @@ mod window {
         }
 
         pub fn is_visible(&self) -> bool {
-            // SAFETY: a live window of this thread.
-            self.live().is_some_and(|h| unsafe { IsWindowVisible(h) } != 0)
+            // Logical visibility survives owner minimization. WM_CLOSE and explicit hides
+            // clear this flag, so both plugin adapters can still detect a user-closed view.
+            self.live().is_some_and(|h| unsafe { GetWindowLongPtrW(h, GWLP_USERDATA) } & VISIBLE_INTENT != 0)
         }
 
         pub fn close(self) {
             if let Some(h) = self.live() {
                 // SAFETY: our own live window; the view was detached before (see `teardown`).
+                crate::editor_transport::unregister(h as usize);
                 unsafe { DestroyWindow(h) };
             }
         }

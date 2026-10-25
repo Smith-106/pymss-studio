@@ -1,5 +1,102 @@
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn minimized_app_does_not_hide_a_pending_standard_plugin_dialog_from_detection() {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, DispatchMessageW, IsIconic, IsWindowVisible, PeekMessageW,
+        ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_HIDE, SW_SHOWMINNOACTIVE,
+        SW_SHOWNOACTIVATE, WS_CAPTION, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU,
+    };
+    struct Windows(Vec<HWND>);
+    impl Drop for Windows {
+        fn drop(&mut self) {
+            for hwnd in self.0.iter().rev() {
+                // SAFETY: each hidden fixture window belongs to this test's thread.
+                unsafe {
+                    DestroyWindow(*hwnd);
+                }
+            }
+        }
+    }
+    let title: Vec<_> = "Plugin dialog ownership fixture"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut windows = Windows(Vec::new());
+    let mut owner = std::ptr::null_mut();
+    for (class, style) in [
+        ("STATIC", WS_OVERLAPPEDWINDOW),
+        ("#32770", WS_POPUP | WS_CAPTION | WS_SYSMENU),
+    ] {
+        let class: Vec<_> = class.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: system classes and valid retained strings. Offscreen tool windows never
+        // activate or take focus; the parent/owned relationship matches the plugin helper.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                class.as_ptr(),
+                title.as_ptr(),
+                style,
+                -30000,
+                -30000,
+                160,
+                100,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        windows.0.push(hwnd);
+        owner = hwnd;
+        unsafe {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+    let pump = || {
+        // SAFETY: MSG is writable; dispatch only messages from the current test thread.
+        unsafe {
+            let mut message: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    };
+    pump();
+    let pid = std::process::id();
+    assert_eq!(
+        dialogs::owned_dialog(pid).as_deref(),
+        Some("Plugin dialog ownership fixture")
+    );
+    unsafe {
+        ShowWindow(windows.0[0], SW_SHOWMINNOACTIVE);
+    }
+    pump();
+    assert_ne!(unsafe { IsIconic(windows.0[0]) }, 0);
+    assert_eq!(unsafe { IsWindowVisible(windows.0[1]) }, 0);
+    assert!(
+        dialogs::owned_dialog(pid).is_some(),
+        "the pending dialog survives minimization"
+    );
+    unsafe {
+        ShowWindow(windows.0[0], SW_SHOWNOACTIVATE);
+    }
+    pump();
+    assert!(dialogs::owned_dialog(pid).is_some());
+    unsafe {
+        ShowWindow(windows.0[1], SW_HIDE);
+    }
+    pump();
+    assert!(
+        dialogs::owned_dialog(pid).is_none(),
+        "an explicitly hidden normal dialog is not a pending modal"
+    );
+}
+
 #[cfg(any(unix, windows))]
 struct Fixture {
     process: Option<HostProcess>,

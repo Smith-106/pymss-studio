@@ -32,7 +32,7 @@ function environment(t, { scanControl = false } = {}) {
     usePluginManagerWindow: () => ({}),
     defineEmits: () => (event, trackId) => emitted.push({ event, trackId }),
     computed, ref, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
-    useEditorStore: () => ({
+    useEditorStore: () => reactive({
       async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise },
       setPluginChain(trackId, chain) {
         writes.push({ trackId, chain })
@@ -41,7 +41,7 @@ function environment(t, { scanControl = false } = {}) {
       },
       scheduleSave() { calls.push({ kind: 'save', project: props.session }) },
     }),
-    useEditorPlaybackStore: () => ({}), observePluginSession: () => () => {}, onScopeDispose: callback => disposals.push(callback), onMounted: callback => mounts.push(callback),
+    useEditorPlaybackStore: () => reactive({ error: null }), observePluginSession: () => () => {}, onScopeDispose: callback => disposals.push(callback), onMounted: callback => mounts.push(callback),
     async invoke(command, args) {
       calls.push({ kind: 'invoke', command, args })
       if (command === 'pick_input_folder') return controls.directory
@@ -117,6 +117,25 @@ function environment(t, { scanControl = false } = {}) {
     },
   }
 }
+
+test('dismissing an error keeps the underlying persistence failure and new failures become visible', async t => {
+  const env = environment(t)
+  env.evaluate("editor.pluginStateError = 'Unable to save plugin state'")
+  await flush()
+  assert.equal(env.read('showOperationError'), true)
+  env.call('dismissOperationError')
+  assert.equal(env.read('showOperationError'), false)
+  assert.equal(env.evaluate('editor.pluginStateError'), 'Unable to save plugin state')
+  env.evaluate("editor.pluginStateError = 'New plugin state failure'")
+  await flush()
+  assert.equal(env.read('showOperationError'), true)
+  env.call('dismissOperationError')
+  await env.call('run', () => {})
+  assert.equal(env.read('showOperationError'), true, 'a new action must expose an unresolved failure again')
+  env.evaluate('editor.pluginStateError = null')
+  await flush()
+  assert.equal(env.read('showOperationError'), false)
+})
 
 test('catalog searches names, vendors and formats and clears a hidden or unsupported selection', async t => {
   const env = environment(t)
@@ -1288,4 +1307,34 @@ test('failed favorite persistence retains the displayed state and does not touch
   assert.match(env.read('error'), /Storage unavailable/)
   assert.equal(env.writes.length, 0)
   assert.equal(env.calls.length, 0)
+})
+
+test('Space on the manager background or a plugin row requests transport once and ignores repeats', t => {
+  const env = environment(t)
+  let prevented = 0
+  const background = { key: ' ', target: null, preventDefault() { prevented++ } }
+  env.call('onManagerKeydown', background)
+  const row = { closest(selector) { return selector.startsWith('button,') ? { hasAttribute: key => key === 'data-editor-transport' } : null } }
+  env.call('onPluginKeydown', { ...background, target: row })
+  env.call('onPluginKeydown', { ...background, target: row, repeat: true })
+  assert.equal(prevented, 3)
+  assert.deepEqual(env.emitted, [{ event: 'togglePlayback', trackId: undefined }, { event: 'togglePlayback', trackId: undefined }])
+})
+
+test('Space preserves text editing, summaries, buttons and modified keys without toggling transport', t => {
+  const env = environment(t)
+  let prevented = 0
+  const base = { key: ' ', target: null, preventDefault() { prevented++ } }
+  for (const patch of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { shiftKey: true }, { isComposing: true }, { defaultPrevented: true }, { key: 'Delete' }]) {
+    env.call('onPluginKeydown', { ...base, ...patch })
+  }
+  for (const kind of ['input', 'summary', 'parameter', 'button', 'editable']) {
+    const target = { isContentEditable: kind === 'editable', closest(selector) {
+      if (selector.startsWith('input,')) return ['input', 'summary', 'parameter'].includes(kind) ? {} : null
+      return kind === 'button' ? { hasAttribute: () => false } : null
+    } }
+    env.call('onPluginKeydown', { ...base, target })
+  }
+  assert.equal(prevented, 0)
+  assert.equal(env.emitted.length, 0)
 })

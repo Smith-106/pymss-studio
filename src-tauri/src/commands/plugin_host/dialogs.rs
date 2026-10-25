@@ -59,7 +59,8 @@ pub(super) fn owned_dialog(_pid: u32) -> Option<String> {
 pub(super) fn owned_dialog(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetAncestor, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
+        IsIconic, IsWindowVisible, GA_ROOTOWNER,
     };
 
     struct Search {
@@ -73,7 +74,14 @@ pub(super) fn owned_dialog(pid: u32) -> Option<String> {
         unsafe {
             GetWindowThreadProcessId(window, &mut pid);
         }
-        if pid != search.pid || unsafe { IsWindowVisible(window) } == 0 {
+        if pid != search.pid {
+            return 1;
+        }
+        // Windows hides the complete owned-popup chain while the app editor is minimized.
+        // A hidden standard modal can still block the helper UI thread until restoration.
+        if unsafe {
+            IsWindowVisible(window) == 0 && IsIconic(GetAncestor(window, GA_ROOTOWNER)) == 0
+        } {
             return 1;
         }
         let mut class = [0u16; 64];

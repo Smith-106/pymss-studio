@@ -13,7 +13,7 @@ import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, p
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
-const emit = defineEmits<{ selectTarget: [trackId: string | null] }>()
+const emit = defineEmits<{ selectTarget: [trackId: string | null]; togglePlayback: [] }>()
 const { t, locale } = useI18n()
 const editor = useEditorStore()
 const playback = useEditorPlaybackStore()
@@ -40,6 +40,7 @@ const expandedCatalogGroups = ref(new Set<string>())
 const collapsedSearchGroups = ref(new Set<string>())
 const feedback = ref('')
 const error = ref('')
+const dismissedOperationError = ref('')
 const dialogPending = ref(false)
 let dialogOperationError = false
 const descriptors = ref<PluginDescriptor[]>([])
@@ -93,6 +94,9 @@ const { windowStyle, resizingWindow, startWindowResize, resizeWindowWithKeyboard
 const descriptorKey = (plugin: PluginDescriptor) => JSON.stringify([plugin.id, plugin.path])
 const relocatingSlot = computed(() => chain.value.find(slot => slot.id === relocatingSlotId.value))
 const operationError = computed(() => error.value || editor.pluginStateError || playback.error)
+const showOperationError = computed(() => Boolean(operationError.value && operationError.value !== dismissedOperationError.value))
+watch(operationError, () => { dismissedOperationError.value = '' })
+function dismissOperationError() { dismissedOperationError.value = operationError.value || '' }
 const categoryLabels = computed(() => ({
   eq: t('editor.plugins.categories.eq'), dynamics: t('editor.plugins.categories.dynamics'),
   pitch: t('editor.plugins.categories.pitch'), reverb: t('editor.plugins.categories.reverb'),
@@ -172,6 +176,15 @@ function toggleFavorite(option: (typeof catalogOptions.value)[number]) {
     localStorage.setItem(FAVORITES_KEY, JSON.stringify([...next]))
     favorites.value = next
   } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+function onPluginKeydown(event: KeyboardEvent) {
+  if (event.key !== ' ' || event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+  const element = event.target as HTMLElement | null
+  if (element?.isContentEditable || element?.closest?.('input, textarea, select, summary, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="spinbutton"], [role="slider"], [role="checkbox"], [role="switch"], [role="radio"], [role="tab"], [role="menuitem"], [role="option"]')) return
+  const button = element?.closest?.('button, [role="button"], a[href]')
+  if (button && !button.hasAttribute('data-editor-transport')) return
+  event.preventDefault()
+  if (!event.repeat) emit('togglePlayback')
 }
 function isCatalogGroupExpanded(key: string) {
   return librarySearch.value.trim() ? !collapsedSearchGroups.value.has(key) : expandedCatalogGroups.value.has(key)
@@ -309,6 +322,7 @@ function onManagerKeyCapture(event: KeyboardEvent) {
   event.stopPropagation()
 }
 function onManagerKeydown(event: KeyboardEvent) {
+  onPluginKeydown(event)
   if (event.key !== 'Escape' || event.defaultPrevented) return
   const element = event.target instanceof Element ? event.target : null
   if (element?.closest('[data-plugin-confirm-trigger][aria-expanded="true"]')) {
@@ -337,6 +351,7 @@ async function run(action: () => void | Promise<void>) {
   if (busy.value) return
   busy.value = true
   error.value = ''
+  dismissedOperationError.value = ''
   dialogOperationError = false
   const project = props.session
   try { await action() }
@@ -615,7 +630,7 @@ async function toggleEditor(slotId: string) {
 </script>
 
 <template>
-  <section v-if="capabilities?.enabled" class="plugin-panel" :aria-busy="busy" :aria-label="t('editor.plugins.inserts')" @keydown.stop>
+  <section v-if="capabilities?.enabled" class="plugin-panel" :aria-busy="busy" :aria-label="t('editor.plugins.inserts')" @keydown.stop="onPluginKeydown">
     <div class="plugin-panel__header">
       <strong>{{ t('editor.plugins.inserts') }}<span>{{ chain.length }}</span></strong>
       <n-button ref="manageButton" size="tiny" quaternary :type="operationError ? 'warning' : 'default'" :aria-label="t('editor.plugins.title')" aria-haspopup="dialog" :aria-expanded="managerOpen" :title="t('editor.plugins.manage')" @click="openManager()"><template #icon><n-icon :component="AddOutline" /></template>{{ t('editor.plugins.library') }}</n-button>
@@ -624,7 +639,7 @@ async function toggleEditor(slotId: string) {
       <li v-for="(slot, index) in chain" :key="slot.id" class="plugin-insert" :class="{ 'plugin-insert--bypassed': slot.bypassed }">
         <div class="plugin-insert__main">
           <span class="plugin-insert__number">{{ index + 1 }}</span>
-          <n-button class="plugin-insert__editor" size="small" text :type="opened.includes(slot.id) ? 'primary' : 'default'" :disabled="busy || !capabilities.nativeEditor || !(capabilities.nativeEditorFormats || ['vst3']).includes(slot.format) || unavailablePlugins.some(item => item.slotId === slot.id)" :aria-label="t(opened.includes(slot.id) ? 'editor.plugins.closeNamedEditor' : 'editor.plugins.openNamedEditor', { name: slot.name || slot.pluginId })" :title="slot.name || slot.pluginId" @click="toggleEditor(slot.id)">{{ slot.name || slot.pluginId }}</n-button>
+          <n-button class="plugin-insert__editor" data-editor-transport size="small" text :type="opened.includes(slot.id) ? 'primary' : 'default'" :disabled="busy || !capabilities.nativeEditor || !(capabilities.nativeEditorFormats || ['vst3']).includes(slot.format) || unavailablePlugins.some(item => item.slotId === slot.id)" :aria-label="t(opened.includes(slot.id) ? 'editor.plugins.closeNamedEditor' : 'editor.plugins.openNamedEditor', { name: slot.name || slot.pluginId })" :title="slot.name || slot.pluginId" @click="toggleEditor(slot.id)">{{ slot.name || slot.pluginId }}</n-button>
           <n-switch size="small" :value="!slot.bypassed" :disabled="busy" :aria-label="t('editor.plugins.enableNamed', { name: slot.name || slot.pluginId })" @update:value="(enabled: boolean) => setPluginBypassed(slot.id, !enabled)" />
         </div>
         <div class="plugin-insert__tools">
@@ -819,8 +834,8 @@ async function toggleEditor(slotId: string) {
             </section>
           </section>
         </div>
-        <template v-if="operationError" #footer>
-          <n-alert :type="dialogPending ? 'warning' : 'error'" :show-icon="false">
+        <template v-if="showOperationError" #footer>
+          <n-alert :type="dialogPending ? 'warning' : 'error'" :show-icon="false" :closable="!dialogPending" @close="dismissOperationError">
             {{ operationError }}
             <p v-if="!dialogPending" class="plugin-panel__hint">{{ t('editor.plugins.recoveryHint') }}</p>
             <n-button v-if="editor.pluginStateError && !dialogPending" size="small" :disabled="busy" @click="run(async () => { await editor.retryPluginStateSave() })">{{ t('editor.plugins.retrySave') }}</n-button>

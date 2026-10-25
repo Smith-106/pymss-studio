@@ -17,8 +17,8 @@ function deferred(){let resolve;const promise=new Promise(done=>{resolve=done});
 function environment(t){
   t.mock.timers.enable({apis:['setTimeout','Date'],now:100000})
   const callbacks=new Map(), listeners=new Map();let callbackId=0
-  const calls=[], controls={projectId:'project',revision:0,sessionId:'native-1',states:{slot:'sha256:initial'},snapshotError:false,statusError:false,updateError:false,partialSnapshot:false,omittedSlots:[],unavailablePlugins:[],openEditors:[],snapshotGate:null,parameterGate:null,parameterValues:{gain:0.5}}
-  const status=()=>({projectId:controls.projectId,sessionId:controls.sessionId,stateRevision:controls.revision,openEditors:[...controls.openEditors],unavailablePlugins:[...controls.unavailablePlugins],position:0,playing:false,duration:2})
+  const calls=[], controls={projectId:'project',revision:0,transportRevision:0,transportOwner:'editor-a',sessionId:'native-1',states:{slot:'sha256:initial'},snapshotError:false,statusError:false,updateError:false,partialSnapshot:false,omittedSlots:[],unavailablePlugins:[],openEditors:[],snapshotGate:null,parameterGate:null,parameterValues:{gain:0.5}}
+  const status=()=>({projectId:controls.projectId,sessionId:controls.sessionId,stateRevision:controls.revision,transportRevision:controls.transportRevision,transportOwner:controls.transportOwner,openEditors:[...controls.openEditors],unavailablePlugins:[...controls.unavailablePlugins],position:0,playing:false,duration:2})
   globalThis.window={matchMedia:()=>({matches:false}),addEventListener(){},removeEventListener(){},__TAURI_EVENT_PLUGIN_INTERNALS__:{unregisterListener(){}},__TAURI_INTERNALS__:{transformCallback(handler){callbacks.set(++callbackId,handler);return callbackId},async invoke(command,args){
     calls.push({command,args:JSON.parse(JSON.stringify(args||{}))})
     if(command==='plugin:event|listen'){listeners.set(args.handler,{event:args.event,handler:callbacks.get(args.handler)});return args.handler}
@@ -763,4 +763,56 @@ test('master limiter toggle and drag are undoable, preserve disabled parameters 
  await env.editor.loadProject('project')
  assert.equal(env.editor.session.masterLimiter.gainDb,30)
  assert.equal(env.editor.session.masterLimiter.attackMs,3)
+})
+
+test('native editor transport revisions are consumed once without marking plugin state dirty',async t=>{
+ const env=environment(t)
+ const requests=[]
+ const stop=host.observePluginTransport(request=>requests.push(request)); t.after(stop)
+ await host.openPluginEditor(env.editor.session,'slot')
+ await env.tick(900)
+ assert.equal(env.editor.pluginStateDirty,false)
+ env.controls.transportRevision=1
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,1)
+ assert.equal(requests[0].project,env.editor.session)
+ assert.equal(requests[0].owner,'editor-a')
+ assert.equal(env.editor.pluginStateDirty,false)
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,1)
+ env.controls.transportRevision=3
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,1,'two quick toggles cancel each other')
+ env.controls.transportRevision=4
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,2)
+})
+
+test('transport counters rebase on owner/session changes and closing still delivers the last key',async t=>{
+ const env=environment(t); const requests=[]
+ const stop=host.observePluginTransport(request=>requests.push(request)); t.after(stop)
+ await host.openPluginEditor(env.editor.session,'slot')
+ env.controls.transportOwner='editor-b'; env.controls.transportRevision=20
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,0)
+ env.controls.sessionId='native-2'; env.controls.transportRevision=30
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,0)
+ env.controls.transportRevision=31; env.controls.openEditors=[]
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,1)
+ assert.equal(requests[0].sessionId,'native-2')
+ assert.equal(requests[0].owner,'editor-b')
+ env.controls.transportRevision=0
+ await host.pluginHostRequest({op:'status',projectId:'project'})
+ assert.equal(requests.length,1,'a reset is not another key')
+})
+
+test('an opened native editor polls at 100ms before playback has ever started',async t=>{
+ const env=environment(t)
+ await host.openPluginEditor(env.editor.session,'slot')
+ env.calls.length=0
+ await env.tick(100)
+ assert.equal(env.calls.filter(call=>call.args?.request?.op==='status').length,1)
+ assert.equal(env.calls.some(call=>call.args?.request?.op==='play'),false)
 })

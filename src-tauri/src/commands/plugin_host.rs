@@ -145,6 +145,7 @@ pub fn plugin_host_capabilities() -> Value {
         "labBuild": cfg!(feature = "vst-lab"),
         "scanControl": capabilities.enabled,
         "catalogCache": capabilities.enabled,
+        "nativeTransport": capabilities.enabled && cfg!(any(windows, target_os = "macos")),
         "defaultDirectories": default_directories,
     })
 }
@@ -1048,9 +1049,20 @@ fn plugin_load_timeout(project: &Value) -> Duration {
     REQUEST_TIMEOUT + Duration::from_secs(units as u64 * 10)
 }
 
+fn bind_editor_owner(request: &mut Value, owner: Option<usize>) -> Result<(), String> {
+    let object = request.as_object_mut().ok_or("Audio host request must be an object")?;
+    object.remove("editorOwner");
+    if let Some(owner) = owner {
+        if owner == 0 { return Err("The editor window is unavailable".into()); }
+        object.insert("editorOwner".into(), json!(owner));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn plugin_host_request(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, PluginHostState>,
     mut request: Value,
 ) -> Result<Value, String> {
@@ -1063,13 +1075,19 @@ pub async fn plugin_host_request(
     if !supported_operation(&op) {
         return Err("Unsupported audio host operation".into());
     }
-    if op == "editor"
-        && request.get("open").and_then(Value::as_bool).unwrap_or(true)
-        && !host_capabilities().native_editor
-    {
+    let opening_editor = op == "editor" && request.get("open").and_then(Value::as_bool).unwrap_or(true);
+    if opening_editor && !host_capabilities().native_editor {
         return Err("Native plugin editors require an X11 or XWayland display on Linux".into());
     }
     let id = project_id(&request)?.to_string();
+    #[cfg(windows)]
+    let owner = if opening_editor {
+        Some(window.hwnd().map_err(|error| error.to_string())?.0 as usize)
+    } else { None };
+    #[cfg(not(windows))]
+    let owner = None;
+    bind_editor_owner(&mut request, owner)?;
+    request["transportOwner"] = json!(window.label());
     let state = state.inner().clone();
     let generation = if op == "load" {
         state.generation.fetch_add(1, Ordering::AcqRel) + 1
@@ -1878,6 +1896,18 @@ mod tests {
         assert_eq!(discard_session(&mut session, &pid, "old", 4, "instance-new")["closed"], true);
         assert!(session.project_id.is_none());
         assert_eq!(discard_session(&mut session, &pid, "old", 4, "instance-new")["closed"], true);
+    }
+
+    #[test]
+    fn editor_owner_comes_from_the_calling_window_and_never_from_frontend_json() {
+        let mut request = json!({"op":"editor", "editorOwner":999});
+        bind_editor_owner(&mut request, Some(12345)).unwrap();
+        assert_eq!(request["editorOwner"], 12345);
+        bind_editor_owner(&mut request, None).unwrap();
+        assert!(request.get("editorOwner").is_none());
+        request["editorOwner"] = json!(999);
+        assert!(bind_editor_owner(&mut request, Some(0)).is_err());
+        assert!(request.get("editorOwner").is_none());
     }
 
     #[test]
