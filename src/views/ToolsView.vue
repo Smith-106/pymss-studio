@@ -8,6 +8,8 @@ import { isAudioToolAvailable } from '@/features/audio-tools/availability'
 import { audioToolRuntimeKey, createAudioToolRuntime } from '@/features/audio-tools/runtime'
 import { loadAudioToolsState, updateAudioToolsState } from '@/features/audio-tools/state'
 import type { AudioToolCategory, AudioToolKey } from '@/features/audio-tools/types'
+import { usePluginMarketplace } from '@/features/plugin-marketplace/composable'
+import PluginViewHost from '@/features/plugin-marketplace/PluginViewHost.vue'
 import { useAppStore } from '@/stores/app'
 import { detectRuntimePlatform } from '@/utils/runtime'
 import { recordFeatureVisit } from '@/utils/logger'
@@ -17,9 +19,42 @@ const app = useAppStore()
 const route = useRoute()
 const router = useRouter()
 const guide = useBeginnerGuideStore()
+import { ExtensionPuzzleOutline } from '@vicons/ionicons5'
+const pluginMarket = usePluginMarketplace()
+// Plugin-contributed tool pages (protocol v1 views with placement "tool").
+const pluginToolViews = computed(() =>
+  (pluginMarket.snapshot.value?.installed || [])
+    .filter(plugin => plugin.managed && plugin.loaded)
+    .flatMap(plugin =>
+      (plugin.contributions?.views || [])
+        .filter(view => view.placements.includes('tool'))
+        .map(view => ({ pluginName: plugin.name, view })),
+    ),
+)
+const activePluginTool = ref('')
+const activePluginToolView = computed(() =>
+  pluginToolViews.value.find(entry => `${entry.pluginName}/${entry.view.id}` === activePluginTool.value) || null,
+)
+watch(pluginMarket.snapshot, () => {
+  if (activePluginTool.value && !pluginToolViews.value.some(entry => `${entry.pluginName}/${entry.view.id}` === activePluginTool.value)) {
+    activePluginTool.value = ''
+  }
+}, { immediate: true })
 const runtime = createAudioToolRuntime()
 provide(audioToolRuntimeKey, runtime)
 const activeTool = ref<AudioToolKey>('convert')
+function applyRequestedPluginView() {
+  const value = route.query.pluginView
+  activePluginTool.value = typeof value === 'string' && pluginToolViews.value.some(entry => `${entry.pluginName}/${entry.view.id}` === value)
+    ? value : ''
+}
+watch(() => route.query.pluginView, applyRequestedPluginView, { immediate: true })
+watch(pluginToolViews, views => {
+  const query = route.query.pluginView
+  if (typeof query === 'string' && views.some(entry => `${entry.pluginName}/${entry.view.id}` === query)) {
+    activePluginTool.value = query
+  }
+}, { immediate: true })
 const isMacOS = computed(() => detectRuntimePlatform(app.runtimeInfo).isMac)
 const visibleAudioTools = computed(() => audioTools.filter(tool => isAudioToolAvailable(tool, isMacOS.value)))
 const activeDefinition = computed(() => visibleAudioTools.value.find(tool => tool.id === activeTool.value) || visibleAudioTools.value[0] || audioTools[0])
@@ -43,15 +78,27 @@ function recordActiveToolVisit() {
 function applyRequestedTool() {
   const requested = route.query.tool
   if (typeof requested === 'string' && visibleAudioTools.value.some(tool => tool.id === requested)) {
+    activePluginTool.value = ''
     if (guide.phase === 'running' && guide.currentStep.tool !== requested) guide.pause()
     activeTool.value = requested as AudioToolKey
   }
 }
 function selectTool(tool: AudioToolKey) {
+  activePluginTool.value = ''
+  const hasPluginQuery = typeof route.query.pluginView === 'string'
+  if (hasPluginQuery) {
+    const { pluginView: _pluginView, ...query } = route.query
+    void router.replace({ query: { ...query, tool } })
+  }
   if (activeTool.value === tool) return
   if (guide.phase === 'running' && guide.currentStep.tool !== tool) guide.pause()
   activeTool.value = tool
-  if (typeof route.query.tool === 'string') void router.replace({ query: { ...route.query, tool } })
+  if (!hasPluginQuery && typeof route.query.tool === 'string') void router.replace({ query: { ...route.query, tool } })
+}
+function selectPluginTool(pluginView: string) {
+  activePluginTool.value = pluginView
+  const { tool: _tool, ...query } = route.query
+  void router.replace({ query: { ...query, pluginView } })
 }
 watch([() => route.query.tool, visibleAudioTools], applyRequestedTool, { immediate: true })
 onMounted(async () => {
@@ -67,8 +114,11 @@ watch(activeTool, value => { if (restored) { recordActiveToolVisit(); void updat
 </script>
 <template><div class="page tools-page audio-tools-page"><div class="page-header-compact"><div><h1>{{ t('tools.title') }}</h1><p>{{ t('tools.subtitle') }}</p></div></div>
   <n-select :value="activeTool" @update:value="selectTool" class="audio-tools-mobile-select" data-guide="audio-tools" :options="mobileToolOptions" />
-  <div class="audio-tools-workspace"><nav class="audio-tools-nav" data-guide="audio-tools" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: activeTool === tool.id }" @click="selectTool(tool.id)"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section></nav>
-    <main class="audio-tools-content" :data-tool="activeTool"><KeepAlive><component :is="activeDefinition.component" :key="activeDefinition.id" /></KeepAlive></main>
+  <div class="audio-tools-workspace"><nav class="audio-tools-nav" :aria-label="t('tools.toolNavigation')"><section v-for="category in categories" :key="category.id"><strong>{{ t(category.titleKey) }}</strong><button v-for="tool in toolsByCategory(category.id)" :key="tool.id" type="button" :class="{ active: !activePluginTool && activeTool === tool.id }" @click="selectTool(tool.id)"><n-icon :component="tool.icon" /><span>{{ t(tool.titleKey) }}</span></button></section><section v-if="pluginToolViews.length"><strong>{{ t('tools.categoryPlugins') }}</strong><button v-for="entry in pluginToolViews" :key="`${entry.pluginName}/${entry.view.id}`" type="button" :class="{ active: activePluginTool === `${entry.pluginName}/${entry.view.id}` }" @click="selectPluginTool(`${entry.pluginName}/${entry.view.id}`)"><n-icon :component="ExtensionPuzzleOutline" /><span>{{ entry.view.title || entry.view.id }}</span></button></section></nav>
+    <main class="audio-tools-content">
+      <PluginViewHost v-if="activePluginToolView" :key="`${pluginMarket.snapshot.value?.pluginsDir}/${activePluginTool}`" :plugin-name="activePluginToolView.pluginName" :plugins-root="pluginMarket.snapshot.value?.pluginsDir || ''" :view="activePluginToolView.view" />
+      <KeepAlive v-if="!activePluginToolView"><component :is="activeDefinition.component" :key="activeDefinition.id" /></KeepAlive>
+    </main>
   </div>
 </div></template>
 <style src="@/features/audio-tools/styles.css"></style>

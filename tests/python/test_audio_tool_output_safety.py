@@ -50,6 +50,41 @@ class AudioOutputSafetyTests(unittest.TestCase):
                 common._render_output(self.output / 'final.wav', lambda _: self.fail('must not render'))
         self.assertEqual(list(self.output.iterdir()), [])
 
+    def test_reexecuted_worker_keeps_the_native_launcher_identity(self):
+        token = 'audio-aBC123def456XYZ789'
+        record = self.root / 'scope.json'
+        record.write_text(json.dumps({'token': token, 'pid': os.getpid(), 'directory': str(self.output)}))
+        worker = '''import json, sys
+from pathlib import Path
+from audio_tools.common import _render_output
+root = Path(sys.argv[1])
+observed = []
+def render(path):
+    observed.append(path.name)
+    path.write_bytes(b'complete')
+result = _render_output(root / 'completed.wav', render)
+print(json.dumps({'partial': observed[0], 'result': str(result)}))
+'''
+        env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[2] / 'python'),
+               'PYMSS_STUDIO_AUDIO_TEMP_TOKEN': token, 'PYMSS_STUDIO_AUDIO_TEMP_STATE': str(record)}
+        result = subprocess.run([sys.executable, '-c', worker, str(self.output)], env=env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertTrue(observed['partial'].startswith(f'.pymss-audio-{token}-{os.getpid()}-'))
+        self.assertEqual(Path(observed['result']).read_bytes(), b'complete')
+
+    def test_an_unrelated_process_identity_cannot_claim_the_native_receipt(self):
+        token = 'audio-aBC123def456XYZ789'
+        record = self.root / 'scope.json'
+        unrelated = max(os.getpid(), os.getppid()) + 1000000
+        record.write_text(json.dumps({'token': token, 'pid': unrelated, 'directory': str(self.output)}))
+        with mock.patch.dict(os.environ, {'PYMSS_STUDIO_AUDIO_TEMP_TOKEN': token, 'PYMSS_STUDIO_AUDIO_TEMP_STATE': str(record)}), \
+             mock.patch.object(common.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'state is unavailable'):
+                common._render_output(self.output / 'final.wav', lambda _: self.fail('must not render'))
+        self.assertEqual(list(self.output.iterdir()), [])
+
     def test_success_publishes_only_complete_audio_and_never_overwrites_existing_files(self):
         target = self.output / 'mix.wav'
         target.write_bytes(b'original')

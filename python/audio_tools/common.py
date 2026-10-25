@@ -83,8 +83,15 @@ def _render_output(path: Path, render: Callable[[Path], None]) -> Path:
         for attempt in range(10):
             try:
                 scope = json.loads(Path(state).read_text(encoding='utf-8'))
-                if scope['token'] == token and scope['pid'] == os.getpid() and Path(scope['directory']).resolve() == path.parent.resolve():
-                    prefix = f'.pymss-audio-{token}-{os.getpid()}-'
+                launcher_pid = scope['pid']
+                if (
+                    scope['token'] == token
+                    and type(launcher_pid) is int
+                    and launcher_pid > 0
+                    and launcher_pid in {os.getpid(), os.getppid()}
+                    and Path(scope['directory']).resolve() == path.parent.resolve()
+                ):
+                    prefix = f'.pymss-audio-{token}-{launcher_pid}-'
                     break
             except (OSError, ValueError, KeyError, TypeError):
                 pass

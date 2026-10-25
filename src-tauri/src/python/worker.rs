@@ -25,9 +25,30 @@ pub(crate) fn recover_audio_output_temps(app: &AppHandle) {
 }
 
 fn needs_audio_output_scope(command: &str, payload: &Value) -> bool {
-    command == "audio_tools" && payload.get("operation").and_then(Value::as_str).is_some_and(|operation| {
+    command == "run_operation" || command == "audio_tools" && payload.get("operation").and_then(Value::as_str).is_some_and(|operation| {
         ["convert", "merge", "slicer"].iter().any(|name| operation.trim().eq_ignore_ascii_case(name))
     })
+}
+
+fn requires_background_result(command: &str) -> bool {
+    matches!(command, "audio_tools" | "export_editor_mix" | "manage_plugin" | "run_operation")
+}
+
+fn operation_output_directory(payload: &Value, default: &Path) -> AppResult<PathBuf> {
+    let raw = match payload.get("outputDir") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.as_str(),
+        _ => return Err(AppError::Worker("outputDir must be a string".into())),
+    };
+    let path = PathBuf::from(raw);
+    let directory = if raw.is_empty() {
+        default.to_path_buf()
+    } else if path.is_absolute() {
+        path
+    } else {
+        default.parent().unwrap_or(default).join(path)
+    };
+    Ok(std::path::absolute(directory)?)
 }
 
 #[cfg(windows)]
@@ -160,7 +181,7 @@ fn acquire_runtime_access<'a>(
     access: &'a Mutex<RuntimeAccess>,
     command: &str,
 ) -> AppResult<Option<RuntimeAccessGuard<'a>>> {
-    let updating = command == "update_runtime_core";
+    let updating = matches!(command, "update_runtime_core" | "manage_plugin" | "activate_runtime" | "delete_runtime" | "install_runtime");
     if !updating && requires_bootstrap_python(command) {
         return Ok(None);
     }
@@ -347,13 +368,16 @@ fn resolve_active_runtime_record(file: &PathBuf) -> Option<(String, Option<Strin
     let content = std::fs::read_to_string(file).ok()?;
     let record: ActiveRuntimeRecord = serde_json::from_str(&content).ok()?;
     let python = PathBuf::from(&record.python_path);
-    let python = if python.is_absolute() {
+    // Resolve the directory, but retain the interpreter filename. On Unix a venv
+    // python is usually a symlink to the base interpreter; canonicalizing that
+    // final component both loses the venv and breaks backend ownership checks.
+    let resolved = if python.is_absolute() {
         python
     } else {
         file.parent()?.join(python)
     };
-    runtime_python_command_path(&python)
-        .map(|path| (path.to_string_lossy().to_string(), record.source))
+    let executable = resolved.parent()?.canonicalize().ok()?.join(resolved.file_name()?);
+    executable.is_file().then(|| (executable.to_string_lossy().to_string(), record.source))
 }
 
 fn bundled_runtime_envs_dir(app: &AppHandle) -> AppResult<Option<PathBuf>> {
@@ -709,6 +733,11 @@ fn build_worker_command(
     let python_for_log = python.clone();
     let worker_for_log = worker.clone();
     let mut cmd = Command::new(&python);
+    #[cfg(unix)]
+    if command == "manage_plugin" {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     isolate_python_environment(&mut cmd, &storage::temp_dir(app)?);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -1260,6 +1289,9 @@ fn is_background_terminal_event(command: &str, event_type: &str) -> bool {
                 "error" | "optional_package_status" | "task_cancelled"
             )
         }
+        "manage_plugin" => {
+            matches!(event_type, "error" | "plugin_manage_result" | "task_cancelled")
+        }
         "import_custom_model" => matches!(
             event_type,
             "error" | "custom_model_import_finished" | "task_cancelled"
@@ -1268,6 +1300,10 @@ fn is_background_terminal_event(command: &str, event_type: &str) -> bool {
             matches!(event_type, "error" | "task_done" | "task_cancelled")
         }
         "audio_tools" => matches!(event_type, "error" | "audio_tool_result" | "task_cancelled"),
+        "run_operation" => {
+            matches!(event_type, "error" | "operation_result" | "task_cancelled")
+        }
+        "list_nodes" => matches!(event_type, "error" | "nodes_list"),
         "export_editor_mix" => {
             matches!(
                 event_type,
@@ -1549,7 +1585,7 @@ fn spawn_worker_background_inner(
     state: State<'_, AppState>,
     command: &str,
     task_id: String,
-    payload: Value,
+    mut payload: Value,
     operation_id: String,
 ) -> AppResult<()> {
     let mut application_access = Some(acquire_application_operation()?);
@@ -1581,8 +1617,15 @@ fn spawn_worker_background_inner(
     }
 
     let command_name = command.to_string();
+    if command == "run_operation" {
+        let directory = operation_output_directory(&payload, &default_output_dir(&app)?)?;
+        payload.as_object_mut()
+            .ok_or_else(|| AppError::Worker("invalid operation request".into()))?
+            .insert("outputDir".into(), Value::String(directory.to_string_lossy().into_owned()));
+    }
     let mut audio_scope = if needs_audio_output_scope(command, &payload) {
-        let raw = payload.get("outputDir").and_then(Value::as_str).unwrap_or("").trim();
+        let raw = payload.get("outputDir").and_then(Value::as_str).unwrap_or("");
+        let raw = if command == "run_operation" { raw } else { raw.trim() };
         if raw.is_empty() { None } else {
             let path = if raw == "~" { storage::home_dir(&app)? }
                 else if raw.starts_with("~/") || raw.starts_with("~\\") { storage::home_dir(&app)?.join(&raw[2..]) }
@@ -1688,7 +1731,7 @@ fn spawn_worker_background_inner(
                                 mark_task_terminal(&app, request_id);
                             } else {
                                 let message = worker_error_message(&envelope);
-                                if command_name == "update_runtime_core" {
+                                if matches!(command_name.as_str(), "update_runtime_core" | "manage_plugin") {
                                     core_terminal_error =
                                         Some((message, envelope.payload.get("logRecord").cloned()));
                                 } else {
@@ -1709,7 +1752,7 @@ fn spawn_worker_background_inner(
                             mark_task_terminal(&app, &task_id);
                         }
                     }
-                    if command_name == "update_runtime_core"
+                    if matches!(command_name.as_str(), "update_runtime_core" | "manage_plugin")
                         && is_background_terminal_event(&command_name, envelope.event_type.as_str())
                     {
                         core_terminal_events.push(envelope);
@@ -1796,6 +1839,19 @@ fn spawn_worker_background_inner(
                 ("durationMs", started_at.elapsed().as_millis().to_string()),
             ],
         );
+        if let Ok(mut cancelled) = app.state::<AppState>().cancelled_tasks.lock() {
+            for registered_task_id in &registered_task_ids {
+                if cancelled.remove(registered_task_id) {
+                    terminal_task_ids.insert(registered_task_id.clone());
+                    if command_name == "manage_plugin" {
+                        let _ = app.emit("pymss://worker-event", serde_json::json!({
+                            "type": "task_cancelled", "taskId": registered_task_id,
+                            "payload": { "message": "Cancelled" }
+                        }));
+                    }
+                }
+            }
+        }
         let missing_terminal_task_ids = registered_task_ids
             .iter()
             .filter(|task_id| !terminal_task_ids.contains(*task_id))
@@ -1819,12 +1875,12 @@ fn spawn_worker_background_inner(
                 }
                 Some(status)
                     if status.success()
-                        && matches!(command_name.as_str(), "audio_tools" | "export_editor_mix") =>
+                        && requires_background_result(&command_name) =>
                 {
                     emit_task_error_to_all(
                         &app,
                         &missing_terminal_task_ids,
-                        "worker exited without an audio tool result".to_string(),
+                        "worker exited without a result".to_string(),
                     );
                 }
                 _ => {}
@@ -1871,6 +1927,27 @@ mod tests {
         assert!(!super::needs_audio_output_scope("audio_tools", &json!({"operation": "scan"})));
         assert!(!super::needs_audio_output_scope("infer", &json!({"operation": "convert"})));
         assert!(!super::needs_audio_output_scope("audio_tools", &json!({})));
+        assert!(super::needs_audio_output_scope("run_operation", &json!({})));
+    }
+
+    #[test]
+    fn operation_output_scopes_use_the_same_directory_as_python() {
+        let root = std::env::temp_dir().join("pymss-operation-scope");
+        let default = root.join("outputs");
+        for payload in [json!({}), json!({"outputDir": null}), json!({"outputDir": ""})] {
+            assert_eq!(super::operation_output_directory(&payload, &default).unwrap(), std::path::absolute(&default).unwrap());
+        }
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": "relative"}), &default).unwrap(), std::path::absolute(root.join("relative")).unwrap());
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": " spaced "}), &default).unwrap(), std::path::absolute(root.join(" spaced ")).unwrap());
+        assert_eq!(super::operation_output_directory(&json!({"outputDir": &default}), &default).unwrap(), std::path::absolute(&default).unwrap());
+        assert!(super::operation_output_directory(&json!({"outputDir": []}), &default).is_err());
+    }
+
+    #[test]
+    fn operation_workers_must_emit_a_terminal_result_even_after_a_successful_exit() {
+        assert!(super::requires_background_result("run_operation"));
+        assert!(super::requires_background_result("manage_plugin"));
+        assert!(!super::requires_background_result("list_operations"));
     }
 
     #[test]
@@ -1909,6 +1986,30 @@ mod tests {
         }
         drop(update);
         assert!(super::acquire_runtime_access(&access, "infer").is_ok());
+    }
+
+    #[test]
+    fn plugin_management_excludes_execution_and_runtime_switching() {
+        let access = std::sync::Mutex::new(super::RuntimeAccess::default());
+        let operation = super::acquire_runtime_access(&access, "run_operation").unwrap();
+        assert!(super::acquire_runtime_access(&access, "manage_plugin").is_err());
+        drop(operation);
+        let management = super::acquire_runtime_access(&access, "manage_plugin").unwrap();
+        for command in ["infer", "list_operations", "list_nodes", "plugin_marketplace", "manage_plugin",
+                        "activate_runtime", "delete_runtime", "update_runtime_core"] {
+            assert!(super::acquire_runtime_access(&access, command).is_err(), "{command}");
+        }
+        drop(management);
+        assert!(super::acquire_runtime_access(&access, "plugin_marketplace").is_ok());
+    }
+
+    #[test]
+    fn plugin_management_result_is_terminal_but_logs_are_not() {
+        assert!(is_background_terminal_event("manage_plugin", "plugin_manage_result"));
+        assert!(is_background_terminal_event("manage_plugin", "error"));
+        assert!(is_background_terminal_event("manage_plugin", "task_cancelled"));
+        assert!(!is_background_terminal_event("manage_plugin", "plugin_stage"));
+        assert!(!is_background_terminal_event("manage_plugin", "plugin_log"));
     }
 
     #[test]
@@ -2214,6 +2315,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_venv_interpreter_remains_usable_by_business_commands() {
+        use std::os::unix::fs::symlink;
+        let unique = temp_root("venv-python-symlink");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.tmp").join(unique.file_name().unwrap());
+        fs::create_dir_all(&root).unwrap();
+        let fixture = ResourceFixture(root);
+        let base = fixture.0.join("base/bin/python3");
+        let python = fixture.0.join("runtime-envs/mlx/bin/python");
+        fixture.file(&base);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        symlink(&base, &python).unwrap();
+        let pointer = fixture.0.join("runtime-envs/active-runtime.json");
+        let expected = python.parent().unwrap().canonicalize().unwrap().join("python");
+        for recorded in [python.to_string_lossy().to_string(), "mlx/bin/python".to_string()] {
+            fs::write(&pointer, serde_json::to_vec(&json!({
+                "pythonPath": recorded, "backend": "mlx"
+            })).unwrap()).unwrap();
+            let resolved = super::resolve_active_runtime_record(&pointer).unwrap().0;
+            let active = super::active_path_backend_matches(&pointer, &resolved).then_some(resolved);
+            let selected = super::select_worker_python("plugin_marketplace", "bootstrap", active);
+            assert!(selected.is_ok(), "an installed MLX venv was rejected: {selected:?}");
+            assert_eq!(selected.unwrap(), expected.to_string_lossy());
+        }
+    }
+
     #[test]
     fn active_pointer_resolution_accepts_existing_relative_and_absolute_paths_without_rewriting() {
         let fixture = ResourceFixture::new("pointer-resolution");
@@ -2501,6 +2630,17 @@ mod tests {
         assert!(!is_background_terminal_event(
             "audio_tools",
             "audio_tool_progress"
+        ));
+    }
+
+    #[test]
+    fn operation_result_is_a_background_terminal_event() {
+        assert!(is_background_terminal_event("run_operation", "operation_result"));
+        assert!(is_background_terminal_event("run_operation", "error"));
+        assert!(is_background_terminal_event("run_operation", "task_cancelled"));
+        assert!(!is_background_terminal_event(
+            "run_operation",
+            "operation_progress"
         ));
     }
 

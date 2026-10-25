@@ -12,6 +12,8 @@ RESOURCE_ID="$(find "$APPDIR/usr" -path '*/python-runtime/bootstrap-id' -print -
 test -n "$RESOURCE_ID"
 RESOURCES="$(dirname "$(dirname "$RESOURCE_ID")")"
 test -f "$RESOURCES/python/worker.py"
+test -s "$RESOURCES/resources/plugin-sdk/pymss-sdk.js"
+test -s "$RESOURCES/resources/plugin-sdk/pymss-sdk.css"
 test -s "$RESOURCES/bin/THIRD_PARTY_TOOLS.txt"
 # linuxdeploy also scans ELF files inside resources. Reject a rewritten RPATH
 # that ties the cached interpreter to the build machine or the AppImage mount.
