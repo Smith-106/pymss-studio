@@ -32,6 +32,15 @@
       return
     }
 
+    // Progress retains the pending call until its terminal RPC response.
+    if (data.jsonrpc === '2.0' && data.method === 'task.progress' && data.params) {
+      var progressEntry = pending.get(data.params.id)
+      if (progressEntry && typeof progressEntry.onProgress === 'function') {
+        try { progressEntry.onProgress(data.params) } catch (e) { /* plugin cb */ }
+      }
+      return
+    }
+
     // RPC responses
     if (data.jsonrpc !== '2.0' || data.id === undefined) return
     var entry = pending.get(data.id)

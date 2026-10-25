@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -194,6 +195,84 @@ class RunOperationTests(unittest.TestCase):
             finally:
                 self._reset_runtime()
                 os.environ.pop("PYMSS_PLUGINS_DIR", None)
+
+
+class OperationOutputTests(unittest.TestCase):
+    @staticmethod
+    def audio(level):
+        import numpy as np
+        from pymss.graph.core import AudioArtifact
+
+        return AudioArtifact(np.full((2, 1000), level, dtype=np.float32), 44100)
+
+    def test_nested_audio_and_array_outputs_survive_the_worker_protocol(self):
+        import numpy as np
+        import soundfile as sf
+        from pymss.operations import OperationSpec, Runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Runtime()
+            runtime.register(
+                spec=OperationSpec(id="test.nested", schema_version=1, title="Nested", inputs={},
+                                   params={"type": "object"}, outputs={"result": {"type": "object"}}),
+                run=lambda ctx, inputs, params: {"result": {
+                    "stems": [self.audio(0.1), self.audio(0.5)],
+                    "scores": np.ones(3, dtype=np.float32),
+                    "metadata": {"empty": None, "level": np.float32(0.5), "file": Path("audio.wav")},
+                }},
+            )
+            output = io.StringIO()
+            with mock.patch.object(worker_operations, "_runtime", return_value=runtime), redirect_stdout(output):
+                code = worker_operations.cmd_run_operation({"operation": "test.nested", "outputDir": directory})
+            event = _read_event(output)
+            self.assertEqual(code, 0, event)
+            result = event["payload"]["outputs"]["result"]["value"]
+            paths = [entry["path"] for entry in result["stems"]]
+            self.assertEqual(len(set(paths)), 2)
+            for path, level in zip(paths, [0.1, 0.5]):
+                waveform, rate = sf.read(path)
+                self.assertEqual(rate, 44100)
+                self.assertEqual(waveform.shape, (1000, 2))
+                self.assertAlmostEqual(float(waveform.max()), level, places=4)
+            self.assertEqual(result["scores"], {"kind": "array", "shape": [3], "dtype": "float32"})
+            self.assertEqual(result["metadata"], {"empty": None, "level": 0.5, "file": "audio.wav"})
+
+    def test_repeated_and_concurrent_outputs_preserve_earlier_audio(self):
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = worker_operations._serialize_output("audio", self.audio(0.1), root)
+            levels = [0.2, 0.3, 0.4, 0.5]
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                outputs = list(executor.map(lambda level: worker_operations._serialize_output("audio", self.audio(level), root), levels))
+            outputs.insert(0, first)
+            self.assertEqual(len({entry["path"] for entry in outputs}), 5)
+            for entry, level in zip(outputs, [0.1, *levels]):
+                waveform, _ = sf.read(entry["path"])
+                self.assertAlmostEqual(float(waveform.max()), level, places=4)
+            self.assertEqual(len(list(root.iterdir())), 5)
+
+    def test_output_port_names_cannot_escape_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = worker_operations._serialize_output("../lead\\voice", self.audio(0.1), root)
+            self.assertTrue(Path(output["path"]).parent.samefile(root))
+
+    def test_failed_audio_write_does_not_publish_or_leave_a_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "operation_output_audio.wav"
+            previous.write_bytes(b"previous export")
+
+            def fail(path, *args):
+                Path(path).write_bytes(b"partial")
+                raise OSError("disk failure")
+
+            with mock.patch("pymss.audio_io.save_audio", side_effect=fail), self.assertRaisesRegex(OSError, "disk failure"):
+                worker_operations._serialize_output("audio", self.audio(0.1), root)
+            self.assertEqual(list(root.iterdir()), [previous])
+            self.assertEqual(previous.read_bytes(), b"previous export")
 
 
 if __name__ == "__main__":

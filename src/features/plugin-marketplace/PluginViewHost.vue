@@ -43,9 +43,9 @@ function allowed(method: string): boolean {
 }
 
 type RunHandlers = {
+  rpcId: number
   resolve: (value: unknown) => void
   reject: (error: Error) => void
-  onProgress?: (payload: Record<string, unknown>) => void
 }
 const runRequests = new Map<string, RunHandlers>()
 
@@ -61,7 +61,7 @@ async function handleCall(id: number, method: string, params: Record<string, unk
     case 'operations.start': {
       const requestId = `plugin_view_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       const promise = new Promise<unknown>((resolve, reject) => {
-        runRequests.set(requestId, { resolve, reject })
+        runRequests.set(requestId, { rpcId: id, resolve, reject })
       })
       // Unmount can reject the request while the native start call is pending.
       void promise.catch(() => undefined)
@@ -170,8 +170,7 @@ onMounted(async () => {
           runRequests.delete(requestId)
           handlers.reject(new Error(String(workerEvent.payload?.message || workerEvent.type)))
         } else if (workerEvent.type === 'operation_progress') {
-          handlers.onProgress?.(workerEvent.payload || {})
-          postToFrame({ jsonrpc: '2.0', method: 'task.progress', params: { requestId, ...(workerEvent.payload || {}) } })
+          postToFrame({ jsonrpc: '2.0', method: 'task.progress', params: { ...(workerEvent.payload || {}), requestId, id: handlers.rpcId } })
         }
       },
     )

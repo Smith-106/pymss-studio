@@ -8,6 +8,7 @@ emits ``operation_result`` as its terminal event (Rust treats it like
 
 from __future__ import annotations
 
+import re
 import traceback
 from pathlib import Path
 from typing import Any
@@ -84,24 +85,32 @@ def _resolve_input(value: Any) -> Any:
 
 def _serialize_output(name: str, value: Any, output_dir: Path) -> Any:
     """Best-effort JSON-safe conversion of one named output."""
+    import numpy as np
+
     from pymss.graph.core import AudioArtifact
 
     if isinstance(value, AudioArtifact):
+        from audio_tools.common import _render_output
         from pymss.audio_io import save_audio
 
-        path = output_dir / f"operation_output_{name}.wav"
-        save_audio(str(path), value.audio.T, value.sample_rate, "wav", {})
+        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name))[:48].rstrip(" .") or "output"
+        path = _render_output(
+            output_dir / f"operation_output_{filename}.wav",
+            lambda target: save_audio(str(target), value.audio.T, value.sample_rate, "wav", {}),
+        )
         return {"kind": "audio_file", "path": str(path), "sampleRate": value.sample_rate}
-    if isinstance(value, (str, int, float, bool)):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
         return {"kind": "scalar", "value": value}
-    import numpy as np
-
     if isinstance(value, np.ndarray):
         return {"kind": "array", "shape": list(value.shape), "dtype": str(value.dtype)}
     if isinstance(value, dict):
-        return {"kind": "object", "value": {k: _serialize_output(k, v, output_dir)["value"] for k, v in value.items()}}
+        children = {k: _serialize_output(f"{name}_{k}", v, output_dir) for k, v in value.items()}
+        return {"kind": "object", "value": {k: child.get("value", child) for k, child in children.items()}}
     if isinstance(value, (list, tuple)):
-        return {"kind": "array", "value": [_serialize_output(name, item, output_dir)["value"] for item in value]}
+        children = [_serialize_output(f"{name}_{index}", item, output_dir) for index, item in enumerate(value)]
+        return {"kind": "array", "value": [child.get("value", child) for child in children]}
     if isinstance(value, Path):
         return {"kind": "scalar", "value": str(value)}
     return {"kind": "opaque", "value": str(value)}

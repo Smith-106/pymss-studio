@@ -7,7 +7,7 @@ import { parse } from 'vue/compiler-sfc'
 
 const descriptor = parse(readFileSync(new URL('../src/features/plugin-marketplace/PluginViewHost.vue', import.meta.url), 'utf8')).descriptor
 const source = ts.createSourceFile('host.ts', descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
-const names = new Set(['allowed', 'handleCall', 'postToFrame'])
+const names = new Set(['allowed', 'handleCall', 'postToFrame', 'onWindowMessage'])
 const snippets = source.statements.flatMap(node => {
   if (ts.isFunctionDeclaration(node) && names.has(node.name?.text)) return [node.getText(source)]
   if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)) {
@@ -34,7 +34,7 @@ function host(overrides = {}) {
     pluginViewUrl: () => 'http://pymss-plugin.localhost/view/gain/editor/index.html', convertFileSrc() {},
     listen: async () => () => {}, invoke: async () => {}, ...overrides,
   }
-  const controller = vm.runInNewContext(`${code}\n({handleCall, postToFrame, mount: onMountedCallback, unmount: onBeforeUnmountCallback})`, state)
+  const controller = vm.runInNewContext(`${code}\n({handleCall, postToFrame, onWindowMessage, mount: onMountedCallback, unmount: onBeforeUnmountCallback})`, state)
   return { state, controller, messages }
 }
 
@@ -100,4 +100,44 @@ test('unmount rejects an operation while native startup is pending', async () =>
   assert.deepEqual(messages, [])
   startup.resolve()
   await assert.rejects(running, /PLUGIN_VIEW_CLOSED/)
+})
+
+test('the actual SDK correlates concurrent progress and waits for terminal responses', async () => {
+  let workerListener
+  const starts = []
+  const { state, controller } = host({
+    listen: async (_event, callback) => { workerListener = callback; return () => {} },
+    invoke: async (command, args) => { if (command === 'start_operation_task') starts.push(args.payload) },
+  })
+  await controller.mount()
+  const sdkWindow = { parent: { postMessage: message => {
+    queueMicrotask(() => controller.onWindowMessage({ source: state.frame.value.contentWindow, data: message }))
+  } } }
+  let receive
+  sdkWindow.addEventListener = (name, callback) => { if (name === 'message') receive = callback }
+  state.frame.value.contentWindow.postMessage = message => queueMicrotask(() => receive({ data: message }))
+  vm.runInNewContext(readFileSync(new URL('../src-tauri/resources/plugin-sdk/pymss-sdk.js', import.meta.url), 'utf8'), { window: sdkWindow })
+  await sdkWindow.pymss.ready()
+  const progress = [[], []]
+  let finished = false
+  const first = sdkWindow.pymss.startOperation('test.first', {}, {}, value => { progress[0].push(value.fraction); throw new Error('plugin callback') })
+    .then(value => { finished = true; return value })
+  const second = sdkWindow.pymss.startOperation('test.second', {}, {}, value => progress[1].push(value.fraction))
+  await new Promise(setImmediate)
+  assert.equal(starts.length, 2)
+  const emit = (index, type, payload) => workerListener({ payload: { type, requestId: starts[index].requestId, payload } })
+  emit(1, 'operation_progress', { fraction: 0.75 })
+  emit(0, 'operation_progress', { fraction: 0.25 })
+  await new Promise(setImmediate)
+  assert.deepEqual(progress, [[0.25], [0.75]])
+  assert.equal(finished, false)
+  emit(0, 'operation_result', { outputs: { value: 1 } })
+  emit(1, 'operation_result', { outputs: { value: 2 } })
+  assert.equal((await first).outputs.value, 1)
+  assert.equal((await second).outputs.value, 2)
+  emit(0, 'operation_progress', { fraction: 1 })
+  await new Promise(setImmediate)
+  assert.deepEqual(progress, [[0.25], [0.75]])
+  assert.equal(state.runRequests.size, 0)
+  controller.unmount()
 })

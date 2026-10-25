@@ -138,8 +138,10 @@ async function refresh() {
   try {
     const result = await invoke<PluginMarketplace>('plugin_marketplace')
     if (request !== sequence) return
-    if (snapshot.value?.runtime.identity !== result.runtime.identity) updates.value = {}
+    const runtimeChanged = snapshot.value?.runtime.identity !== result.runtime.identity
+    if (runtimeChanged) updates.value = {}
     snapshot.value = result
+    if (runtimeChanged) pluginRevision.value += 1
   } catch (failure) {
     if (request === sequence) {
       error.value = String(failure)

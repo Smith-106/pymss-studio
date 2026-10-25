@@ -134,6 +134,7 @@ test('cancel does not claim completion when a terminal event is already queued',
 
 test('out-of-order refresh responses cannot replace a newer runtime', async () => {
   await reset()
+  const before = pluginRevision.value
   const responses = []
   globalThis.__pluginInvoke = () => new Promise(resolve => responses.push(resolve))
   const first = market.refresh()
@@ -143,6 +144,18 @@ test('out-of-order refresh responses cannot replace a newer runtime', async () =
   responses[0](empty('old-runtime'))
   await first
   assert.equal(market.snapshot.value.runtime.identity, 'new-runtime')
+  assert.equal(pluginRevision.value, before + 1)
+})
+
+test('a runtime switch refreshes plugin consumers exactly once', async () => {
+  await reset()
+  const before = pluginRevision.value
+  globalThis.__pluginInvoke = async () => empty('cuda-runtime')
+  await market.refresh()
+  assert.equal(market.snapshot.value.runtime.identity, 'cuda-runtime')
+  assert.equal(pluginRevision.value, before + 1)
+  await market.refresh()
+  assert.equal(pluginRevision.value, before + 1)
 })
 
 test('navigation keeps the task alive and records only a bounded activity log', async () => {
