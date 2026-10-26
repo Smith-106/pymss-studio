@@ -170,6 +170,9 @@ fn timeout_blacklists_only_its_package_continues_scanning_and_force_cannot_bypas
     assert_eq!(report.plugins.len(), 1);
     assert_eq!(report.blacklisted.len(), 1);
     assert_eq!(report.blacklisted[0].reason, BlacklistReason::Timeout);
+    // The UI returns the reported package identity, which can differ from the
+    // temporary directory spelling (for example /var versus /private/var on macOS).
+    let bad = PathBuf::from(&report.blacklisted[0].path);
     // A blocked path stays excluded even when missing: no fingerprint or native probe occurs.
     fs::remove_file(&bad).unwrap();
     let report = scan_bundles(root.path(), vec![bad.clone(), good], vec![], true, |path| {
@@ -310,10 +313,13 @@ fn restoring_during_a_scan_does_not_resurrect_its_previously_read_failure_cache(
     let trigger = root.path().join("trigger.vst3");
     fs::write(&bad, "bad").unwrap();
     fs::write(&trigger, "trigger").unwrap();
-    scan_bundles(root.path(), vec![bad.clone()], vec![], false, |_| {
+    let failed = scan_bundles(root.path(), vec![bad.clone()], vec![], false, |_| {
         Err("temporary failure".into())
     })
     .unwrap();
+    // Use the scan's canonical identity when adding/restoring an exclusion, as
+    // the UI does with entry.path, so invalidation addresses the cached package.
+    let bad = PathBuf::from(&failed.failures[0].path);
     let run = state.scan_control.start("scan-one".into()).unwrap();
     let report = scan_pipeline::scan(
         root.path(),

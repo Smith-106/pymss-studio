@@ -18,6 +18,9 @@ pub(super) fn cached_report(root: &Path, paths: &[String]) -> Result<Value, Stri
         if !is_virtual_scan_target(source) && !source.is_absolute() {
             return Err("Plugin library directories must be absolute".into());
         }
+        // Cached aliases retain the selected spelling. Keep it alongside the
+        // resolved root so a symlinked parent does not hide those entries.
+        selected.push(blacklist::path_key(path));
         let canonical = if is_virtual_scan_target(source) {
             source.to_path_buf()
         } else {
@@ -27,6 +30,8 @@ pub(super) fn cached_report(root: &Path, paths: &[String]) -> Result<Value, Stri
         };
         selected.push(blacklist::path_key(&canonical.to_string_lossy()));
     }
+    selected.sort_unstable();
+    selected.dedup();
     let contains = |path: &str| {
         let key = blacklist::path_key(path);
         selected.iter().any(|source| {
