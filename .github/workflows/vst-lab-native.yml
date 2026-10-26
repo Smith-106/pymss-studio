@@ -1,13 +1,16 @@
 name: VST Lab native validation
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: vst-lab-native-${{ github.ref }}
+  group: vst-lab-native-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,6 +26,9 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/native/target
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
