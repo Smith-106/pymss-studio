@@ -219,6 +219,45 @@ fn deleted_directory_aliases_stay_removed_after_partial_refresh_and_catalog_rest
 }
 
 #[test]
+fn cached_catalog_matches_source_aliases_below_a_symlinked_parent_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let physical = root.path().join("physical");
+    let source = physical.join("plugins");
+    let package = physical.join("installed.vst3");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir(&package).unwrap();
+    let alias_root = root.path().join("alias");
+    let alias_package = source.join("Effect.vst3");
+    for (target, alias) in [(&physical, &alias_root), (&package, &alias_package)] {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, alias).unwrap();
+        #[cfg(windows)]
+        {
+            let output = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(alias)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction creation failed: {output:?}");
+        }
+    }
+    let selected = alias_root.join("plugins");
+    scan_bundles(root.path(), vec![selected.join("Effect.vst3")], vec![], false, |_| {
+        Ok(vec![json!({"id":"effect"})])
+    }).unwrap();
+    let before = fs::read(root.path().join("plugin-cache.json")).unwrap();
+    // Match the saved source spelling even when its parent resolves elsewhere,
+    // such as /var -> /private/var on macOS. Restoration must not rescan packages.
+    let restored = scan_pipeline::cached_report(root.path(), &sources(&selected)).unwrap();
+    assert_eq!(restored["plugins"].as_array().unwrap().len(), 1);
+    assert_eq!(restored["scanned"], 0);
+    assert_eq!(fs::read(root.path().join("plugin-cache.json")).unwrap(), before);
+    assert!(scan_pipeline::cached_report(root.path(), &sources(&root.path().join("unrelated")))
+        .unwrap()["plugins"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn cached_descriptors_remain_available_during_a_blocked_probe_and_reading_does_not_touch_packages()
 {
     let root = tempfile::tempdir().unwrap();
