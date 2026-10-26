@@ -6,6 +6,47 @@ pub(crate) struct ChannelLayout {
     pub(crate) outputs: usize,
 }
 
+pub(crate) const MAX_BUSES: u32 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BusScope {
+    Input,
+    Output,
+}
+
+/// Prefer one bus when the unit permits it, retaining fixed auxiliary buses for
+/// explicit silent input callbacks and unconnected auxiliary outputs.
+pub(crate) fn main_buses(
+    inputs: u32,
+    outputs: u32,
+    has_input: bool,
+    mut reduce: impl FnMut(BusScope, u32) -> Result<u32, String>,
+) -> Result<(u32, u32), String> {
+    let validate = |inputs, outputs| {
+        outputs > 0
+            && outputs <= MAX_BUSES
+            && inputs <= MAX_BUSES
+            && if has_input { inputs > 0 } else { inputs == 0 }
+    };
+    if !validate(inputs, outputs) {
+        return Err("Invalid Audio Unit bus configuration".into());
+    }
+    let inputs = if inputs > 1 {
+        reduce(BusScope::Input, inputs)?
+    } else {
+        inputs
+    };
+    let outputs = if outputs > 1 {
+        reduce(BusScope::Output, outputs)?
+    } else {
+        outputs
+    };
+    if !validate(inputs, outputs) {
+        return Err("Invalid Audio Unit bus configuration".into());
+    }
+    Ok((inputs, outputs))
+}
+
 /// Prefer the host's layout, then preserve its output width before folding either side.
 /// Each pair is attempted once; a unit without an input bus needs only two output choices.
 pub(crate) fn candidates(channels: usize, has_input: bool) -> Vec<ChannelLayout> {
@@ -69,6 +110,35 @@ pub(crate) fn copy_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bus_negotiation_retains_fixed_sidechains_and_reduces_writable_auxiliary_buses() {
+        let mut calls = Vec::new();
+        assert_eq!(
+            main_buses(2, 1, true, |scope, count| {
+                calls.push((scope, count));
+                Ok(count)
+            })
+            .unwrap(),
+            (2, 1)
+        );
+        assert_eq!(calls, [(BusScope::Input, 2)]);
+        assert_eq!(main_buses(3, 2, true, |_, _| Ok(1)).unwrap(), (1, 1));
+        assert_eq!(
+            main_buses(0, 1, false, |_, _| panic!("no auxiliary buses")).unwrap(),
+            (0, 1)
+        );
+        for (inputs, outputs) in [(0, 1), (1, 0), (33, 1), (1, 33)] {
+            assert!(
+                main_buses(inputs, outputs, true, |_, _| panic!(
+                    "validate before configuring"
+                ))
+                .is_err()
+            );
+        }
+        assert!(main_buses(2, 1, true, |_, _| Ok(0)).is_err());
+        assert!(main_buses(2, 1, true, |_, _| Err("Unable to read buses".into())).is_err());
+    }
 
     #[test]
     fn negotiation_covers_each_pair_and_accepts_asymmetric_effects() {

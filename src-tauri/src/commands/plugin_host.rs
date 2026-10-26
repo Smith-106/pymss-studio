@@ -446,7 +446,7 @@ impl HostProcess {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -481,6 +481,26 @@ impl HostProcess {
             control.reap(&mut child);
             return Err("Audio host output pipe is unavailable".into());
         };
+        if let Some(stderr) = child.stderr.take() {
+            let child_pid = child.id();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                loop {
+                    let mut line = Vec::new();
+                    match (&mut reader).take(4097).read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            // Persist only our bounded, structured AU lifecycle records. Other
+                            // vendor output retains its original stderr destination.
+                            if line.len() <= 4096 && line.starts_with(b"[audio.au]") {
+                                crate::session_log::early("INFO", "audio.au.lifecycle", &format!("pid={child_pid} {}", String::from_utf8_lossy(&line).trim_end()));
+                            }
+                            let _ = std::io::stderr().write_all(&line);
+                        }
+                    }
+                }
+            });
+        }
         let (input, writes) =
             mpsc::sync_channel::<(Vec<u8>, mpsc::SyncSender<Result<(), String>>)>(1);
         std::thread::spawn(move || {
@@ -758,16 +778,25 @@ fn request_session(
     request: Value,
     timeout: Duration,
 ) -> Result<Value, HostRequestError> {
+    let operation = request.get("op").and_then(Value::as_str).unwrap_or("").to_owned();
     let closing = matches!(
         request.get("op").and_then(Value::as_str),
         Some("shutdown" | "unload")
     );
-    let result = match session.process.as_mut() {
+    let mut result = match session.process.as_mut() {
         Some(process) => process.request_live(request, timeout),
         None => Err(HostRequestError::Transport(
             "The audio host session is closed".into(),
         )),
     };
+    if let Err(HostRequestError::Transport(message)) = &mut result {
+        if let Some(process) = session.process.as_mut() {
+            if let Ok(Some(status)) = process.child.try_wait() {
+                message.push_str(&format!(" ({status})"));
+                crate::session_log::early("ERROR", "audio.plugin_host.exit", &format!("pid={} operation={operation} status={status}", process.control.pid));
+            }
+        }
+    }
     reconcile_live_session(session, pid, result.as_ref().is_err_and(HostRequestError::is_fatal) || (result.is_ok() && closing));
     result
 }

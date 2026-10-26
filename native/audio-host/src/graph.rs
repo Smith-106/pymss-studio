@@ -335,13 +335,19 @@ impl Graph {
         let mut unavailable_plugins = Vec::new();
         let mut chains = Vec::new();
         for track in &spec.tracks {
-            chains.push(chain(
-                &track.plugin_chain,
-                sample_rate,
-                offline,
-                &mut ui,
-                &mut unavailable_plugins,
-            )?);
+            chains.push(
+                chain(
+                    &track.plugin_chain,
+                    sample_rate,
+                    offline,
+                    &mut ui,
+                    &mut unavailable_plugins,
+                )
+                .map_err(|message| {
+                    let label = if track.name.trim().is_empty() { &track.id } else { &track.name };
+                    format!("Track {label:?}: {message}")
+                })?,
+            );
         }
         let master = chain(
             &spec.plugin_chain,
@@ -349,7 +355,8 @@ impl Graph {
             offline,
             &mut ui,
             &mut unavailable_plugins,
-        )?;
+        )
+        .map_err(|message| format!("Master output: {message}"))?;
         let track_latencies: Vec<usize> = chains
             .iter()
             .map(|c| total_latency(c.iter().map(|s| s.latency)))
@@ -815,7 +822,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let spec = unavailable_project(&directory.path().join("missing.vst3"), false);
         let result = Graph::load(spec, PathBuf::from("ffmpeg"), 48000);
-        assert!(matches!(result, Err(message) if message.contains("missing-slot")));
+        assert!(matches!(result, Err(message) if message.starts_with("Master output: ") && message.contains("missing-slot")));
+    }
+
+    #[test]
+    fn track_plugin_load_errors_identify_the_chain_that_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut spec = unavailable_project(&directory.path().join("missing.vst3"), false);
+        let mut slot = spec.plugin_chain.remove(0);
+        slot.name = "Pro-C 3".into();
+        spec.tracks = serde_json::from_value(serde_json::json!([
+            {"id":"voice", "name":"Vocals", "clips":[]},
+            {"id":"drums", "name":"Drums", "clips":[], "pluginChain":[slot]}
+        ])).unwrap();
+        for label in ["Drums", "drums"] {
+            if label == "drums" { spec.tracks[1].name.clear(); }
+            let result = Graph::load(spec.clone(), "ffmpeg".into(), 48000);
+            assert!(matches!(result, Err(message) if message.starts_with(&format!("Track {label:?}: "))
+                && message.contains("Pro-C 3 (missing-slot)")));
+        }
     }
 
     #[test]

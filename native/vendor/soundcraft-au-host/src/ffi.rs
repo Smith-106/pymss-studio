@@ -38,7 +38,6 @@ const MAX_STATE: usize = 32 << 20;
 /// Longest CFString converted (bytes).
 const MAX_STRING: CFIndex = 4096;
 
-const K_AUDIO_COMPONENT_FLAG_REQUIRES_ASYNC: u32 = 8;
 const K_AUDIO_COMPONENT_FLAG_IS_V3: u32 = 4;
 
 const PROP_CLASS_INFO: u32 = 0;
@@ -640,6 +639,8 @@ struct InputState {
     bufs: Vec<Vec<f32>>,
     frames: usize,
     borrowed: [InputBuffer; MAX_AU_CHANNELS],
+    bus: u32,
+    silent: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -675,7 +676,7 @@ unsafe extern "C" fn input_callback(
     frames: u32,
     data: *mut AudioBufferListHeader,
 ) -> OSStatus {
-    if ref_con.is_null() || data.is_null() || bus != 0 {
+    if ref_con.is_null() || data.is_null() {
         return -50; // paramErr
     }
     // SAFETY: `ref_con` is the `InputState` leaked by `Instance::new`, alive until after the unit
@@ -685,7 +686,7 @@ unsafe extern "C" fn input_callback(
     unsafe {
         let input = &*(ref_con as *const InputState);
         let n = (*data).number_buffers as usize;
-        if frames as usize > input.frames || n != input.bufs.len() || n > MAX_AU_CHANNELS {
+        if bus != input.bus || frames as usize > input.frames || n != input.bufs.len() || n > MAX_AU_CHANNELS {
             return -50;
         }
         let first: *mut AudioBuffer = ptr::addr_of_mut!((*data).first);
@@ -702,6 +703,7 @@ unsafe extern "C" fn input_callback(
                 return -50;
             }
             if b.data.is_null() {
+                if input.silent { ptr::write_bytes(src.data, 0, frames); }
                 // Lend our buffer (the unit may process in place; it is ours to scribble on).
                 b.data = src.data.cast();
                 b.data_byte_size = (frames * 4) as u32;
@@ -715,7 +717,11 @@ unsafe extern "C" fn input_callback(
             }
             // A unit can retain the pointer lent during an earlier callback in this render.
             // Raw copy permits overlap without creating aliased mutable/shared slices.
-            ptr::copy(src.data, b.data.cast::<f32>(), frames);
+            if input.silent {
+                ptr::write_bytes(b.data.cast::<f32>(), 0, frames);
+            } else {
+                ptr::copy(src.data, b.data.cast::<f32>(), frames);
+            }
         }
     }
     0
@@ -726,6 +732,8 @@ pub struct Instance {
     unit: AudioUnit,
     /// Leaked `Box<InputState>` read by `input_callback`; freed in `Drop` after disposal.
     input: *mut InputState,
+    /// Stable callback contexts, retired alongside the AU before being freed.
+    auxiliary_inputs: Vec<*mut InputState>,
     /// Leaked `Box<HostTime>` read by the host callbacks; freed in `Drop` after disposal.
     time: *mut HostTime,
     changes: *mut PropertyChanges,
@@ -799,11 +807,9 @@ impl Instance {
         {
             return Err("Matching Audio Unit component is not registered".into());
         }
-        let unit = if d.component_flags
-            & (K_AUDIO_COMPONENT_FLAG_REQUIRES_ASYNC | K_AUDIO_COMPONENT_FLAG_IS_V3)
-            != 0
-        {
-            async_au::instantiate(comp, is_v3)?
+        eprintln!("[audio.au] instantiate component={ty:08X}:{subtype:08X}:{manufacturer:08X} flags=0x{:08X}", d.component_flags);
+        let unit = if let Some(options) = crate::attempts::async_options(d.component_flags) {
+            async_au::instantiate(comp, options)?
         } else {
             let mut unit = ptr::null_mut();
             let status = unsafe { AudioComponentInstanceNew(comp, &mut unit) };
@@ -813,10 +819,13 @@ impl Instance {
             }
             unit
         };
+        eprintln!("[audio.au] instantiated component={ty:08X}:{subtype:08X}:{manufacturer:08X}");
         let input = Box::into_raw(Box::new(InputState {
             bufs: Vec::new(),
             frames: 0,
             borrowed: [InputBuffer::EMPTY; MAX_AU_CHANNELS],
+            bus: 0,
+            silent: false,
         }));
         let time = Box::into_raw(Box::new(HostTime::new()));
         let empty = AudioBuffer {
@@ -827,6 +836,7 @@ impl Instance {
         let mut inst = Instance {
             unit,
             input,
+            auxiliary_inputs: Vec::new(),
             time,
             changes: Box::into_raw(Box::new(PropertyChanges {
                 dirty: AtomicBool::new(true),
@@ -1001,7 +1011,7 @@ impl Instance {
         }
     }
 
-    fn format(&self, scope: u32, sample_rate: f64, channels: usize) -> OSStatus {
+    fn format(&self, scope: u32, bus: u32, sample_rate: f64, channels: usize) -> OSStatus {
         let asbd = AudioStreamBasicDescription {
             sample_rate,
             format_id: FORMAT_LINEAR_PCM,
@@ -1013,7 +1023,54 @@ impl Instance {
             bits_per_channel: 32,
             reserved: 0,
         };
-        self.set_property(PROP_STREAM_FORMAT, scope, 0, &asbd)
+        self.set_property(PROP_STREAM_FORMAT, scope, bus, &asbd)
+    }
+
+    fn reduce_buses(&self, scope: u32, count: u32) -> Result<u32, String> {
+        let mut size = 0;
+        let mut writable = 0_u8;
+        // Only units advertising a writable ElementCount may have their topology reduced.
+        let status = unsafe { AudioUnitGetPropertyInfo(self.unit, PROP_ELEMENT_COUNT, scope, 0, &mut size, &mut writable) };
+        if status == 0 && writable != 0 && size == std::mem::size_of::<u32>() as u32 {
+            let _ = self.set_property(PROP_ELEMENT_COUNT, scope, 0, &1_u32);
+            return self.bus_count(scope);
+        }
+        Ok(count)
+    }
+
+    fn auxiliary_format(&self, scope: u32, bus: u32, rate: f64, preferred: usize) -> Result<usize, OSStatus> {
+        let mut last = -10868;
+        for channels in [preferred, 3 - preferred] {
+            last = self.format(scope, bus, rate, channels);
+            if last == 0 { return Ok(channels); }
+        }
+        Err(last)
+    }
+
+    fn configure_auxiliary_buses(&mut self, counts: (u32, u32), rate: f64, frames: usize, layout: crate::channels::ChannelLayout) -> Result<(), OSStatus> {
+        for bus in 1..counts.0 {
+            let channels = self.auxiliary_format(SCOPE_INPUT, bus, rate, layout.inputs)?;
+            while self.auxiliary_inputs.len() < bus as usize {
+                let index = self.auxiliary_inputs.len() as u32 + 1;
+                self.auxiliary_inputs.push(Box::into_raw(Box::new(InputState {
+                    bufs: Vec::new(), frames: 0, borrowed: [InputBuffer::EMPTY; MAX_AU_CHANNELS], bus: index, silent: true,
+                })));
+            }
+            let pointer = self.auxiliary_inputs[bus as usize - 1];
+            // DSP is stopped and all callback contexts retain stable addresses until disposal.
+            let input = unsafe { &mut *pointer };
+            input.bufs = (0..channels).map(|_| vec![0.0; frames]).collect();
+            input.frames = frames;
+            input.refresh_pointers();
+            let callback = AuRenderCallbackStruct { input_proc: Some(input_callback), input_proc_ref_con: pointer.cast() };
+            let status = self.set_property(PROP_SET_RENDER_CALLBACK, SCOPE_INPUT, bus, &callback);
+            if status != 0 { return Err(status); }
+        }
+        // Auxiliary outputs remain unconnected. The host pulls only the main output bus.
+        for bus in 1..counts.1 {
+            self.auxiliary_format(SCOPE_OUTPUT, bus, rate, layout.outputs)?;
+        }
+        Ok(())
     }
 
     fn bus_count(&self, scope: u32) -> Result<u32, String> {
@@ -1084,12 +1141,11 @@ impl Instance {
             return Err("invalid Audio Unit configuration".into());
         }
         let mf = max_frames;
-        if self.bus_count(SCOPE_OUTPUT)? != 1 || self.has_input && self.bus_count(SCOPE_INPUT)? != 1
-        {
-            return Err(
-                "Audio Units with additional input or output buses are not supported".into(),
-            );
-        }
+        eprintln!("[audio.au] configure sampleRate={sample_rate} maxFrames={max_frames}");
+        let counts = crate::channels::main_buses(
+            self.bus_count(SCOPE_INPUT)?, self.bus_count(SCOPE_OUTPUT)?, self.has_input,
+            |scope, count| self.reduce_buses(match scope { crate::channels::BusScope::Input => SCOPE_INPUT, crate::channels::BusScope::Output => SCOPE_OUTPUT }, count),
+        )?;
         let status = self.set_property(PROP_MAX_FRAMES, SCOPE_GLOBAL, 0, &(mf as u32));
         if status != 0 {
             return Err(format!("cannot set the maximum render slice ({status})"));
@@ -1105,20 +1161,26 @@ impl Instance {
             }
         }
         let layout = crate::channels::negotiate(layouts, |layout| {
-            let o = self.format(SCOPE_OUTPUT, sample_rate, layout.outputs);
+            let o = self.format(SCOPE_OUTPUT, 0, sample_rate, layout.outputs);
             let i = if self.has_input {
-                self.format(SCOPE_INPUT, sample_rate, layout.inputs)
+                self.format(SCOPE_INPUT, 0, sample_rate, layout.inputs)
             } else {
                 0
             };
             if o != 0 || i != 0 {
                 return Err(if o != 0 { o } else { i });
             }
+            self.configure_auxiliary_buses(counts, sample_rate, mf, layout)?;
+            let input = unsafe { &mut *self.input };
+            input.bufs = (0..layout.inputs).map(|_| vec![0.0; mf]).collect();
+            input.frames = mf;
+            input.refresh_pointers();
             // SAFETY: the unit is live and uninitialized.
             let st = unsafe { AudioUnitInitialize(self.unit) };
             if st == 0 {
                 Ok(())
             } else {
+                let _ = unsafe { AudioUnitUninitialize(self.unit) };
                 Err(st)
             }
         }).map_err(|status| format!("the unit accepts none of the requested mono/stereo input/output float formats ({status})"))?;
@@ -1132,13 +1194,9 @@ impl Instance {
         // SAFETY: the callback only runs inside `AudioUnitRender`, which is not running now
         // (we hold `&mut self`), so this exclusive access does not alias.
         let input = unsafe { &mut *self.input };
-        input.bufs = if self.has_input {
-            (0..layout.inputs).map(|_| vec![0.0; mf]).collect()
-        } else {
-            Vec::new()
-        };
         input.frames = 0;
         self.max_frames = mf;
+        eprintln!("[audio.au] configured inputs={} outputs={} mainChannels={}/{}", counts.0, counts.1, layout.inputs, layout.outputs);
         Ok(layout)
     }
 
@@ -1169,6 +1227,10 @@ impl Instance {
             // Refresh after all host-side mutable slice borrows have ended. The callback
             // accesses only this raw pointer table throughout AudioUnitRender.
             input.refresh_pointers();
+        }
+        for &pointer in &self.auxiliary_inputs {
+            // An auxiliary input is always silent; its callback rewrites every requested block.
+            unsafe { (*pointer).frames = frames; }
         }
         let n = self.outputs.len().min(MAX_AU_CHANNELS);
         for (b, out) in self.abl.buffers.iter_mut().zip(self.outputs.iter_mut()) {
@@ -1758,6 +1820,7 @@ impl soundcraft_dsp::PluginEditor for NativeController {
 struct RetiredInstance {
     unit: AudioUnit,
     input: *mut InputState,
+    auxiliary_inputs: Vec<*mut InputState>,
     time: *mut HostTime,
     changes: *mut PropertyChanges,
     initialized: bool,
@@ -1792,6 +1855,7 @@ impl RetiredInstance {
             let status = AudioComponentInstanceDispose(self.unit);
             if status == 0 {
                 drop(Box::from_raw(self.input));
+                for pointer in self.auxiliary_inputs { drop(Box::from_raw(pointer)); }
                 drop(Box::from_raw(self.time));
                 drop(Box::from_raw(self.changes));
             } else {
@@ -1833,6 +1897,7 @@ impl Drop for Instance {
             state.retired = Some(RetiredInstance {
                 unit: self.unit,
                 input: self.input,
+                auxiliary_inputs: std::mem::take(&mut self.auxiliary_inputs),
                 time: self.time,
                 changes: self.changes,
                 initialized: self.initialized,
@@ -1880,6 +1945,8 @@ mod tests {
             bufs: vec![vec![0.25, -0.5, 0.75, 1.0]],
             frames: 4,
             borrowed: [InputBuffer::EMPTY; MAX_AU_CHANNELS],
+            bus: 0,
+            silent: false,
         };
         input.refresh_pointers();
         let mut output = [0.0_f32; 4];
@@ -1924,6 +1991,8 @@ mod tests {
             bufs: vec![vec![0.25, -0.5, 0.75, 1.0]],
             frames: 4,
             borrowed: [InputBuffer::EMPTY; MAX_AU_CHANNELS],
+            bus: 0,
+            silent: false,
         };
         input.refresh_pointers();
         let user = ptr::from_mut(&mut input).cast();
@@ -1959,6 +2028,30 @@ mod tests {
             unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 1, 4, &mut list) },
             0
         );
+    }
+
+    #[test]
+    fn auxiliary_callback_returns_silence_for_its_bus_without_retaining_in_place_writes() {
+        let mut input = InputState {
+            bufs: vec![vec![0.75; 4]], frames: 4,
+            borrowed: [InputBuffer::EMPTY; MAX_AU_CHANNELS], bus: 1, silent: true,
+        };
+        input.refresh_pointers();
+        let user = ptr::from_mut(&mut input).cast();
+        let mut output = [0.5_f32; 4];
+        let mut list = AudioBufferListHeader { number_buffers: 1, first: AudioBuffer {
+            number_channels: 1, data_byte_size: 16, data: output.as_mut_ptr().cast(),
+        }};
+        assert_eq!(unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 1, 4, &mut list) }, 0);
+        assert_eq!(output, [0.0; 4]);
+        assert_ne!(unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 0, 4, &mut list) }, 0);
+        assert_ne!(unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 1, 5, &mut list) }, 0);
+        list.first.data = ptr::null_mut();
+        assert_eq!(unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 1, 4, &mut list) }, 0);
+        assert_eq!(input.bufs[0], [0.0; 4]);
+        input.bufs[0].fill(0.9);
+        assert_eq!(unsafe { input_callback(user, ptr::null_mut(), ptr::null(), 1, 4, &mut list) }, 0);
+        assert_eq!(input.bufs[0], [0.0; 4]);
     }
 
     #[test]

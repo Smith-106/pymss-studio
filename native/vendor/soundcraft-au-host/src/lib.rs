@@ -34,8 +34,10 @@
 //! their NSViewController. DSP, state and parameter notifications use Apple's AUv2 compatibility
 //! bridge; native 64-bit AUParameterAddress values are never truncated into parameter IDs.
 //!
-//! Not hosted yet: instruments/MIDI, sidechain/extra buses, and parameters outside the
-//! global scope. Units without a compatible custom Cocoa view retain generic parameter controls.
+//! The main bus is rendered in mono/stereo. Writable auxiliary buses are reduced when possible;
+//! fixed auxiliary inputs receive silence and auxiliary outputs remain unconnected. External
+//! sidechain routing, instruments/MIDI and parameters outside global scope are not hosted yet.
+//! Units without a compatible custom Cocoa view retain generic parameter controls.
 //! The optional OfflineRender context is supported for these ordinary effects. Dedicated `auol`
 //! offline units require a separate preflight/priming workflow and remain outside this host.
 //!

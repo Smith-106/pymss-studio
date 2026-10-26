@@ -67,3 +67,12 @@ Native editor transport shortcuts:
   system hotkeys or asynchronous protocol output are introduced.
 - Linux native transport interception remains disabled: X11 passive grabs cannot reliably
   distinguish third-party plugin text editors. Native plugin loading remains available.
+
+Audio Unit compatibility:
+- Negotiate the main mono/stereo buses while reducing writable auxiliary bus counts.
+  Fixed auxiliary inputs receive dedicated silent render callbacks; auxiliary outputs stay
+  unconnected. Callback storage is retained until AudioComponentInstanceDispose succeeds.
+- RequiresAsyncInstantiation and IsV3 components use the documented out-of-process creation
+  option. Component flags and instantiation/configuration stages are written to diagnostics.
+https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_elementcount
+https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api

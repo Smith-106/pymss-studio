@@ -107,7 +107,7 @@ fn wait<T>(request: &Completion<T>, operation: &str) -> Result<T, String> {
     }
 }
 
-pub(super) fn instantiate(component: AudioComponent, is_v3: bool) -> Result<AudioUnit, String> {
+pub(super) fn instantiate(component: AudioComponent, options: u32) -> Result<AudioUnit, String> {
     if !soundcraft_vst3_host::on_ui_thread() {
         return Err("Asynchronous Audio Units require the main thread".into());
     }
@@ -123,10 +123,9 @@ pub(super) fn instantiate(component: AudioComponent, is_v3: bool) -> Result<Audi
             }
         },
     );
-    // LoadOutOfProcess is the documented AUv3 extension mode. Legacy async components use
-    // default options instead of being coerced into an unsupported extension mode.
+    // Follow the component's instantiation flags rather than its display identity.
     unsafe {
-        AudioComponentInstantiate(component, if is_v3 { 1 } else { 0 }, &callback);
+        AudioComponentInstantiate(component, options, &callback);
     }
     let (pointer, status) = wait(&request, "Audio Unit instantiation")?;
     if status != 0 || pointer == 0 {

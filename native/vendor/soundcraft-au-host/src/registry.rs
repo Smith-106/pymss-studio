@@ -239,6 +239,7 @@ fn instantiate_raw(
     match made {
         Ok(inst) => {
             r.attempts.completed(id, true);
+            eprintln!("[audio.au] parameters component={id}");
             let info = match r.infos.get(id) {
                 Some(i) => *i,
                 None => {
@@ -247,6 +248,7 @@ fn instantiate_raw(
                     i
                 }
             };
+            eprintln!("[audio.au] parameters-ready component={id}");
             Ok((inst, info, ty))
         }
         Err(e) => {

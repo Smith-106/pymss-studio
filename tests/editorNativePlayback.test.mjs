@@ -179,6 +179,22 @@ test('an initial load that fails after the chain was repaired retries the curren
   assert.equal(env.playback.error, null)
   assert.equal(env.calls.filter(call => call[0] === 'ensure').length, 2)
 })
+
+test('replacing an insert during its initial load reports the replacement failure instead of the old plugin', async t => {
+  const gate = deferred()
+  const env = environment(t, { ensureGate: gate })
+  env.editor.session.pluginChain[0].name = 'Pro-C 3'
+  env.backend.ensureError = 'Track "Drums": Pro-C 3 (old-slot): unsupported bus layout'
+  const playing = env.native.play(1)
+  env.editor.session.pluginChain = [{ id: 'ozone', format: 'au', pluginId: 'ozone', name: 'Ozone 12', path: 'au:ozone', bypassed: false }]
+  await flush()
+  env.backend.ensureError = 'Track "Vocals": Ozone 12 (ozone): initialization failed'
+  gate.resolve()
+  assert.equal(await playing, false)
+  assert.match(env.playback.error, /Ozone 12/)
+  assert.doesNotMatch(env.playback.error, /Pro-C 3/)
+})
+
 test('a plugin dialog retains playback polling and recovers without a transport error', async t => {
   const env = environment(t)
   await env.native.play(2)
