@@ -23,7 +23,7 @@ function updateTime(key: 'attackMs' | 'releaseMs', value: number | null) {
     <header>
       <strong>{{ t('editor.limiter.title') }}</strong>
       <n-switch size="small" :value="limiter.enabled" :aria-label="t('editor.limiter.enable')"
-        @update:value="emit('update', { enabled: $event })" />
+        @keydown.space.stop @update:value="emit('update', { enabled: $event })" />
     </header>
     <div class="master-limiter__times">
       <label>
