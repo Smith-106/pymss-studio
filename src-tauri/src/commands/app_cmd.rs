@@ -1405,7 +1405,7 @@ fn write_editor_project(app: &AppHandle, project: &Value) -> AppResult<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Worker("missing editor project id".into()))?;
     let dir = editor_project_dir(app, project_id)?;
-    storage::write_json_file(&dir.join("project.json"), project)?;
+    storage::write_editor_project_file(&dir.join("project.json"), project)?;
     session_log::record_editor_project(project);
     Ok(project.clone())
 }

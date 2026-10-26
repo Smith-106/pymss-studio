@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
 import type { EditorPluginSlot, EditorSession } from '@/types/editor'
-import { pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
+import { pluginProcessingProject, pluginProjectBlockReason, pluginProjectSignature, projectPluginSlots } from './editorPlugins'
 
 export type PluginHostCapabilities = { enabled: boolean; platform: string; formats: string[]; nativeEditor: boolean; nativeEditorFormats?: string[]; recording?: boolean; experimental: boolean; labBuild?: boolean; scanControl?: boolean; catalogCache?: boolean; nativeTransport?: boolean; defaultDirectories?: string[] }
 export type PluginDescriptor = { id: string; classId: string; name: string; vendor: string; version: string; path: string; isInstrument: boolean | null; format?: string; auVersion?: 2 | 3; isShellChild?: boolean; category?: string; subCategories?: string[]; rawCategory?: number | null; componentType?: number; componentSubtype?: number; componentManufacturer?: number }
@@ -175,7 +175,7 @@ async function ensureNow(project: EditorSession) {
   const expectedGeneration = op === 'load' ? recoveryGenerations.get(project) : undefined
   let response: Partial<PluginHostStatus>
   try {
-    response = await requestNow<Partial<PluginHostStatus>>({ op, project: JSON.parse(JSON.stringify(project)), projectId: project.id,
+    response = await requestNow<Partial<PluginHostStatus>>({ op, project: JSON.parse(JSON.stringify(pluginProcessingProject(project))), projectId: project.id,
       ...(expectedGeneration !== undefined ? { expectedGeneration } : {}),
       ...(stateRestoreSlotIds.length ? { stateRestoreSlotIds } : {}) })
   } catch (cause) {

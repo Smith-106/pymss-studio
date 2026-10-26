@@ -296,6 +296,56 @@ pub(crate) fn write_json_file(path: &Path, data: &Value) -> AppResult<()> {
     write_json_file_locked(path, data)
 }
 
+pub(crate) fn write_editor_project_file(path: &Path, data: &Value) -> AppResult<()> {
+    let _write_guard = JSON_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    backup_pre_plugin_project(path, data).map_err(|error| {
+        AppError::Worker(format!("Could not preserve the original editor project at {}: {error}", path.display()))
+    })?;
+    write_json_file_locked(path, data)
+}
+
+fn backup_pre_plugin_project(path: &Path, data: &Value) -> AppResult<()> {
+    let backup = path.with_file_name("project.pre-plugins.json");
+    match std::fs::symlink_metadata(&backup) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => return Err(AppError::Worker(format!("The project backup is not a regular file: {}", backup.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let previous: Value = serde_json::from_slice(&content)?;
+    let has_legacy_effects = previous.get("tracks").and_then(Value::as_array)
+        .is_some_and(|tracks| tracks.iter().any(|track| track.get("effects").is_some_and(Value::is_object)));
+    if previous.get("version").and_then(Value::as_u64).unwrap_or(0) >= 4
+        || (!has_legacy_effects && data.get("version").and_then(Value::as_u64).unwrap_or(0) < 4)
+    {
+        return Ok(());
+    }
+
+    // Publish a fully synced copy before replacing the project. A second writer
+    // cannot replace the first upgrade snapshot, including across processes.
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    file.write_all(&content)?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(&backup) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(&backup)?.is_file() {
+                Ok(())
+            } else {
+                Err(error.error.into())
+            }
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+
 fn write_json_file_locked(path: &Path, data: &Value) -> AppResult<()> {
     write_json_file_with_replace(path, data, replace_file)
 }
@@ -1046,6 +1096,85 @@ mod tests {
         assert_eq!(stored, json!({ "value": 2 }));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_upgrade_backup_preserves_original_bytes_and_is_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let original = b"{\n  \"id\": \"old\", \"version\": 3, \"tracks\": [{\"effects\": {\"delay\": 0.3}}], \"future\": [1, 2]\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut next: serde_json::Value = serde_json::from_slice(original).unwrap();
+        // Autosave/enrichment can run before the user adds their first plugin.
+        next["name"] = json!("Renamed");
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        next["version"] = json!(4);
+        next["pluginChain"] = json!([{ "id": "slot", "state": "sha256:retained" }]);
+        super::write_editor_project_file(&path, &next).unwrap();
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, next);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn editor_upgrade_backup_covers_v3_without_effects_but_not_new_or_existing_v4_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let old = json!({ "id": "project", "version": 3, "tracks": [] });
+        super::write_editor_project_file(&path, &old).unwrap();
+        super::write_editor_project_file(&path, &old).unwrap();
+        assert!(!backup.exists());
+        let upgraded = json!({ "id": "project", "version": 4, "masterLimiter": { "enabled": true } });
+        super::write_editor_project_file(&path, &upgraded).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        assert_eq!(stored, old);
+        let new_root = tempfile::tempdir().unwrap();
+        let new_path = new_root.path().join("project.json");
+        super::write_editor_project_file(&new_path, &upgraded).unwrap();
+        super::write_editor_project_file(&new_path, &upgraded).unwrap();
+        assert!(!new_root.path().join("project.pre-plugins.json").exists());
+    }
+
+    #[test]
+    fn editor_upgrade_backup_failure_keeps_original_project_until_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let old = b"{\"id\":\"project\",\"version\":3}";
+        std::fs::write(&path, old).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        let next = json!({ "id": "project", "version": 4 });
+        let error = super::write_editor_project_file(&path, &next).unwrap_err();
+        assert!(error.to_string().contains("Could not preserve the original editor project"));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_dir(&backup).unwrap();
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), old);
+    }
+
+    #[test]
+    fn editor_upgrade_backup_serializes_concurrent_first_saves() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = b"{\"id\":\"project\",\"version\":3}";
+        std::fs::write(&path, old).unwrap();
+        std::thread::scope(|scope| {
+            for revision in 1..=4 {
+                let path = &path;
+                scope.spawn(move || super::write_editor_project_file(path, &json!({
+                    "id": "project", "version": 4, "revision": revision
+                })).unwrap());
+            }
+        });
+        assert_eq!(std::fs::read(root.path().join("project.pre-plugins.json")).unwrap(), old);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 4);
+        assert!(saved["revision"].as_u64().is_some_and(|revision| (1..=4).contains(&revision)));
     }
 
     #[cfg(windows)]

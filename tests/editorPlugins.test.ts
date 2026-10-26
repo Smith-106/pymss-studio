@@ -1,13 +1,29 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { EditorSession } from '../src/types/editor.ts'
-import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
+import { applyPluginStates, clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginAudioUnitVersion, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginDescriptorLabels, pluginDescriptorVariant, pluginProcessingProject, pluginProjectBlockReason, pluginProjectSignature, pluginProjectVersion, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 function project(): EditorSession {
   return { id: 'project', name: 'Project', masterVolume: 0.6, masterPan: -0.4,
     tracks: [], sources: [], createdAt: 1, updatedAt: 1 }
 }
 const slot = { id: 'slot', format: 'vst3', pluginId: 'gain', name: 'Gain', path: 'gain.vst3', bypassed: false, state: 'sha256:old' }
+
+test('legacy track effects do not change the audio graph or strip opaque plugin metadata', () => {
+  const session = project()
+  session.tracks = [{ id: 'track', sourceId: 'source', role: 'stem', name: 'Track',
+    volume: 1, pan: 0, muted: false, solo: false, fadeIn: 0, fadeOut: 0,
+    effects: { reverb: 0.4 }, pluginChain: [{ ...slot, effects: { vendorState: 'preserve' } }] }]
+  const signature = pluginProjectSignature(session)
+  const processing = pluginProcessingProject(session)
+  assert.equal('effects' in processing.tracks[0], false)
+  assert.deepEqual(processing.tracks[0].pluginChain![0].effects, { vendorState: 'preserve' })
+  session.tracks[0].effects!.reverb = 0.8
+  assert.equal(pluginProjectSignature(session), signature)
+  session.tracks[0].volume = 0.5
+  assert.notEqual(pluginProjectSignature(session), signature)
+  assert.deepEqual(session.tracks[0].effects, { reverb: 0.8 })
+})
 
 test('library families merge one matching VST2/VST3 pair and prefer VST3 without rewriting descriptors', () => {
   const legacy = { id: 'vst2:gain', name: ' SerumFX ', vendor: ' Xfer Records ', path: '/effect.dll' }

@@ -881,19 +881,47 @@ test('queued parameter writes allow opaque state captured by the same controller
  assert.equal(env.editor.session.pluginChain[0].state,'sha256:captured-live')
 })
 
-test('legacy track effects are dropped on load and never reach the plugin host',async t=>{
+test('legacy track effects survive editing, undo, autosave and reopen without reaching the plugin host',async t=>{
  const env=environment(t)
- env.controls.persisted={...JSON.parse(JSON.stringify(env.editor.session)),version:4,
+ const effects={reverb:0.2,delay:0.3,delayTime:0.4,clarity:0.5,compressor:0.6,extra:{values:[0.1,0.2]}}
+ env.controls.persisted={...JSON.parse(JSON.stringify(env.editor.session)),version:3,pluginChain:undefined,
   tracks:[{id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,
-   effects:{reverb:0.2,delay:0.3,delayTime:0.4,clarity:0.5,compressor:0.6}}]}
+   effects:JSON.parse(JSON.stringify(effects))}]}
  await env.editor.loadProject('project')
  assert.equal(env.editor.session.tracks.length,1)
- assert.equal('effects' in env.editor.session.tracks[0],false)
+ assert.deepEqual(JSON.parse(JSON.stringify(env.editor.session.tracks[0].effects)),effects)
+ env.controls.persisted.tracks[0].effects.extra.values[0]=99
+ env.editor.renameTrack('track','Renamed')
+ env.editor.session.tracks[0].effects.extra.values[0]=88
+ env.editor.undo()
+ assert.deepEqual(JSON.parse(JSON.stringify(env.editor.session.tracks[0].effects)),effects)
+ env.editor.setTrackVolume('track',0.75)
+ await env.tick(420)
+ assert.equal(env.saved().at(-1).args.project.tracks[0].volume,0.75)
+ assert.deepEqual(env.saved().at(-1).args.project.tracks[0].effects,effects)
+ await env.editor.loadProject('project')
+ assert.deepEqual(JSON.parse(JSON.stringify(env.editor.session.tracks[0].effects)),effects)
  await host.ensurePluginSession(env.editor.session)
  const load=env.calls.find(call=>call.args?.request?.op==='load').args.request
  assert.equal(load.project.tracks.length,1)
  assert.equal('effects' in load.project.tracks[0],false)
 })
+
+for(const native of [false,true]){
+ test(`legacy effects stay persisted but are excluded from ${native?'native':'dry'} export`,async t=>{
+  const env=environment(t)
+  if(!native)env.editor.session.pluginChain=undefined
+  env.editor.session.tracks=[{id:'track',sourceId:'source',role:'stem',name:'Track',volume:1,pan:0,muted:false,solo:false,fadeIn:0,fadeOut:0,
+   effects:{reverb:0.5,delay:0.2}}]
+  await env.editor.exportMix({format:'wav'})
+  const rendered=env.calls.find(call=>call.command==='plugin_host_render')
+  assert.equal(Boolean(rendered),native)
+  if(rendered)assert.equal('effects' in rendered.args.project.tracks[0],false)
+  const encoded=env.calls.find(call=>call.command==='start_editor_mix_export').args.payload.project
+  assert.equal('effects' in encoded.tracks[0],false)
+  assert.deepEqual(JSON.parse(JSON.stringify(env.editor.session.tracks[0].effects)),{reverb:0.5,delay:0.2})
+ })
+}
 
 test('master limiter toggle and drag are undoable, preserve disabled parameters and survive save/reopen',async t=>{
  const env=environment(t)

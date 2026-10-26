@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { masterLimiterRenderRate, normalizeMasterLimiter } from '@/utils/masterLimiter'
 import { createLogger } from '@/utils/logger'
-import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
+import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginProcessingProject, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
 import { assertPluginProjectSupported, currentPluginSession, discardUnavailablePluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession, type PluginSessionState } from '@/utils/pluginHost'
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
@@ -307,9 +307,16 @@ function duplicatedTrackColor(source: EditorSource) {
   return trackColor(source.role, source.stemKey)
 }
 
+function cloneLegacyTrackEffects(effects: unknown): EditorTrack['effects'] {
+  return effects && typeof effects === 'object' && !Array.isArray(effects)
+    ? JSON.parse(JSON.stringify(effects)) as Record<string, unknown>
+    : undefined
+}
+
 function cloneTracks(tracks: EditorTrack[]) {
   return tracks.map((track) => ({
     ...track,
+    effects: cloneLegacyTrackEffects(track.effects),
     pluginChain: clonePluginChain(track.pluginChain),
     clips: track.clips?.map((clip) => ({ ...clip })),
   }))
@@ -460,6 +467,7 @@ function normalizeTrack(
     solo: Boolean(track.solo),
     fadeIn,
     fadeOut,
+    effects: cloneLegacyTrackEffects(track.effects),
     pluginChain: normalizePluginChain(track.pluginChain),
     type: track.type === 'recording' || role === 'recording'
       ? 'recording'
@@ -2003,7 +2011,7 @@ export const useEditorStore = defineStore('editor', () => {
             exportProgress.value = { phase: 'preparing', completed: 0, total: 100, current: '' }
             try {
               const rendered = await invoke<{ path: string; duration: number; sampleRate: number; channels: number; tailLimited?: boolean }>('plugin_host_render', {
-                project: snapshot, taskId,
+                project: pluginProcessingProject(snapshot), taskId,
                 sampleRate: normalizeMasterLimiter(snapshot.masterLimiter).enabled
                   ? masterLimiterRenderRate(snapshot, normalized.audioParams?.sampleRate) : undefined,
               })

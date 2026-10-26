@@ -172,9 +172,17 @@ export function applyPluginStates(project: EditorSession, states: Record<string,
   return changed
 }
 
+/** Legacy settings remain in saved projects but are not part of the audio graph. */
+export function pluginProcessingProject(project: EditorSession): EditorSession {
+  return {
+    ...project,
+    tracks: project.tracks.map(({ effects: _effects, ...track }) => track),
+  }
+}
+
 /** Captured host state updates the host signature atomically; explicit history restores remain observable. */
 export function pluginProjectSignature(project: EditorSession) {
-  return JSON.stringify(project, (key, value) => ['peaks', 'channelPeaks', 'updatedAt'].includes(key) ? undefined : value)
+  return JSON.stringify(pluginProcessingProject(project), (key, value) => ['peaks', 'channelPeaks', 'updatedAt'].includes(key) ? undefined : value)
 }
 
 export function neutralPluginRenderProject(project: EditorSession, render: { path: string; duration: number; sampleRate: number; channels: number }): EditorSession {
