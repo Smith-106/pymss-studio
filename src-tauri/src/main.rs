@@ -122,7 +122,6 @@ fn main() {
             commands::plugin_host::plugin_host_cancel_scan,
             commands::plugin_host::plugin_host_scan_blacklist,
             commands::plugin_host::plugin_host_remove_scan_blacklist,
-            commands::plugin_host::plugin_host_probe_aax,
             commands::plugin_host::plugin_host_request,
             commands::plugin_host::plugin_host_render,
             commands::plugin_host::plugin_host_cancel_render,

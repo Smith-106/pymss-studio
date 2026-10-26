@@ -1704,52 +1704,6 @@ pub async fn plugin_host_scan_report(
     .map_err(|error| error.to_string())
 }
 
-fn aax_probe_path(path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(path);
-    if !path.is_absolute()
-        || !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("aaxplugin"))
-    {
-        return Err("An absolute AAX package path is required".into());
-    }
-    Ok(path)
-}
-
-/// Module/version diagnostics only; this does not add AAX to supported_formats.
-#[tauri::command]
-pub async fn plugin_host_probe_aax(
-    state: State<'_, PluginHostState>,
-    path: String,
-) -> Result<Value, String> {
-    require_enabled()?;
-    let path = aax_probe_path(&path)?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
-            .scan_lock
-            .lock()
-            .map_err(|_| "Plugin scan lock failed")?;
-        if state.scan_process.id() == u32::MAX {
-            return Err("Plugin inspection was cancelled".into());
-        }
-        let process = HostProcess::spawn(&[std::ffi::OsStr::new("--aax-probe"), path.as_os_str()])?;
-        state.scan_process.publish(&process)?;
-        let result = process
-            .receive(SCAN_TIMEOUT)
-            .map_err(|error| error.to_string());
-        drop(process);
-        state.scan_process.release();
-        if state.scan_process.id() == u32::MAX {
-            Err("Plugin inspection was cancelled".into())
-        } else {
-            result
-        }
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
 fn render_directory(root: &Path, task_id: &str) -> Result<PathBuf, String> {
     if task_id.is_empty()
         || task_id.len() > 128
@@ -2057,22 +2011,6 @@ mod tests {
             assert!(directories.is_empty());
         }
         assert!(directories.iter().all(|path| Path::new(path.as_str().unwrap()).is_absolute()));
-    }
-
-    #[test]
-    fn aax_probe_accepts_only_explicit_absolute_package_paths() {
-        for path in [
-            "Effect.aaxplugin",
-            "au:system",
-            "",
-            "relative/Effect.aaxplugin",
-        ] {
-            assert!(aax_probe_path(path).is_err());
-        }
-        let root = tempfile::tempdir().unwrap();
-        assert!(aax_probe_path(&root.path().join("Other.vst3").to_string_lossy()).is_err());
-        let package = root.path().join("音频 Effect.AAXPLUGIN");
-        assert_eq!(aax_probe_path(&package.to_string_lossy()).unwrap(), package);
     }
 
     #[test]
