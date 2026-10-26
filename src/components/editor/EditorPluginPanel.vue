@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onScopeDispose, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onScopeDispose, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 import { AddOutline, ArrowDownOutline, ArrowUpOutline, ChevronForwardOutline, CloseOutline, FolderOpenOutline, OpenOutline, OptionsOutline, RefreshOutline, SearchOutline, Star, StarOutline, TrashOutline } from '@vicons/ionicons5'
@@ -7,9 +7,9 @@ import { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import { usePluginManagerLayout } from '@/composables/usePluginManagerLayout'
 import { usePluginManagerWindow } from '@/composables/usePluginManagerWindow'
-import type { EditorSession } from '@/types/editor'
+import type { EditorPluginSlot, EditorSession } from '@/types/editor'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginFavoriteKey, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '@/utils/editorPlugins'
-import { observePluginSession, openPluginEditor, PluginHostDialogPendingError, pluginHostCapabilities, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type UnavailablePlugin } from '@/utils/pluginHost'
+import { currentPluginSession, observePluginSession, openPluginEditor, PluginHostDialogPendingError, pluginHostCapabilities, pluginHostRequest, type PluginDescriptor, type PluginHostCapabilities, type PluginScanReport, type PluginScanStatus, type PluginScanBlacklistEntry, type PluginSessionState, type UnavailablePlugin } from '@/utils/pluginHost'
 import EditorPluginParameters from './EditorPluginParameters.vue'
 
 const props = defineProps<{ session: EditorSession; selectedTrackId: string | null }>()
@@ -53,6 +53,10 @@ const directoryDraft = ref('')
 const directories = ref<string[]>([])
 const opened = ref<string[]>([])
 const parameterSlotId = ref<string | null>(null)
+const recoveryEdit = shallowRef<{
+  project: EditorSession; trackId: string | null; host: PluginSessionState; sessionId: string;
+  signature: string; change: (slots: EditorPluginSlot[], recovering?: boolean) => void;
+} | null>(null)
 // A stored empty list is an explicit choice; seed standard paths only for new preferences.
 const STORAGE_KEY = 'pymss-plugin-library-directories-v1'
 const FAVORITES_KEY = 'pymss-plugin-favorites-v1'
@@ -215,6 +219,8 @@ async function activateCatalogPlugin(option: (typeof catalogOptions.value)[numbe
   else await addPlugin()
 }
 const stopObservingSession = observePluginSession(host => {
+  const pending = recoveryEdit.value
+  if (pending && (!host || host !== pending.host || host.sessionId !== pending.sessionId || !host.unavailable || host.interactionRequired)) recoveryEdit.value = null
   dialogPending.value = host?.project === props.session && Boolean(host.interactionRequired)
   if (!dialogPending.value && dialogOperationError) { error.value = ''; dialogOperationError = false }
   if (host?.project === props.session) { opened.value = [...host.openEditors]; unavailablePlugins.value = [...host.unavailablePlugins] }
@@ -222,9 +228,10 @@ const stopObservingSession = observePluginSession(host => {
 })
 onScopeDispose(stopObservingSession)
 watch(() => props.selectedTrackId, id => { target.value = id === null ? 'master' : `track:${id}` }, { immediate: true })
-watch(() => props.session, () => { managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; feedback.value = ''; scanFeedback.value = ''; dialogPending.value = false; dialogOperationError = false; cancelActiveScan(); scanGeneration++; selectedPluginId.value = null; relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId === null ? 'master' : `track:${props.selectedTrackId}` })
+watch(() => props.session, () => { recoveryEdit.value = null; managerOpen.value = false; sourcesOpen.value = false; reloadConfirmOpen.value = false; targetMenuOpen.value = false; opened.value = []; unavailablePlugins.value = []; error.value = ''; feedback.value = ''; scanFeedback.value = ''; dialogPending.value = false; dialogOperationError = false; cancelActiveScan(); scanGeneration++; selectedPluginId.value = null; relocatingSlotId.value = null; parameterSlotId.value = null; target.value = props.selectedTrackId === null ? 'master' : `track:${props.selectedTrackId}` })
 watch(targetOptions, options => { if (!options.some(option => option.value === target.value)) target.value = 'master' })
 watch(target, value => {
+  recoveryEdit.value = null
   reloadConfirmOpen.value = false; targetMenuOpen.value = false; relocatingSlotId.value = null; selectedPluginId.value = null; parameterSlotId.value = null; feedback.value = ''
   const trackId = value === 'master' ? null : value.slice(6)
   if (trackId !== props.selectedTrackId) emit('selectTarget', trackId)
@@ -541,11 +548,25 @@ async function scan(force = false) {
     }
   }
 }
-async function mutate(change: (slots: typeof chain.value) => void, recovery = false) {
+async function mutate(change: (slots: typeof chain.value, recovering?: boolean) => void, recovery = false, allowUnavailableRecovery = false) {
   await run(async () => {
     const project = props.session
     const trackId = targetTrackId.value
-    await editor.capturePluginState(project, true, recovery)
+    try { await editor.capturePluginState(project, true, recovery) }
+    catch (cause) {
+      if (allowUnavailableRecovery && props.session === project && !(cause instanceof PluginHostDialogPendingError)) {
+        const host = currentPluginSession()
+        if (host?.project === project && !host.interactionRequired) {
+          if (!host.unavailable) { try { await pluginHostRequest({ op: 'status', projectId: project.id }) } catch { /* Confirm unavailability through the session observer. */ } }
+          if (host.interactionRequired) throw new PluginHostDialogPendingError()
+          if (props.session === project && currentPluginSession() === host && host.unavailable && !host.interactionRequired) {
+            const target = trackId === null ? project : project.tracks.find(track => track.id === trackId)
+            if (target) recoveryEdit.value = { project, trackId, host, sessionId: host.sessionId, signature: JSON.stringify(target.pluginChain || []), change }
+          }
+        }
+      }
+      throw cause
+    }
     if (props.session !== project) return
     const track = trackId ? props.session.tracks.find(track => track.id === trackId) : null
     if (trackId && !track) return
@@ -554,6 +575,20 @@ async function mutate(change: (slots: typeof chain.value) => void, recovery = fa
     change(slots)
     if (JSON.stringify(slots) === JSON.stringify(currentChain || [])) return
     editor.setPluginChain(trackId, slots)
+  })
+}
+
+async function confirmRecoveryEdit() {
+  const pending = recoveryEdit.value
+  if (!pending || busy.value) return false
+  recoveryEdit.value = null
+  await run(async () => {
+    if (props.session !== pending.project) throw new Error(t('editor.plugins.stateCaptureSuperseded'))
+    const target = pending.trackId === null ? pending.project : pending.project.tracks.find(track => track.id === pending.trackId)
+    if (!target || JSON.stringify(target.pluginChain || []) !== pending.signature) throw new Error(t('editor.plugins.stateCaptureSuperseded'))
+    const slots = clonePluginChain(target.pluginChain) || []
+    pending.change(slots, true)
+    await editor.recoverPluginChain({ ...pending, chain: slots })
   })
 }
 function beginRelocation(slotId: string) {
@@ -589,16 +624,20 @@ async function addPlugin() {
   if (props.session === project && slots?.some(slot => slot.id === slotId)) feedback.value = t('editor.plugins.addedToTarget', { name: plugin.name, target: destination })
 }
 function setPluginBypassed(slotId: string, bypassed: boolean) {
-  return mutate(slots => {
+  return mutate((slots, recovering) => {
     const slot = slots.find(slot => slot.id === slotId)
-    if (slot) slot.bypassed = bypassed
-  }, bypassed)
+    if (slot) {
+      slot.bypassed = bypassed
+      if (!bypassed) delete slot.skipLoad
+      else if (recovering) slot.skipLoad = true
+    }
+  }, bypassed, bypassed)
 }
 function removePlugin(slotId: string) {
   return mutate(slots => {
     const index = slots.findIndex(slot => slot.id === slotId)
     if (index >= 0) slots.splice(index, 1)
-  }, true)
+  }, true, true)
 }
 function movePlugin(slotId: string, offset: number) {
   return mutate(slots => {
@@ -851,6 +890,12 @@ async function toggleEditor(slotId: string) {
       </n-card>
     </template>
   </n-modal>
+  <n-modal v-if="recoveryEdit" :show="true" preset="dialog" type="warning"
+    :aria-label="t('editor.plugins.recoveryEditTitle')"
+    :title="t('editor.plugins.recoveryEditTitle')" :content="t('editor.plugins.recoveryEditWarning')"
+    :positive-text="t('editor.plugins.recoveryEditConfirm')" :negative-text="t('common.cancel')"
+    :mask-closable="false" @positive-click="confirmRecoveryEdit" @negative-click="recoveryEdit = null"
+    @close="recoveryEdit = null" @update:show="(value: boolean) => { if (!value) recoveryEdit = null }" />
 </template>
 
 <style scoped>

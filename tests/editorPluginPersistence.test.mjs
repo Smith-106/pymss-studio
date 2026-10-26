@@ -26,6 +26,8 @@ function environment(t){
     if(command==='plugin_host_capabilities')return hostCapabilities
     if(command==='plugin_host_request'){
       const request=args.request
+      if(request.op==='load'&&request.expectedGeneration!==undefined&&controls.fencedLoadFailure){const failure=controls.fencedLoadFailure;controls.fencedLoadFailure=null;throw new Error(failure)}
+      if(request.op==='unload'&&request.discardUnsaved){if(controls.discardGate)await controls.discardGate.promise;return{closed:true,superseded:!!controls.discardRefused,generation:7}}
       if(request.op==='update'&&controls.updateError)throw new Error('Plugin Missing Effect [missing] could not be loaded')
       if(request.op==='load'){controls.projectId=request.projectId;controls.states=Object.fromEntries([...(request.project.pluginChain||[]),...request.project.tracks.flatMap(track=>track.pluginChain||[])].map(slot=>[slot.id,slot.state||'sha256:initial']))}
       if(controls.dialogPending&&request.op!=='load')throw new Error('PLUGIN_HOST_DIALOG_PENDING: The plugin is waiting for its dialog')
@@ -494,6 +496,165 @@ test('a recovery edit cannot discard a dead session or an incomplete enabled con
  await assert.rejects(env.editor.capturePluginState(env.editor.session,true,true),/session is closed/)
  assert.equal(env.editor.pluginStateUnavailable,true)
  assert.equal(env.editor.session.pluginChain[0].state,'sha256:initial')
+})
+
+test('confirmed dead-host recovery preserves captured parameters and current project edits',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.states.slot='sha256:latest-captured'
+ await env.editor.saveProject()
+ env.editor.session.masterVolume=0.72
+ env.editor.session.pluginChain.push({id:'bad',format:'au',pluginId:'au:aufx:test:test',name:'Bad AU',path:'au:aufx:test:test',bypassed:false,state:'opaque:keep',future:{value:7}})
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ const current=host.currentPluginSession()
+ const signature=JSON.stringify(env.editor.session.pluginChain)
+ const repaired=env.editor.session.pluginChain.map(slot=>slot.id==='bad'?{...slot,bypassed:true,skipLoad:true}:slot)
+ await env.editor.recoverPluginChain({project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature,chain:repaired})
+ assert.equal(host.currentPluginSession(),null)
+ assert.equal(env.editor.session.pluginChain[0].state,'sha256:latest-captured')
+ assert.equal(env.editor.session.pluginChain[1].state,'opaque:keep')
+ assert.equal(env.editor.session.pluginChain[1].skipLoad,true)
+ assert.deepEqual(env.editor.session.pluginChain[1].future,{value:7})
+ assert.equal(env.controls.persisted.masterVolume,0.72)
+ assert.equal(env.controls.persisted.pluginChain[0].state,'sha256:latest-captured')
+ assert.equal(env.editor.pluginStateError,null)
+ assert.equal(env.editor.pluginStateUnavailable,false)
+ env.controls.statusError=false
+ await host.ensurePluginSession(env.editor.session)
+ const recoveryLoad=env.calls.filter(call=>call.command==='plugin_host_request'&&call.args.request.op==='load').at(-1).args.request
+ assert.equal(recoveryLoad.expectedGeneration,7)
+ env.editor.undo()
+ assert.equal(env.editor.session.pluginChain[1].bypassed,false)
+ assert.equal(env.editor.session.pluginChain[1].skipLoad,undefined)
+})
+
+test('recovery rejects a replaced session and a backend discard refusal without changing the project',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ const current=host.currentPluginSession()
+ const signature=JSON.stringify(env.editor.session.pluginChain)
+ const options={project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature,chain:[]}
+ await assert.rejects(env.editor.recoverPluginChain(options),/changed|superseded|已变更|已被替换/)
+ assert.equal(env.editor.session.pluginChain.length,1)
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ env.controls.discardRefused=true
+ await assert.rejects(env.editor.recoverPluginChain(options))
+ assert.equal(env.editor.session.pluginChain.length,1)
+ assert.equal(host.currentPluginSession(),current)
+ env.controls.discardRefused=false
+ current.sessionId='replacement'
+ await assert.rejects(env.editor.recoverPluginChain(options))
+ assert.equal(env.editor.session.pluginChain.length,1)
+})
+
+test('rejected recovery restores the pending automatic project save',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ await env.editor.saveProject()
+ env.calls.length=0
+ env.editor.setMasterVolume(0.72)
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ const current=host.currentPluginSession()
+ env.controls.discardRefused=true
+ await assert.rejects(env.editor.recoverPluginChain({project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature:JSON.stringify(env.editor.session.pluginChain),chain:[]}))
+ assert.equal(env.controls.persisted.masterVolume,1)
+ assert.equal(env.editor.session.pluginChain.length,1)
+ assert.ok(env.editor.pluginStateError)
+ env.controls.statusError=false
+ await env.tick(420)
+ assert.equal(env.controls.persisted.masterVolume,0.72)
+ assert.equal(env.saved().length,1)
+})
+
+for(const responsive of [true,false])test(`rejected recovery ${responsive?'restores plugin-only autosave':'keeps plugin-only retries bounded'}`,async t=>{
+  const env=environment(t)
+  await host.ensurePluginSession(env.editor.session)
+  await env.editor.saveProject()
+  env.controls.states.slot='sha256:unsaved-gui';env.controls.revision++
+  await host.pluginHostRequest({op:'status',projectId:'project'})
+  env.controls.statusError=true
+  await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+  const current=host.currentPluginSession()
+  env.controls.discardRefused=true
+  await assert.rejects(env.editor.recoverPluginChain({project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature:JSON.stringify(env.editor.session.pluginChain),chain:[]}))
+  env.calls.length=0
+  env.controls.statusError=!responsive
+  await env.tick(900)
+  if(responsive){
+   assert.equal(env.controls.persisted.pluginChain[0].state,'sha256:unsaved-gui')
+   assert.equal(env.editor.pluginStateError,null)
+  }else{
+   assert.equal(env.saved().length,0)
+   assert.ok(env.editor.pluginStateError)
+   await env.tick(2000)
+   const attempts=env.calls.filter(call=>call.args?.request?.op==='status').length
+   assert.equal(attempts,2)
+   await env.tick(10000)
+   assert.equal(env.calls.filter(call=>call.args?.request?.op==='status').length,attempts)
+  }
+})
+
+test('recovery rejected after a project switch does not schedule a save for the replacement',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ await env.editor.saveProject()
+ env.editor.setMasterVolume(0.72)
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ const project=env.editor.session,current=host.currentPluginSession()
+ const gate=env.controls.discardGate=deferred()
+ const recovery=env.editor.recoverPluginChain({project,trackId:null,host:current,sessionId:current.sessionId,signature:JSON.stringify(project.pluginChain),chain:[]})
+ await flush()
+ env.editor.session={...project,id:'replacement',pluginChain:[]}
+ await flush()
+ gate.resolve()
+ await assert.rejects(recovery)
+ env.calls.length=0
+ await env.tick(5000)
+ assert.equal(env.saved().length,0)
+ assert.equal(env.editor.session.id,'replacement')
+ assert.equal(project.pluginChain.length,1)
+})
+
+test('an accepted recovery load failure advances its retry fence without dropping replacement protection',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ const current=host.currentPluginSession()
+ await env.editor.recoverPluginChain({project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature:JSON.stringify(env.editor.session.pluginChain),chain:env.editor.session.pluginChain})
+ env.controls.statusError=false
+ env.controls.fencedLoadFailure='PLUGIN_HOST_RECOVERY_LOAD_FAILED:8:Plugin initialization failed'
+ await assert.rejects(host.ensurePluginSession(env.editor.session),/Plugin initialization failed/)
+ env.controls.fencedLoadFailure='The audio session changed before recovery could reload it'
+ await assert.rejects(host.ensurePluginSession(env.editor.session),/session changed/)
+ await host.ensurePluginSession(env.editor.session)
+ const requests=env.calls.filter(call=>call.command==='plugin_host_request'&&call.args.request.op==='load').map(call=>call.args.request.expectedGeneration)
+ assert.deepEqual(requests,[undefined,7,8,8])
+})
+
+test('a fenced recovery load preserves dialog waiting semantics and its retry generation',async t=>{
+ const env=environment(t)
+ await host.ensurePluginSession(env.editor.session)
+ env.controls.statusError=true
+ await assert.rejects(host.pluginHostRequest({op:'status',projectId:'project'}))
+ const current=host.currentPluginSession()
+ await env.editor.recoverPluginChain({project:env.editor.session,trackId:null,host:current,sessionId:current.sessionId,signature:JSON.stringify(env.editor.session.pluginChain),chain:env.editor.session.pluginChain})
+ env.controls.statusError=false
+ env.controls.fencedLoadFailure='PLUGIN_HOST_RECOVERY_LOAD_FAILED:8:PLUGIN_HOST_DIALOG_PENDING: Complete the authorization dialog'
+ await assert.rejects(host.ensurePluginSession(env.editor.session),cause=>{
+  assert.ok(cause instanceof host.PluginHostDialogPendingError)
+  assert.equal(cause.message,new host.PluginHostDialogPendingError().message)
+  assert.doesNotMatch(cause.message,/PLUGIN_HOST_/)
+  return true
+ })
+ await host.ensurePluginSession(env.editor.session)
+ const requests=env.calls.filter(call=>call.command==='plugin_host_request'&&call.args.request.op==='load').map(call=>call.args.request.expectedGeneration)
+ assert.deepEqual(requests,[undefined,7,8])
+ assert.equal(host.currentPluginSession().unavailable,false)
 })
 
 for(const format of ['vst2','au'])test(`${format} controllers require complete snapshots and retain opaque state on bypass`,async t=>{

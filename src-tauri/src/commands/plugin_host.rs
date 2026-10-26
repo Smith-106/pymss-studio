@@ -750,11 +750,24 @@ fn close_session(session: &mut Session, pid: &ProcessLease) {
 
 fn discard_session(session: &mut Session, pid: &ProcessLease, project: &str, generation: u64, native_session: &str) -> Value {
     // An old window may release its own unavailable session, but never a newer project's graph.
-    if session.project_id.as_deref() == Some(project) && session.generation == generation
-        && session.native_session_id.as_deref() == Some(native_session) {
+    let owned = session.project_id.as_deref() == Some(project) && session.generation == generation
+        && session.native_session_id.as_deref() == Some(native_session);
+    let absent = session.generation == generation && session.project_id.is_none()
+        && session.native_session_id.is_none() && session.process.is_none();
+    if owned {
         close_session(session, pid);
     }
-    json!({ "closed": true })
+    json!({ "closed": true, "superseded": !owned && !absent, "generation": generation })
+}
+
+fn begin_load_generation(state: &PluginHostState, expected: Option<u64>) -> Result<u64, String> {
+    if let Some(expected) = expected {
+        let next = expected.checked_add(1).ok_or("Audio host generation exhausted")?;
+        state.generation.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| next).map_err(|_| "The audio session changed before recovery could reload it".into())
+    } else {
+        Ok(state.generation.fetch_add(1, Ordering::AcqRel) + 1)
+    }
 }
 
 fn prepare_session_request(
@@ -812,6 +825,9 @@ fn reconcile_live_session(session: &mut Session, pid: &ProcessLease, closing: bo
 }
 
 fn prepare_live_load_with(session: &mut Session, pid: &ProcessLease, generation: u64, detector: &mut impl FnMut(u32) -> Option<String>) -> Result<(), HostRequestError> {
+    // The caller holds the session lock and has checked this load's reservation. Claim it
+    // before any fallible preparation so a retired or failed host remains recoverable.
+    session.generation = generation;
     let mut result = match session.process.as_mut() {
         Some(process) => process.finish_pending_with(detector),
         None => Ok(()),
@@ -824,14 +840,7 @@ fn prepare_live_load_with(session: &mut Session, pid: &ProcessLease, generation:
     }
     let fatal = result.as_ref().is_err_and(HostRequestError::is_fatal);
     reconcile_live_session(session, pid, fatal);
-    if let Err(error) = result {
-        if !fatal {
-            // Declining a replacement while a dialog is open must not invalidate the retained
-            // graph's subsequent status/save requests. Older queued requests stay superseded.
-            session.generation = generation;
-        }
-        return Err(error);
-    }
+    result?;
     close_session(session, pid);
     Ok(())
 }
@@ -946,6 +955,9 @@ fn resolve_states(root: &Path, value: &mut Value) -> Result<(), String> {
     match value {
         Value::Object(object) => {
             let bypassed = object.get("bypassed").and_then(Value::as_bool) == Some(true);
+            if bypassed && object.get("skipLoad").and_then(Value::as_bool) == Some(true) {
+                return Ok(());
+            }
             let unsupported = object
                 .get("format")
                 .and_then(Value::as_str)
@@ -1118,13 +1130,18 @@ pub async fn plugin_host_request(
     bind_editor_owner(&mut request, owner)?;
     request["transportOwner"] = json!(window.label());
     let state = state.inner().clone();
+    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
+    let recovery_load = op == "load" && request.get("expectedGeneration").is_some();
     let generation = if op == "load" {
-        state.generation.fetch_add(1, Ordering::AcqRel) + 1
+        let expected = match request.get("expectedGeneration") {
+            None => None,
+            Some(value) => Some(value.as_u64().ok_or("Invalid expected audio session generation")?),
+        };
+        begin_load_generation(&state, expected)?
     } else {
         state.generation.load(Ordering::Acquire)
     };
-    let root = crate::storage::data_root_dir(&app).map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         require_generation(&state, generation)?;
         let mut session = state
             .session
@@ -1159,9 +1176,6 @@ pub async fn plugin_host_request(
             session.process = Some(process);
             session.project_id = Some(id.clone());
         }
-        if op == "load" {
-            session.generation = generation;
-        }
         let timeout = if op == "load" || op == "update" {
             plugin_load_timeout(&request["project"])
         } else {
@@ -1177,7 +1191,11 @@ pub async fn plugin_host_request(
         }
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    if recovery_load {
+        result.map_err(|error| format!("PLUGIN_HOST_RECOVERY_LOAD_FAILED:{generation}:{error}"))
+    } else { result }
 }
 
 fn bundle_fingerprint(path: &Path) -> Result<String, String> {
@@ -1928,6 +1946,60 @@ mod tests {
     }
 
     #[test]
+    fn recovery_ack_rejects_replacement_sessions_and_fenced_load_cannot_supersede_them() {
+        let state = PluginHostState::default();
+        state.generation.store(9, Ordering::Release);
+        let mut session = Session { project_id: Some("new".into()), native_session_id: Some("instance-new".into()), generation: 9, ..Session::default() };
+        let reply = discard_session(&mut session, &state.session_pid, "old", 9, "instance-old");
+        assert_eq!(reply["superseded"], true);
+        assert_eq!(session.project_id.as_deref(), Some("new"));
+        close_session(&mut session, &state.session_pid);
+        let reply = discard_session(&mut session, &state.session_pid, "old", 9, "instance-old");
+        assert_eq!(reply["superseded"], false);
+        assert_eq!(reply["generation"], 9);
+        assert_eq!(begin_load_generation(&state, Some(9)).unwrap(), 10);
+        assert!(begin_load_generation(&state, Some(9)).is_err());
+        assert_eq!(state.generation.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn empty_session_cannot_authorize_recovery_over_a_pending_load() {
+        let state = PluginHostState::default();
+        state.generation.store(8, Ordering::Release);
+        let mut session = Session { generation: 8, ..Session::default() };
+        // A different window reserves a load before its blocking task obtains the session lock.
+        let pending = begin_load_generation(&state, None).unwrap();
+        assert_eq!(pending, 9);
+        let reply = discard_session(&mut session, &state.session_pid, "old", pending, "old-native");
+        assert_eq!(reply["superseded"], true);
+        assert_eq!(session.generation, 8);
+        assert!(require_generation(&state, pending).is_ok());
+    }
+
+    #[test]
+    fn failed_load_preflight_retains_the_claimed_generation_for_recovery() {
+        let state = PluginHostState::default();
+        state.generation.store(8, Ordering::Release);
+        let mut session = Session { generation: 8, ..Session::default() };
+        let generation = begin_load_generation(&state, None).unwrap();
+        assert!(require_generation(&state, generation).is_ok());
+        prepare_live_load_with(&mut session, &state.session_pid, generation, &mut |_| None).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut request = json!({"project":{"pluginChain":[{
+            "format":"vst3", "bypassed":false,
+            "state":format!("sha256:{}", "a".repeat(64))
+        }]}});
+        assert!(prepare_session_request(&mut session, &state.session_pid, true, || {
+            resolve_states(root.path(), &mut request)
+        }).is_err());
+        assert!(session.process.is_none());
+        assert_eq!(session.generation, generation);
+        let reply = discard_session(&mut session, &state.session_pid, "project", generation, "old-native");
+        assert_eq!(reply["superseded"], false);
+        assert_eq!(begin_load_generation(&state, Some(generation)).unwrap(), generation + 1);
+    }
+
+    #[test]
     fn editor_owner_comes_from_the_calling_window_and_never_from_frontend_json() {
         let mut request = json!({"op":"editor", "editorOwner":999});
         bind_editor_owner(&mut request, Some(12345)).unwrap();
@@ -2146,6 +2218,16 @@ mod tests {
         assert!(state_path(root.path(), "sha256:../../secret").is_err());
         fs::write(state_path(root.path(), &token).unwrap(), b"tampered").unwrap();
         assert!(resolve_states(root.path(), &mut json!({"state":token})).is_err());
+    }
+
+    #[test]
+    fn quarantined_bypass_states_remain_opaque_until_explicitly_enabled() {
+        let root = tempfile::tempdir().unwrap();
+        let mut slot = json!({"format":"au", "bypassed":true, "skipLoad":true, "state":"sha256:../../unresolved"});
+        resolve_states(root.path(), &mut slot).unwrap();
+        assert_eq!(slot["state"], "sha256:../../unresolved");
+        slot["bypassed"] = json!(false);
+        assert!(resolve_states(root.path(), &mut slot).is_err());
     }
 
     #[test]

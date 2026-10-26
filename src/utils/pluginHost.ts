@@ -22,6 +22,7 @@ let operationQueue: Promise<unknown> = Promise.resolve()
 let capabilities: Promise<PluginHostCapabilities> | null = null
 let monitor: ReturnType<typeof setTimeout> | null = null
 let sessionSequence = 0
+const recoveryGenerations = new WeakMap<EditorSession, number>()
 const listeners = new Set<(state: PluginSessionState | null) => void>()
 export type PluginTransportRequest = { project: EditorSession; session: PluginSessionState; sessionId: string; owner: string }
 const transportListeners = new Set<(request: PluginTransportRequest) => void>()
@@ -171,8 +172,24 @@ async function ensureNow(project: EditorSession) {
   const previousSlots = op === 'update' && loaded ? projectPluginSlots(JSON.parse(loaded.signature) as EditorSession) : []
   const stateRestoreSlotIds = projectPluginSlots(project).filter(slot => previousSlots.some(previous => previous.id === slot.id
     && previous.path === slot.path && previous.pluginId === slot.pluginId && previous.state !== slot.state)).map(slot => slot.id)
-  const response = await requestNow<Partial<PluginHostStatus>>({ op, project: JSON.parse(JSON.stringify(project)), projectId: project.id,
-    ...(stateRestoreSlotIds.length ? { stateRestoreSlotIds } : {}) })
+  const expectedGeneration = op === 'load' ? recoveryGenerations.get(project) : undefined
+  let response: Partial<PluginHostStatus>
+  try {
+    response = await requestNow<Partial<PluginHostStatus>>({ op, project: JSON.parse(JSON.stringify(project)), projectId: project.id,
+      ...(expectedGeneration !== undefined ? { expectedGeneration } : {}),
+      ...(stateRestoreSlotIds.length ? { stateRestoreSlotIds } : {}) })
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause)
+    const accepted = /^PLUGIN_HOST_RECOVERY_LOAD_FAILED:(\d+):([\s\S]*)$/.exec(message)
+    if (expectedGeneration !== undefined && accepted && Number.isSafeInteger(Number(accepted[1]))
+      && Number(accepted[1]) === expectedGeneration + 1 && recoveryGenerations.get(project) === expectedGeneration) {
+      recoveryGenerations.set(project, Number(accepted[1]))
+      if (accepted[2].startsWith('PLUGIN_HOST_DIALOG_PENDING:')) throw new PluginHostDialogPendingError()
+      throw new Error(accepted[2])
+    }
+    throw cause
+  }
+  recoveryGenerations.delete(project)
   if (op === 'load' || !loaded || loaded.project !== project) {
     loaded = { project, sessionId: response.sessionId || `session-${++sessionSequence}`, revision: response.stateRevision || 0,
       capturedRevision: -1, dirty: true, error: null, signature, unavailable: false, unavailablePlugins: response.unavailablePlugins || [], openEditors: response.openEditors || [], lastStatus: 0, lastFallback: Date.now(), nativeTransport: hostCapabilities.nativeTransport ?? Number.isSafeInteger(response.transportRevision), transportOwner: response.transportOwner,
@@ -248,6 +265,21 @@ export function unloadPluginSession(projectId: string, options: { discardUnsaved
     if (!options.discardUnsaved && (current.dirty || current.error)) throw new Error(current.error || String(i18n.global.t('editor.plugins.stateCaptureUnavailable')))
     await requestNow({ op: 'unload', projectId, ...(options.discardUnsaved ? { discardUnsaved: true, expectedSessionId: current.sessionId } : {}) })
     if (loaded === current) { loaded = null; publish() }
+    if (monitor) { clearTimeout(monitor); monitor = null }
+  })
+}
+
+/** Explicit recovery after the host stopped responding; never discard a replacement session. */
+export function discardUnavailablePluginSession(project: EditorSession, expected: PluginSessionState, expectedSessionId: string) {
+  return enqueue(async () => {
+    const current = loaded
+    if (!current || current !== expected || current.project !== project || current.sessionId !== expectedSessionId
+      || !current.unavailable || current.interactionRequired) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+    const result = await requestNow<{ closed?: boolean; superseded?: boolean; generation?: number }>({ op: 'unload', projectId: project.id, discardUnsaved: true, expectedSessionId })
+    if (loaded !== current || result.closed !== true || result.superseded !== false || !Number.isSafeInteger(result.generation) || Number(result.generation) < 0) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+    recoveryGenerations.set(project, Number(result.generation))
+    loaded = null
+    publish()
     if (monitor) { clearTimeout(monitor); monitor = null }
   })
 }

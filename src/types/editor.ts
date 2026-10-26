@@ -39,6 +39,7 @@ export type EditorPluginSlot = {
   name: string
   path: string
   bypassed: boolean
+  skipLoad?: boolean
   state?: string
   [key: string]: unknown
 }

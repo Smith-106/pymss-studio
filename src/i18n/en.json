@@ -1128,6 +1128,9 @@
       "addSelected": "Add effect",
       "closeParameters": "Close parameters",
       "dialogPending": "The plugin is waiting for a dialog. Switch to its window and complete or cancel authorization or file selection to continue. The current session has been retained.",
+      "recoveryEditTitle": "Recover Plugin Operation",
+      "recoveryEditWarning": "Plugin processing has stopped. Continuing will use the plugin parameters currently retained in the project. Uncaptured plugin changes cannot be recovered. Track and clip edits will be preserved.",
+      "recoveryEditConfirm": "Recover and Continue",
       "resizeLibrary": "Resize the plugin library",
       "resizeParameters": "Resize the parameter panel",
       "resizeWindow": {

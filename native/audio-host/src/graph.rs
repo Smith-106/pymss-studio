@@ -223,6 +223,10 @@ fn chain(
         if offline && slot.bypassed {
             continue;
         }
+        if slot.bypassed && slot.skip_load {
+            unavailable.push(UnavailablePlugin { slot_id: slot.id.clone(), message: "Plugin loading is suspended until it is enabled again".into() });
+            continue;
+        }
         let load = || -> Result<HostedPlugin, String> {
             if !crate::discovery::supports_format(&slot.format) {
                 return Err(format!("Plugin format is unavailable: {}", slot.format));
@@ -815,6 +819,19 @@ mod tests {
         assert_eq!(graph.tail, 0);
         assert_eq!(graph.spec.plugin_chain[0].state.as_deref(), Some("opaque-original-state"));
         assert_eq!(graph.spec.tracks[0].plugin_chain[0].state.as_deref(), Some("opaque-original-state"));
+    }
+
+    #[test]
+    fn quarantined_bypasses_keep_their_state_without_instantiating_and_enable_still_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut spec = unavailable_project(&directory.path().join("missing.vst3"), true);
+        spec.plugin_chain[0].skip_load = true;
+        let (graph, ui) = Graph::load(spec.clone(), "ffmpeg".into(), 48000).unwrap();
+        assert!(ui.is_empty());
+        assert!(graph.unavailable_plugins[0].message.contains("suspended"));
+        assert_eq!(graph.spec.plugin_chain[0].state.as_deref(), Some("opaque-original-state"));
+        spec.plugin_chain[0].bypassed = false;
+        assert!(Graph::load(spec, "ffmpeg".into(), 48000).is_err());
     }
 
     #[test]

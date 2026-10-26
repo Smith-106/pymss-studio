@@ -397,6 +397,35 @@ fn replacement_waits_for_modal_but_explicit_discard_and_shutdown_reclaim_the_own
     }
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn fatal_load_preparation_retains_the_claimed_generation_for_recovery() {
+    let mut fixture = Fixture::new();
+    fixture.suspend("editor", Duration::from_millis(30));
+    fixture.replies.send(Err("The helper exited".into())).unwrap();
+    let state = PluginHostState::default();
+    state.generation.store(1, Ordering::Release);
+    let process = fixture.process.take().unwrap();
+    state.session_pid.publish(&process).unwrap();
+    let mut session = state.session.lock().unwrap();
+    *session = Session {
+        generation: 1,
+        project_id: Some("project".into()),
+        native_session_id: Some("instance".into()),
+        process: Some(process),
+    };
+    let generation = begin_load_generation(&state, None).unwrap();
+    let error = prepare_live_load_with(&mut session, &state.session_pid, generation, &mut |_| None)
+        .unwrap_err();
+    assert!(error.is_fatal());
+    assert!(session.process.is_none());
+    assert_eq!(state.session_pid.id(), 0);
+    assert_eq!(session.generation, generation);
+    let reply = discard_session(&mut session, &state.session_pid, "project", generation, "instance");
+    assert_eq!(reply["superseded"], false);
+    assert!(require_generation(&state, generation).is_ok());
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "opt-in: observes the owned helper's real plugin authorization dialog for 22 seconds"]

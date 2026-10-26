@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { compileTemplate, parse } from 'vue/compiler-sfc'
-import { computed, effectScope, nextTick, proxyRefs, reactive, ref, watch } from 'vue'
+import { computed, effectScope, nextTick, proxyRefs, reactive, ref, shallowRef, watch } from 'vue'
 import { clonePluginChain, pluginDescriptorCategory, pluginDescriptorFamilies, pluginDescriptorFormat, pluginFavoriteKey, pluginDescriptorLabels, pluginDescriptorVariant, pluginSlotMatchesDescriptor } from '../src/utils/editorPlugins.ts'
 
 const component = readFileSync(new URL('../src/components/editor/EditorPluginPanel.vue', import.meta.url), 'utf8')
@@ -31,9 +31,15 @@ function environment(t, { scanControl = false } = {}) {
     usePluginManagerLayout: () => ({}),
     usePluginManagerWindow: () => ({}),
     defineEmits: () => (event, trackId) => emitted.push({ event, trackId }),
-    computed, ref, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
+    computed, ref, shallowRef, watch, nextTick, defineProps: () => props, useI18n: () => ({ t: key => key, locale: ref('en') }),
     useEditorStore: () => reactive({
-      async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise },
+      async capturePluginState(project, force, recovery) { calls.push({ kind: 'capture', project, force, recovery }); await controls.captureGate.promise; if (controls.captureError) throw controls.captureError },
+      async recoverPluginChain(options) {
+        calls.push({ kind: 'recover', options })
+        const target = options.trackId === null ? props.session : props.session.tracks.find(track => track.id === options.trackId)
+        writes.push({ trackId: options.trackId, chain: options.chain })
+        target.pluginChain = options.chain
+      },
       setPluginChain(trackId, chain) {
         writes.push({ trackId, chain })
         const target = trackId ? props.session.tracks.find(track => track.id === trackId) : props.session
@@ -42,6 +48,8 @@ function environment(t, { scanControl = false } = {}) {
       scheduleSave() { calls.push({ kind: 'save', project: props.session }) },
     }),
     useEditorPlaybackStore: () => reactive({ error: null }), observePluginSession: () => () => {}, onScopeDispose: callback => disposals.push(callback), onMounted: callback => mounts.push(callback),
+    currentPluginSession: () => controls.host || null,
+    pluginHostRequest: async () => { if (controls.probeUnavailable && controls.host) { controls.host.unavailable = true; throw new Error('Host is closed') } },
     async invoke(command, args) {
       calls.push({ kind: 'invoke', command, args })
       if (command === 'pick_input_folder') return controls.directory
@@ -117,6 +125,73 @@ function environment(t, { scanControl = false } = {}) {
     },
   }
 }
+
+test('dead hosts require confirmation before removing or quarantining an insert', async t => {
+  for (const action of ['remove', 'bypass']) {
+    const env = environment(t)
+    env.controls.captureError = new Error('Host is closed')
+    const host = env.controls.host = { project: env.props.session, sessionId: 'dead', unavailable: true }
+    env.releaseCapture()
+    if (action === 'remove') await env.call('removePlugin', 'b')
+    else await env.call('setPluginBypassed', 'b', true)
+    assert.equal(env.writes.length, 0)
+    assert.equal(env.read('recoveryEdit').host, host, 'confirmation must retain the actual session identity')
+    await env.call('confirmRecoveryEdit')
+    assert.equal(env.calls.filter(call => call.kind === 'recover').length, 1)
+    const chain = env.props.session.pluginChain
+    if (action === 'remove') assert.deepEqual(chain.map(slot => slot.id), ['a', 'c'])
+    else assert.equal(chain.find(slot => slot.id === 'b').skipLoad, true)
+    assert.equal(env.read('recoveryEdit'), null)
+  }
+})
+
+test('cancelled or obsolete recovery confirmation cannot modify the plugin chain', async t => {
+  const env = environment(t)
+  env.controls.captureError = new Error('Host is closed')
+  env.controls.host = { project: env.props.session, sessionId: 'dead', unavailable: true }
+  env.releaseCapture()
+  await env.call('removePlugin', 'b')
+  env.set('recoveryEdit', null)
+  assert.deepEqual(env.props.session.pluginChain.map(slot => slot.id), ['a', 'b', 'c'])
+  await env.call('removePlugin', 'b')
+  env.props.session.pluginChain.push(plugin('new'))
+  await env.call('confirmRecoveryEdit')
+  assert.equal(env.calls.some(call => call.kind === 'recover'), false)
+  assert.deepEqual(env.props.session.pluginChain.map(slot => slot.id), ['a', 'b', 'c', 'new'])
+})
+
+test('a responsive host capture failure does not offer destructive recovery', async t => {
+  const env = environment(t)
+  env.controls.captureError = new Error('Incomplete snapshot')
+  env.controls.host = { project: env.props.session, sessionId: 'alive', unavailable: false }
+  env.releaseCapture()
+  await env.call('removePlugin', 'b')
+  assert.equal(env.read('recoveryEdit'), null)
+  assert.equal(env.writes.length, 0)
+})
+
+test('switching projects cancels a pending unavailable-host confirmation', async t => {
+  const env = environment(t)
+  env.controls.captureError = new Error('Host is closed')
+  env.controls.host = { project: env.props.session, sessionId: 'dead', unavailable: true }
+  env.releaseCapture()
+  await env.call('removePlugin', 'b')
+  assert.ok(env.read('recoveryEdit'))
+  env.props.session = { ...env.props.session, id: 'replacement' }
+  await flush()
+  assert.equal(env.read('recoveryEdit'), null)
+  assert.equal(env.writes.length, 0)
+})
+
+test('enabling an explicitly quarantined plugin clears its load suppression', async t => {
+  const env = environment(t)
+  env.props.session.pluginChain[1].bypassed = true
+  env.props.session.pluginChain[1].skipLoad = true
+  env.releaseCapture()
+  await env.call('setPluginBypassed', 'b', false)
+  assert.equal(env.props.session.pluginChain[1].bypassed, false)
+  assert.equal(env.props.session.pluginChain[1].skipLoad, undefined)
+})
 
 test('dismissing an error keeps the underlying persistence failure and new failures become visible', async t => {
   const env = environment(t)

@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { masterLimiterRenderRate, normalizeMasterLimiter } from '@/utils/masterLimiter'
 import { createLogger } from '@/utils/logger'
 import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
-import { assertPluginProjectSupported, currentPluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession } from '@/utils/pluginHost'
+import { assertPluginProjectSupported, currentPluginSession, discardUnavailablePluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession, type PluginSessionState } from '@/utils/pluginHost'
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -2112,6 +2112,48 @@ export const useEditorStore = defineStore('editor', () => {
     scheduleSave()
   }
 
+  async function recoverPluginChain(options: {
+    project: EditorSession; trackId: string | null; chain: EditorPluginSlot[];
+    host: PluginSessionState; sessionId: string; signature: string;
+  }) {
+    const { project, trackId, host, sessionId, signature } = options
+    const validate = () => {
+      const target = trackId === null ? project : project.tracks.find(track => track.id === trackId)
+      if (session.value !== project || !target || JSON.stringify(target.pluginChain || []) !== signature) {
+        throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+      }
+    }
+    const clearTimers = () => {
+      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+      if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+    }
+    validate()
+    const resumeProjectSave = saveTimer !== null || pendingProjectSaves.has(project.id)
+    const resumePluginSave = pluginSaveTimer !== null
+    clearTimers()
+    try {
+      if (saveDrainTask) await saveDrainTask.catch(() => undefined)
+      validate()
+      await discardUnavailablePluginSession(project, host, sessionId)
+      validate()
+      clearTimers()
+      const previousError = pluginStateError.value
+      setPluginChain(trackId, options.chain)
+      pluginStateDirty.value = false
+      pluginStateError.value = null
+      pluginStateUnavailable.value = false
+      if (lastError.value === previousError) lastError.value = null
+      await flushSave()
+    } catch (cause) {
+      // A rejected recovery must not cancel edits that were already waiting for autosave.
+      if (!discardingWindowChanges && session.value === project) {
+        if (saveTimer === null && (resumeProjectSave || pendingProjectSaves.has(project.id))) scheduleSave()
+        if (pluginSaveTimer === null && resumePluginSave) schedulePluginStateSave(project)
+      }
+      throw cause
+    }
+  }
+
   function setZoom(value: number) {
     pixelsPerSecond.value = clamp(Number(value), 4, 240)
   }
@@ -2127,6 +2169,7 @@ export const useEditorStore = defineStore('editor', () => {
   return {
     session,
     setPluginChain,
+    recoverPluginChain,
     pluginStateDirty,
     pluginStateError,
     pluginStateUnavailable,

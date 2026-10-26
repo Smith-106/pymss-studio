@@ -43,6 +43,8 @@ pub struct PluginSlot {
     pub path: String,
     #[serde(default)]
     pub bypassed: bool,
+    #[serde(default)]
+    pub skip_load: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1413,6 +1415,7 @@ mod tests {
             name: "Effect".into(),
             path: String::new(),
             bypassed: true,
+            skip_load: false,
             state: Some("state".into()),
             bypass_warning: None,
         };
@@ -1443,6 +1446,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             bypassed: false,
+            skip_load: false,
             state: None,
             bypass_warning: None,
         });
