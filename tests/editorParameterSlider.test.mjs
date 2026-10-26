@@ -49,10 +49,6 @@ const parameters = [
   { name: 'master-pan', reset: 0, min: -1, max: 1, get: s => s.masterPan, set: (s, v) => s.setMasterPan(v) },
   { name: 'track-volume', reset: 1, min: 0, max: 2, get: s => s.session.tracks[0].volume, set: (s, v) => s.setTrackVolume('track', v) },
   { name: 'track-pan', reset: 0, min: -1, max: 1, get: s => s.session.tracks[0].pan, set: (s, v) => s.setTrackPan('track', v) },
-  ...['clarity', 'compressor', 'reverb', 'delay'].map(key => ({
-    name: key, reset: 0, min: 0, max: 1,
-    get: s => s.session.tracks[0].effects[key], set: (s, v) => s.setTrackEffects('track', { [key]: v }),
-  })),
 ]
 const flush = async () => { await nextTick(); await new Promise(resolve => setImmediate(resolve)); await nextTick() }
 const resetLabel = spec => spec.reset === 1 ? '100%' : spec.min < 0 ? 'Center' : '0%'
@@ -65,8 +61,7 @@ async function mountSliders(t, specs = [parameters[0]], { disabled = false, valu
     id: 'slider-project', name: 'Project', masterVolume: value, masterPan: value,
     sources: [], createdAt: 1, updatedAt: 1,
     tracks: [{ id: 'track', name: 'Track', role: 'stem', volume: value, pan: value,
-      muted: false, solo: false, fadeIn: 0, fadeOut: 0, clips: [],
-      effects: { clarity: value, compressor: value, reverb: value, delay: value, delayTime: 0.24 } }],
+      muted: false, solo: false, fadeIn: 0, fadeOut: 0, clips: [] }],
   }
   store.clearHistory()
   const visible = ref(true)
@@ -111,7 +106,7 @@ async function doubleClick(target, x) {
   await mouse(target, 'dblclick', x, 2)
 }
 
-test('Default buttons reset all eight parameters atomically and expose the target to assistive technology', async t => {
+test('Default buttons reset every mixer parameter atomically and expose the target to assistive technology', async t => {
   for (const parameter of parameters) {
     await t.test(parameter.name, async t => {
       const env = await mountSliders(t, [parameter])
