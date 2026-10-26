@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, State};
 
 mod blacklist;
 mod dialogs;
+mod process_exit;
 #[cfg(test)]
 mod dialog_tests;
 mod scan_control;
@@ -803,10 +804,25 @@ fn request_session(
         )),
     };
     if let Err(HostRequestError::Transport(message)) = &mut result {
-        if let Some(process) = session.process.as_mut() {
-            if let Ok(Some(status)) = process.child.try_wait() {
-                message.push_str(&format!(" ({status})"));
-                crate::session_log::early("ERROR", "audio.plugin_host.exit", &format!("pid={} operation={operation} status={status}", process.control.pid));
+        if let Some(process) = session.process.as_ref() {
+            let grace = if matches!(message.as_str(), "The audio host exited unexpectedly" | "The audio host response pipe closed") {
+                Duration::from_millis(500)
+            } else { Duration::ZERO };
+            let observed = {
+                // Observe without reaping. Cleanup still signals the owned process group before
+                // releasing its PID, and cancellation uses this same identity guard.
+                let active = process.control.active.lock().unwrap_or_else(|error| error.into_inner());
+                if *active { process_exit::observe(&process.child, grace) } else { Ok(None) }
+            };
+            match observed {
+                Ok(Some(status)) => {
+                    message.push_str(&format!(" ({status})"));
+                    crate::session_log::early("ERROR", "audio.plugin_host.exit", &format!("pid={} operation={operation} status={status}", process.control.pid));
+                }
+                other => {
+                    let detail = other.err().map(|error| error.to_string()).unwrap_or_else(|| "not observed before cleanup".into());
+                    crate::session_log::early("ERROR", "audio.plugin_host.transport", &format!("pid={} operation={operation} exitStatus=unavailable observation={detail} reason={message}", process.control.pid));
+                }
             }
         }
     }

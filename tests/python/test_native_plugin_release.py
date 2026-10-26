@@ -26,6 +26,11 @@ def load_script(name):
 PROBE = load_script("verify-native-plugins")
 MERGE = load_script("merge-macos-plugin-entitlements")
 REQUIRED = ROOT / "src-tauri/entitlements.plugins.plist"
+PLUGIN_PERMISSIONS = {
+    "com.apple.security.cs.disable-library-validation": True,
+    "com.apple.security.cs.allow-jit": True,
+    "com.apple.security.cs.allow-unsigned-executable-memory": True,
+}
 FAKE_HELPER = r"""import json,os,sys,time
 mode=os.environ.get('PROBE_BEHAVIOR','')
 with open(os.environ['PROBE_TRACE'],'a',encoding='utf-8') as out:
@@ -133,29 +138,49 @@ class NativePluginReleaseTests(unittest.TestCase):
 
     def test_final_macos_bundle_requires_plugin_entitlements_and_au_capability(self):
         app = self.bundle()
+        signature = subprocess.CompletedProcess(
+            [], 0, stdout=plistlib.dumps(PLUGIN_PERMISSIONS), stderr=b""
+        )
+        with (
+            mock.patch.dict(os.environ, {"PROBE_PLATFORM": "macos"}),
+            mock.patch.object(PROBE.subprocess, "run", return_value=signature) as signing,
+        ):
+            self.assertIn("au", PROBE.verify(app, "macos")["formats"])
+        signing.assert_called_once_with(
+            ["codesign", "--display", "--entitlements", ":-", str(app.resolve())],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            [call["args"] for call in self.calls()],
+            [["--plugin-host-capabilities"], ["--audio-host"]],
+        )
+        self.assertTrue(all(not Path(call["data"]).exists() for call in self.calls()))
+
+    def test_final_macos_signature_rejects_each_missing_or_disabled_plugin_permission(
+        self,
+    ):
+        app = self.bundle()
         with mock.patch.dict(os.environ, {"PROBE_PLATFORM": "macos"}):
-            for enabled in (False, True):
-                with self.subTest(library_validation_disabled=enabled):
-                    signature = subprocess.CompletedProcess(
-                        [],
-                        0,
-                        stdout=plistlib.dumps(
-                            {
-                                "com.apple.security.cs.disable-library-validation": enabled
-                            }
-                        ),
-                        stderr=b"",
-                    )
-                    with mock.patch.object(
-                        PROBE.subprocess, "run", return_value=signature
-                    ):
-                        if enabled:
-                            self.assertIn("au", PROBE.verify(app, "macos")["formats"])
+            for permission in PLUGIN_PERMISSIONS:
+                for enabled in (None, False):
+                    with self.subTest(permission=permission, value=enabled):
+                        entitlements = dict(PLUGIN_PERMISSIONS)
+                        if enabled is None:
+                            del entitlements[permission]
                         else:
-                            with self.assertRaisesRegex(
-                                ValueError, "third-party plugin"
-                            ):
+                            entitlements[permission] = enabled
+                        signature = subprocess.CompletedProcess(
+                            [], 0, stdout=plistlib.dumps(entitlements), stderr=b""
+                        )
+                        with mock.patch.object(
+                            PROBE.subprocess, "run", return_value=signature
+                        ):
+                            with self.assertRaises(ValueError) as failure:
                                 PROBE.verify(app, "macos")
+                        self.assertIn(permission, str(failure.exception))
+                        self.assertFalse(self.trace.exists())
 
     def test_macos_staging_rejects_the_experimental_bundle_identity(self):
         app = self.bundle()
@@ -192,7 +217,8 @@ class MacosPluginEntitlementsTests(unittest.TestCase):
             root = Path(temporary)
             existing, output = root / "existing.plist", root / "merged.plist"
             permissions = {
-                "com.apple.security.cs.allow-jit": True,
+                "com.apple.security.cs.allow-jit": False,
+                "com.apple.security.cs.allow-unsigned-executable-memory": False,
                 "com.apple.security.device.audio-input": True,
                 "keychain-access-groups": ["existing.application"],
                 "com.apple.security.cs.disable-library-validation": False,
@@ -200,11 +226,7 @@ class MacosPluginEntitlementsTests(unittest.TestCase):
             existing.write_bytes(plistlib.dumps(permissions))
             result = MERGE.merge_entitlements(existing, REQUIRED, output)
             self.assertEqual(plistlib.loads(output.read_bytes()), result)
-            self.assertTrue(
-                result.pop("com.apple.security.cs.disable-library-validation")
-            )
-            permissions.pop("com.apple.security.cs.disable-library-validation")
-            self.assertEqual(result, permissions)
+            self.assertEqual(result, {**permissions, **PLUGIN_PERMISSIONS})
 
     def test_invalid_existing_entitlements_do_not_overwrite_an_output(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -229,7 +251,8 @@ class MacosPluginEntitlementsTests(unittest.TestCase):
             original.write_bytes(
                 plistlib.dumps(
                     {
-                        "com.apple.security.cs.allow-jit": True,
+                        "com.apple.security.cs.allow-jit": False,
+                        "com.apple.security.cs.allow-unsigned-executable-memory": False,
                         "custom-permission": ["keep"],
                     }
                 )
@@ -292,13 +315,10 @@ codesign() { "$TEST_PYTHON" "$SIGN_RECORDER" "$@"; }
             self.assertEqual(
                 final["args"][final["args"].index("--options") + 1], "runtime"
             )
-            self.assertTrue(
-                final["entitlements"][
-                    "com.apple.security.cs.disable-library-validation"
-                ]
+            self.assertEqual(
+                final["entitlements"],
+                {**PLUGIN_PERMISSIONS, "custom-permission": ["keep"]},
             )
-            self.assertTrue(final["entitlements"]["com.apple.security.cs.allow-jit"])
-            self.assertEqual(final["entitlements"]["custom-permission"], ["keep"])
 
 
 class NativePluginBuildEntryTests(unittest.TestCase):

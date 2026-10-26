@@ -94,13 +94,16 @@ def verify(executable: Path, platform: str, timeout: float = 15) -> dict:
             timeout=timeout,
         )
         entitlements = plistlib.loads(signature.stdout)
-        if (
-            entitlements.get("com.apple.security.cs.disable-library-validation")
-            is not True
+        for permission in (
+            "com.apple.security.cs.disable-library-validation",
+            "com.apple.security.cs.allow-jit",
+            "com.apple.security.cs.allow-unsigned-executable-memory",
         ):
-            raise ValueError(
-                "The signed macOS app cannot load third-party plugin libraries"
-            )
+            if entitlements.get(permission) is not True:
+                raise ValueError(
+                    "The signed macOS app is missing required plugin permission: "
+                    f"{permission}=true"
+                )
     executable = executable_path(executable)
     expected = {"vst2", "vst3"} | ({"au"} if platform == "macos" else set())
     with tempfile.TemporaryDirectory(prefix="pymss-plugin-package-") as temporary:
