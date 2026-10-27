@@ -4,21 +4,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 fn fixture_bundle(root: &Path) -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../vendor/soundcraft-vst3-host/tests/fixture/Cargo.toml");
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("audio-host-tail-fixture-target");
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["build", "--quiet", "--manifest-path"])
-        .arg(manifest)
-        .arg("--target-dir")
-        .arg(&target)
-        .env_remove("RUSTFLAGS")
-        .status()
-        .unwrap();
-    assert!(status.success(), "fixture build failed");
     let (library, folder, executable) = if cfg!(windows) {
         ("vst3_fixture.dll", "x86_64-win", "Fixture.vst3")
     } else if cfg!(target_os = "macos") {
@@ -34,14 +23,27 @@ fn fixture_bundle(root: &Path) -> PathBuf {
             "Fixture.so",
         )
     };
+    // Do not let another test rebuild the shared library while a bundle copies it.
+    static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+    let library = LIBRARY.get_or_init(|| {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../vendor/soundcraft-vst3-host/tests/fixture/Cargo.toml");
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("audio-host-tail-fixture-target");
+        let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args(["build", "--quiet", "--manifest-path"])
+            .arg(manifest)
+            .arg("--target-dir")
+            .arg(&target)
+            .env_remove("RUSTFLAGS")
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture build failed");
+        target.join("debug").join(library)
+    });
     let bundle = root.join("Fixture.vst3");
     let directory = bundle.join("Contents").join(folder);
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::copy(
-        target.join("debug").join(library),
-        directory.join(executable),
-    )
-    .unwrap();
+    std::fs::copy(library, directory.join(executable)).unwrap();
     bundle
 }
 
